@@ -2151,7 +2151,14 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                         causal = True,
                         softmax_scale = self.scaling,
                         cache_seqlens = _cache_seqlens,
-                        window_size = (_swa_win, _swa_win) if _swa_win else (-1, -1)
+                        window_size = (_swa_win, _swa_win) if _swa_win else (-1, -1),
+                        # BUG 103: FA2 auto split-KV (num_splits=0) picks a schedule and
+                        # reduction-buffer sizes that change with cache_seqlens, so the
+                        # kernel reallocates buffers a captured graph holds addresses of ->
+                        # stale reads -> token garbage once the sequence grows past the SWA
+                        # ring (~kv_state_size). num_splits=1 forces single-pass decode with
+                        # stable buffer addresses, making the graphed SWA decode graph-safe.
+                        num_splits = 1,
                     )
                 else:
                     # FlashInfer >= 0.7.4 serves head_dim > 256 (Gemma-4's hd512 global

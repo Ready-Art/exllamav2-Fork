@@ -221,6 +221,13 @@ class TPContext:
                 sm_scale = scale,
                 q_data_type = torch.half,
                 kv_data_type = k_cache_dev.dtype,
+                # BUG 103: auto split-KV picks a schedule (and reduction-buffer sizes)
+                # that changes with kv_len, so plan() reallocates the buffers a captured
+                # graph run() holds addresses of -> stale reads -> variable-onset token
+                # garbage at long context (short context, no split, is clean). Disabling
+                # split-KV keeps a single-pass decode with stable buffer addresses across
+                # replays, which is what makes the hd512 graph decode actually graph-safe.
+                disable_split_kv = True,
             )
         finally:
             torch.cuda.set_stream(prev_stream)
