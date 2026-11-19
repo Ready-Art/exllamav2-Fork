@@ -73,8 +73,10 @@ architectures are untested here — treat them as experimental and verify correc
 ## Install
 
 Verified on Ubuntu 26.10, 4× RTX 3090 (sm86), Python 3.12.15, torch 2.15.0+cu132, CUDA toolkit 13.5,
-FlashInfer 0.7.4, flash-attn 2.8.3. Install torch **before** building the fork: `setup.py` precompiles
-the CUDA extension against the installed torch, and `--no-build-isolation` makes the build use it.
+FlashInfer 0.7.4, flash-attn 2.8.3 — including end-to-end generation through TabbyAPI (SP MTP
+sampling, MP MTP greedy, MP sampling fallback) with coherent, corruption-free multi-thousand-token
+outputs. Install torch **before** building the fork: `setup.py` precompiles the CUDA extension
+against the installed torch, and `--no-build-isolation` makes the build use it.
 
 Use [uv](https://docs.astral.sh/uv/getting-started/installation/) to manage Python — it installs
 Python 3.12 itself, so no system Python 3.12 package is needed:
@@ -153,8 +155,12 @@ gen.begin_stream(input_ids, settings, token_healing=True)
 ```
 
 For the MP backend use `MTPMPDriver` (`exllamav2/mtp_mp.py`); runnable benchmarks and examples
-are in [`mtp/`](mtp/). Every emitted token is sampled from the **target's** verified logits, so
-greedy MTP output matches plain autoregressive generation.
+are in [`mtp/`](mtp/). Every emitted token is sampled from the **target's** verified logits.
+Under sampling, a token that deviates from the cached draft/bonus token triggers a
+rewind-and-recommit of the cache (BUG 100 fix), so the K/V cache can never desync from the
+emitted text and the output distribution stays exactly target-autoregressive. Greedy MTP
+matches plain autoregressive generation except for rare fp16 near-tie flips between the
+verify-window and single-token decode attention kernels on long prose.
 
 ## Gemma-4-31B-IT
 
@@ -234,6 +240,13 @@ tokens of context, MP MTP greedy currently runs *slower* than plain MP decode (~
 measured through TabbyAPI) — the per-round fixed costs (worker-pipe K/V gather/rewind round trips
 and the torch hd512 verify-window attention) dominate when there is little context to amortize
 them over. Reducing those round costs is the main MTP optimization target.
+
+**Sampling caveat:** the numbers above are greedy. Under sampling (e.g. temperature 1.0), every
+deviation from the drafted tokens costs a rewind + recommit forward (the BUG 100 correctness
+fix), so MTP throughput drops toward — or below — plain decode at short context (~12 vs ~19 tok/s
+SP measured at temp 1.0 / top_p 0.92). MTP's speedup is concentrated in greedy / low-temperature
+/ structured generation where acceptance is high; probabilistic speculative acceptance to recover
+sampling throughput is future work.
 
 ## Upstream features
 
