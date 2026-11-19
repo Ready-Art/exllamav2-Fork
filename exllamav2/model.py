@@ -31,12 +31,13 @@ torch.set_num_threads(1)
 
 import math
 from exllamav2.config import ExLlamaV2Config
-from exllamav2.cache import ExLlamaV2CacheBase
+from exllamav2.cache import ExLlamaV2CacheBase, ExLlamaV2Cache_SWA
 from exllamav2.linear import ExLlamaV2Linear
 from exllamav2.module import ExLlamaV2Module
 from exllamav2.rmsnorm import ExLlamaV2RMSNorm
 from exllamav2.layernorm import ExLlamaV2LayerNorm
 from exllamav2.attn import ExLlamaV2Attention, has_flash_attn, has_xformers
+from exllamav2.layer_scalar import ExLlamaV2LayerScalar
 from exllamav2.lora import ExLlamaV2Lora
 from exllamav2.mlp import ExLlamaV2MLP
 from exllamav2.moe_mlp import ExLlamaV2MoEMLP
@@ -47,6 +48,7 @@ from exllamav2.compat import safe_move_tensor
 from exllamav2.stloader import cleanup_stfiles
 from exllamav2.device import ExLlamaV2DeviceContext, set_device_streams
 from exllamav2.tensor_p import TPContext, BROADCAST_VC
+from exllamav2.tp_graph import TPGraphManager, TPGraphRunner
 from exllamav2.architecture import RopeStyle
 import gc
 import threading
@@ -63,6 +65,31 @@ def _torch_device(idx):
 
 
 class ExLlamaV2:
+
+    @staticmethod
+    def _swa_ring_params(cache):
+        """BUG 94: (ring_size, page_size, is_swa_layer) for an SWA TP/rank cache, else None.
+
+        The streaming/TP path must keep the sliding-window layers' K/V inside their small
+        ring buffers. The ring parameters live on the per-device SWA cache; the TP wrapper
+        and the rank-local view expose them via the first non-None member.
+        """
+        if cache is None:
+            return None
+        _is_swa = getattr(cache, "is_swa_layer", None)
+        _ring = getattr(cache, "kv_state_size", None)
+        _page = getattr(cache, "page_size", 128)
+        if _is_swa is None:
+            for _c in getattr(cache, "caches", ()):
+                if _c is None:
+                    continue
+                _is_swa = _c.is_swa_layer
+                _ring = _c.kv_state_size
+                _page = _c.page_size
+                break
+        if _is_swa is None or not any(_is_swa) or _ring is None:
+            return None
+        return _ring, _page, _is_swa
 
     config: ExLlamaV2Config
     modules: list[ExLlamaV2Module]
@@ -90,13 +117,21 @@ class ExLlamaV2:
         self.loaded = False
         self.tp_context = None
 
+        # CUDA-graph decode state (BUG 43). Created in load_tp_gen; None for non-TP models,
+        # which keep using the existing fused-kernel graph path in q_attn.cu / q_mlp.cu.
+        # Change98: the static input/logits/state buffers live on each TPGraphRunner, not here.
+        self.tp_graph = None
+
         # Build model
 
         cfg = self.config
         if archparams is None: archparams = cfg.arch.lm
         self.archparams = archparams
 
-        emb = ExLlamaV2Embedding(self, cfg.arch.lm_prefix + "model.embed_tokens")
+        # `embed_key` / `norm_key` are relative to lm_prefix. Gemma-4 nests them directly
+        # under `model.language_model.`, so the old hard-coded "model.embed_tokens" produced
+        # `model.language_model.model.embed_tokens`, which does not exist. PLAN.md §2.1.
+        emb = ExLlamaV2Embedding(self, cfg.arch.lm_prefix + getattr(archparams, "embed_key", "model.embed_tokens"))
         self.modules += [emb]
 
         if archparams.keys["learned_pos_emb"]:
@@ -105,7 +140,10 @@ class ExLlamaV2:
 
         for layer_idx in range(cfg.num_hidden_layers):
 
-            layer_key = cfg.arch.lm_prefix + f"model.layers.{layer_idx}"
+            # `layers_root` is relative to lm_prefix. Gemma-4 uses "layers".
+            # PLAN.md §2.1.
+            layers_root = getattr(archparams, "layers_root", "model.layers")
+            layer_key = cfg.arch.lm_prefix + f"{layers_root}.{layer_idx}"
             rope_index = 0
 
             if cfg.arch.lm.alternating_swa:
@@ -129,10 +167,17 @@ class ExLlamaV2:
                 else: mlp = ExLlamaV2MLP(self, layer_key, layer_idx)
                 self.modules += [attn, mlp]
 
+                # Per-layer scalar applied to the block output, after both residual adds.
+                # PLAN.md §2.6. Gemma-4 only.
+                if getattr(cfg.arch.lm, "layer_scalar", False):
+                    ls = ExLlamaV2LayerScalar(self, layer_key + ".layer_scalar")
+                    self.modules += [ls]
+
+        _norm_key = cfg.arch.lm_prefix + getattr(archparams, "norm_key", "model.norm")
         if cfg.arch.lm.norm == "layernorm":
-            norm = ExLlamaV2LayerNorm(self, cfg.arch.lm_prefix + "model.norm")
+            norm = ExLlamaV2LayerNorm(self, _norm_key)
         elif cfg.arch.lm.norm == "rmsnorm":
-            norm = ExLlamaV2RMSNorm(self, cfg.arch.lm_prefix + "model.norm")
+            norm = ExLlamaV2RMSNorm(self, _norm_key)
         else:
             raise ValueError("unknown norm type")
         self.modules += [norm]
@@ -185,8 +230,14 @@ class ExLlamaV2:
         # Constant shared between layers
 
         if self.archparams.rope_style != RopeStyle.NONE:
-            sincos_size = cfg.head_dim * cfg.max_seq_len * 2
-            constant_size = sincos_size * 2
+            # Two tables may exist (base + alt). For Gemma-4 the base table spans global_head_dim
+            # (512) while the alt table spans head_dim (256), so size for the larger of the two.
+            # Using cfg.head_dim alone would under-allocate by 2x and corrupt the 512-dim layers.
+            # PLAN.md §2.3 / §8 trap 1.
+            max_sincos_dim = max(cfg.head_dim, getattr(cfg, "global_head_dim", cfg.head_dim))
+            sincos_size = max_sincos_dim * cfg.max_seq_len * 2
+            n_tables = 2 if cfg.rotary_embedding_base_alt else 1
+            constant_size = sincos_size * 2 * n_tables
         else:
             constant_size = 0
 
@@ -413,8 +464,12 @@ class ExLlamaV2:
         expect_cache_tokens: int = 0,
         expect_cache_base: type = None
     ):
+        # The fused single-device q_attn/q_mlp graph path is still disabled for TP: those
+        # kernels assume one device. TP decode now has its own whole-step graph instead
+        # (tp_graph.py), which is what actually removes the per-op launch latency.
         self.config.no_graphs = True
         self.tp_context = TPContext(self, gpu_split, expect_cache_tokens, expect_cache_base)
+        self.tp_graph = TPGraphManager(self)
 
         # Create device tensors
 
@@ -455,7 +510,13 @@ class ExLlamaV2:
                 if isinstance(module, ExLlamaV2MLP):
                     module.tp_split()
                 if isinstance(module, ExLlamaV2RMSNorm):
-                    module.tp_split(BROADCAST_VC)
+                    # The norm that feeds the head must stay on the head's device and return a
+                    # single tensor: the head is replicated (bug 23), so a TP-split norm would
+                    # hand it a per-device list. Stage L bug 24.
+                    if idx == self.head_layer_idx - 1:
+                        module.tp_replicate(self.tp_context.device)
+                    else:
+                        module.tp_split(BROADCAST_VC)
                 elif isinstance(module, ExLlamaV2Linear):
                     module.tp_split(BROADCAST_VC)
 
@@ -472,6 +533,151 @@ class ExLlamaV2:
 
             self.tp_context.finalize()
 
+
+    def load_tp_rank(
+        self,
+        rank: int,
+        gpu_split: list[float] | None = None,
+        expect_cache_tokens: int = 0,
+        expect_cache_base: type = None,
+        load_head: bool | None = None,
+        callback: Callable[[int, int], None] | None = None
+    ):
+        """
+        Load only the shard of the model owned by device ``rank``.
+
+        This is the worker-side counterpart of :meth:`load_tp`. A multiprocess TP backend runs one
+        process per GPU, and each process must build its own slice without ever materialising the
+        whole model -- that is the entire point, since the model does not fit on one card.
+
+        Every rank builds the same ``TPContext`` from the same ``gpu_split``, because the split
+        definition has to agree across ranks for the collectives to line up. What differs is the device
+        context: only ``rank``'s scratch space is allocated, and only ``rank``'s shards are loaded.
+
+        ``load_head`` controls whether ``lm_head`` is loaded. It is replicated, not sharded, and on
+        Gemma-4 it is 2.8 GB (262144 x 5376 fp16), so only the master should load it -- the
+        workers never run it.
+
+        :param rank:
+            Device index this process owns.
+
+        :param gpu_split:
+            Per-GPU VRAM allocations in GB. Must be identical on every rank.
+
+        :param expect_cache_tokens:
+            Expected cache size in tokens, used to inform the split. Must be identical on every rank.
+
+        :param expect_cache_base:
+            Cache type to expect, used to inform the split. Must be identical on every rank.
+
+        :param load_head:
+            Whether to load ``lm_head``. Defaults to True only for rank 0.
+
+        :param callback:
+            Called as ``callback(module_idx, num_modules)`` after each module loads.
+        """
+        from exllamav2.embedding import ExLlamaV2Embedding
+        from exllamav2.attn import ExLlamaV2Attention
+        from exllamav2.mlp import ExLlamaV2MLP
+        from exllamav2.rmsnorm import ExLlamaV2RMSNorm
+        from exllamav2.layernorm import ExLlamaV2LayerNorm
+        from exllamav2.layer_scalar import ExLlamaV2LayerScalar
+        from exllamav2.tensor_p import BROADCAST_VC, BROADCAST_Q, BROADCAST_RS
+
+        if load_head is None:
+            load_head = (rank == 0)
+
+        # BUG 77: forward_chunk must know whether this process owns lm_head.
+        self._tp_has_head = bool(load_head)
+
+        # The fused single-device graph path assumes one device.
+        self.config.no_graphs = True
+
+        self.tp_context = TPContext(self, gpu_split, expect_cache_tokens, expect_cache_base)
+        # BUG 58: enter multiprocess mode BEFORE any module loads. get_split() filters to
+        # this rank from here on, and the loaders size their shards from it -- setting it
+        # afterwards would make every module load the full split.
+        self.tp_context.set_rank(rank)
+        # BUG 80: keep the CUDA-graph path. Graphs are worth 2.55x on decode in the
+        # single-process path and are the largest single factor in the MP path too. Capture is
+        # per-process and only touches the devices this process owns (TPContext.all_devices() is
+        # rank-filtered), so it is valid in a worker; if it fails, TPGraphManager.disable()
+        # falls back to the eager path, which is what this used to do unconditionally.
+        self.tp_graph = TPGraphManager(self)
+
+        # Size the device context for THIS rank only.
+        #
+        # scratch_space_tp() returns one entry per device and also populates the
+        # out_features_tp / in_features_tp lists that the TP forward paths dispatch on. It has to run
+        # for every module so those lists are consistent, but only this rank's scratch is allocated.
+        devs = self.tp_context.num_devices
+        scratch = [0] * devs
+        for module in self.modules[1:]:
+            ms = module.scratch_space_tp()
+            for i, m in enumerate(ms):
+                scratch[i] = max(scratch[i], m)
+
+        self.device_context = [None] * devs
+        if scratch[rank] > 0:
+            self.device_context[rank] = ExLlamaV2DeviceContext(self, rank, scratch[rank])
+
+        with torch.inference_mode():
+            set_device_streams()
+
+            for idx, module in enumerate(self.modules):
+                if callback is not None:
+                    callback(idx, len(self.modules))
+
+                if isinstance(module, ExLlamaV2Embedding):
+                    module.tp_load_rank(rank)
+
+                elif isinstance(module, ExLlamaV2Attention):
+                    module.tp_load_rank(rank)
+
+                elif isinstance(module, ExLlamaV2MLP):
+                    module.tp_load_rank(rank)
+
+                elif isinstance(module, (ExLlamaV2RMSNorm, ExLlamaV2LayerNorm)):
+                    # The norm feeding the head must stay full-width on the head's device; every
+                    # other norm is replicated full-width on every device anyway.
+                    if idx == self.head_layer_idx - 1:
+                        module.tp_load_rank(rank, BROADCAST_VC)
+                    else:
+                        module.tp_load_rank(rank, BROADCAST_RS)
+
+                elif isinstance(module, ExLlamaV2LayerScalar):
+                    module.tp_load_rank(rank)
+
+                elif isinstance(module, ExLlamaV2Linear):
+                    if idx == self.head_layer_idx:
+                        if load_head:
+                            module.tp_load_rank_replicated(rank)
+                        else:
+                            module.set_device_idx(rank)
+                            module.out_features_tp = []
+                            module.in_features_tp = []
+                            module.is_tp = False
+                    else:
+                        module.tp_load_rank(rank, BROADCAST_VC)
+
+                else:
+                    raise NotImplementedError(
+                        "load_tp_rank: unsupported module type "
+                        + type(module).__name__ + " at index " + str(idx)
+                    )
+
+            torch.cuda.empty_cache()
+            gc.collect()
+
+            if callback is not None:
+                callback(len(self.modules), len(self.modules))
+
+            self.loaded = True
+            cleanup_stfiles()
+
+            # BUG 57: build streams / ext_tp_contexts / pos / past_len_tp. Without this the
+            # first TP GEMM dereferences a NULL ctx->streams[dev].
+            self.tp_context.finalize()
 
     def load_autosplit(
         self,
@@ -556,9 +762,18 @@ class ExLlamaV2:
             reserved_vram_tensors = []
             minimum_reserve_tensor = None
 
-            # Largest hidden state to ever forward through model
+            # Largest hidden state to ever forward through model.
+            # SWA ring caches cannot hold a full max_input_len chunk (the per-module
+            # test forward below bypasses model.forward's ring-aware chunk loop), so
+            # cap the test sequence at the ring depth; it still measures per-module
+            # VRAM representative of real decode/prefill chunks.
+            _test_len = self.config.max_input_len
+            _swa_layers = getattr(cache, "is_swa_layer", None)
+            _ring = getattr(cache, "kv_state_size", None)
+            if _ring is not None and _swa_layers is not None and any(_swa_layers):
+                _test_len = min(_test_len, _ring)
 
-            hidden_state = torch.zeros((1, self.config.max_input_len), dtype = torch.long)
+            hidden_state = torch.zeros((1, _test_len), dtype = torch.long)
             batch_size, seq_len = hidden_state.shape
             past_len = 0
             attn_params = ExLlamaV2Attention.Params(batch_size, seq_len, past_len, None, None)
@@ -876,6 +1091,34 @@ class ExLlamaV2:
 
             chunk_size = min(remaining_q_len, effective_max_input_len)
 
+            # BUG 94: sliding-window (SWA) layers keep their K/V in a small ring
+            # (kv_state_size deep), not a full-length cache. Cap the prefill chunk at
+            # the ring size -- a longer chunk can never fit -- and shift the ring
+            # before the chunk if it would overflow, so the new K/V always lands in
+            # [0, ring). The shift is a deterministic function of
+            # (current_seq_len, window_beg, chunk_size), so every TP rank computes the
+            # same shift and shifts its own ring slice with no cross-rank communication.
+            # (current_seq_len, not the `past_len` local: in the flash branch that local
+            # is not refreshed between chunks.)
+            _swa_p = self._swa_ring_params(cache)
+            if _swa_p is not None:
+                _ring, _page, _swa = _swa_p
+                if cache.current_seq_len == 0 and cache.window_beg != 0:
+                    cache.window_beg = 0  # new sequence
+                chunk_size = min(chunk_size, _ring)
+                _cpos = cache.current_seq_len - cache.window_beg
+                _overflow = _cpos + chunk_size - _ring
+                if _overflow > 0:
+                    _shift = ((_overflow + _page - 1) // _page) * _page
+                    assert 0 < _shift <= _ring, \
+                        f"BUG 94: bad SWA ring shift {_shift} (ring {_ring})"
+                    if _shift < _ring:
+                        for _li in range(len(_swa)):
+                            if _swa[_li]:
+                                cache.shift_ring(_li, _shift)
+                    # _shift == _ring is a full rotation: the ring data is unchanged.
+                    cache.window_beg += _shift
+
             # Limit chunk_size to keep size of attention operation <= max_attention_size
 
             if (has_flash_attn and not self.config.no_flash_attn) \
@@ -932,6 +1175,264 @@ class ExLlamaV2:
         else:
             return result, last_state
 
+
+    def _fi_tp_graph_plan(self, cache, kv_len: int):
+        """
+        Refresh the FlashInfer hd>256 paged decode plans for a graphed step.
+
+        Host-side work, called OUTSIDE the capture region: once before warmup/capture and
+        once before every replay (the plan encodes the dynamic kv_len). All hd512 layers
+        share the per-device geometry, so one wrapper per (device, geometry) serves every
+        layer's captured run(). After planning, order dev0's replay launch after every
+        device's plan work so no replayed run() reads a half-written plan.
+        """
+        from exllamav2.attn import use_flashinfer
+        from exllamav2.tensor_p import BROADCAST_KV
+
+        cfg = self.config
+        ctx = self.tp_context
+        if not use_flashinfer(cfg) or cfg.attn_logit_softcapping:
+            return
+        planned = False
+        for m in self.modules:
+            if not isinstance(m, ExLlamaV2Attention):
+                continue
+            if m.head_dim <= 256 or m.sliding_window:
+                continue
+            ctx.set_geometry(m.layer_idx)
+            split = ctx.get_split(BROADCAST_KV)
+            k_cache, _ = cache.get_kv_state(m.layer_idx, 1, 0, max(0, kv_len - 1))
+            for idx, (dev, a, b) in enumerate(split):
+                key = (
+                    dev, (b - a) * m.num_key_value_groups, b - a,
+                    m.head_dim, m.scaling
+                )
+                if ctx.fi_decode_plan(key, kv_len, k_cache[idx]):
+                    planned = True
+        if planned:
+            ctx.fi_decode_order_before_replay()
+
+    def _tp_graph_step(
+        self,
+        input_ids: torch.Tensor,
+        cache,
+        attn_params,
+        past_len: int,
+        batch_size: int,
+        seq_len: int,
+        last_id_only: bool,
+        return_last_state: bool = False
+    ):
+        """
+        Run one graphed step -- decode, MTP bonus commit (return_last_state), or the MTP
+        verify window (seq_len > 1) -- capturing it on first use.
+
+        Returns the runner on success, or None to fall back to the eager path. Falling back is
+        always safe: the eager path is unchanged and still correct.
+
+        The step is captured with ``graph_mode`` set on the TP context, which makes the
+        collectives device-resident and takes the sequence position from device memory. The
+        graph is therefore position-agnostic and replays at every subsequent token.
+
+        Change98: every static buffer (embedded input, logits, optional pre-final-norm state)
+        is owned by the RUNNER, not the model. The decode (1,1), bonus (1,1,state) and verify
+        (1,W) graphs coexist; a single shared input buffer would be reallocated whenever the
+        shape changes and leave every previously captured graph reading freed memory -- the
+        BUG 44 failure mode generalized to multiple runners.
+        """
+        ctx = self.tp_context
+
+        # The embedding module holds its weight on the CPU (embedding.py:55 keeps it there
+        # deliberately), so the token lookup runs on the host and produces a host tensor. Host work
+        # is not recorded by a CUDA graph, so the graph must NOT contain the embedding: if it did,
+        # replay would re-emit the capture-time embedding and every step would be one token behind
+        # (the lag-by-one symptom).
+        #
+        # Instead the embedding is run eagerly on every step, exactly as the eager path does, and its
+        # result is copied into a static device buffer that the graph reads. The graph therefore
+        # starts at module 1 and is driven purely by that buffer plus `pos`.
+        self._tp_graph_embed = None
+        embed_module = self.modules[0]
+        first_module = 1
+
+        # Static device buffer for the embedded input: allocated once per runner (per shape),
+        # never reallocated -- the captured graph holds its address. BUG 44 was a shared buffer
+        # being reallocated on a shape mismatch, making every replay re-read the capture-time
+        # embedding; with multiple coexisting runners (decode / bonus / verify) the buffer must
+        # be per-runner for the same reason.
+
+        def run_embedding(ids: torch.Tensor) -> torch.Tensor:
+            """Embedding lookup on the host, result moved to dev0. Mirrors the eager path."""
+            with torch.inference_mode():
+                h = embed_module.forward(ids, cache = cache, attn_params = attn_params,
+                                        past_len = past_len, loras = None)
+            if h.device.type == "cpu":
+                h = h.to(ctx.device, non_blocking = False)
+            return h
+
+        # Device-side sequence position. RoPE and the KV write both read this, so it must be
+        # updated *before* replay and must not be reallocated (the graph holds its address).
+        if ctx.pos is None:
+            ctx.pos = torch.zeros((1,), dtype = torch.int32, device = ctx.device)
+
+        # BUG 47: pass the cache so a runner captured against a different KV cache is
+        # rejected instead of replayed against freed buffers.
+        runner = self.tp_graph.get(batch_size, seq_len, cache,
+                                   state = return_last_state, last_id_only = last_id_only)
+
+        def stage_inputs(input_buf):
+            # Write every dynamic input on dev0's TP stream, ordered before the graph launch.
+            # flash_attn_with_kvcache takes cache_seqlens as a device tensor; fill the STABLE
+            # per-device tensors owned by TPContext (the graph holds their addresses), not the
+            # per-call copies on attn_params, which would freeze the capture-time length.
+            _dev0_stream = ctx.streams_dev[ctx.device]
+            _prev = torch.cuda.current_stream(ctx.device)
+            torch.cuda.set_stream(_dev0_stream)
+            try:
+                _h0 = run_embedding(input_ids)
+                input_buf.copy_(_h0)
+                ctx.set_pos(past_len)
+                ctx.set_ring_pos(past_len - getattr(cache, "window_beg", 0))
+                for _pl in ctx.past_len_tp.values():
+                    ctx.fill_tp(_pl, past_len)
+            finally:
+                torch.cuda.set_stream(_prev)
+
+        if runner is None:
+            # First step of this shape: allocate the runner's static buffers, then capture.
+            _h0 = run_embedding(input_ids)
+            input_buf = torch.empty_like(_h0, device = ctx.device)
+            # The bonus graph also returns the pre-final-norm hidden state. The copy into this
+            # static buffer is recorded INSIDE the graph, so every replay refreshes it.
+            state_buf = None
+            if return_last_state:
+                state_buf = torch.empty((batch_size, 1, self.config.hidden_size),
+                                        dtype = _h0.dtype, device = ctx.device)
+            out = {}
+
+            def step_fn():
+                # Start from the static embedded-input buffer; the embedding itself is host work
+                # and therefore outside the graph (see the note above).
+                x = input_buf
+                for idx, module in enumerate(self.modules):
+                    if idx < first_module:
+                        continue
+                    # BUG 81: a rank-local worker without lm_head must stop before it, exactly as
+                    # forward_chunk does (BUG 77). Otherwise capture aborts with
+                    # "Layer model.language_model.lm_head has no data" and graphs get disabled.
+                    if idx == self.head_layer_idx and not getattr(self, "_tp_has_head", True):
+                        break
+                    # MTP bonus state: capture BEFORE the final norm (module head_layer_idx - 1)
+                    # runs -- the same point forward_chunk's eager extract_state_indices clones at.
+                    if return_last_state and idx == self.head_layer_idx - 1:
+                        state_buf.copy_(x)
+                    if idx == self.head_layer_idx and last_id_only:
+                        x = x.narrow(-2, -1, 1)
+                    # No safe_move_tensor here: in graph mode the residual stream stays on the
+                    # primary device for the whole step, and safe_move_tensor host-synchronises,
+                    # which is illegal inside a capture region. BUG 43.
+                    x = module.forward(
+                        x,
+                        cache = cache,
+                        attn_params = attn_params,
+                        past_len = past_len,
+                        loras = None,
+                    )
+                # Keep a reference to the logits so they are not freed; the graph writes into
+                # this buffer on every replay.
+                out["logits"] = x
+
+            # attn_params.prep_tp() must run BEFORE capture: it calls safe_move_tensor, which
+            # does a torch.cuda.synchronize(), and a host sync is illegal inside a capture
+            # region. Warming it here means the in-capture call finds its per-device tensors
+            # already built for every geometry and returns immediately.
+            ctx.graph_mode = False
+            for _li in range(self.config.num_hidden_layers):
+                ctx.set_geometry(_li)
+                attn_params.prep_tp(self)
+            ctx.set_geometry(0)
+
+            runner = TPGraphRunner(step_fn, ctx.device,
+                                   (batch_size, seq_len, return_last_state, last_id_only),
+                                   tp_context = ctx)
+            # Let capture() restore the KV cache position after its warmup iterations. The
+            # warmup runs the real step, which advances current_seq_len and writes KV rows.
+            runner.cache = cache
+            runner.input_buf = input_buf
+            runner.state_buf = state_buf
+            # Stage the real inputs so warmup and capture run at the caller's position with the
+            # caller's tokens (the warmup KV writes are idempotent: same rows, same values).
+            stage_inputs(input_buf)
+            # hd>256 FlashInfer decode plans must exist before warmup/capture: run() is
+            # captured, plan() is host work and cannot run inside the capture region.
+            self._fi_tp_graph_plan(cache, past_len + seq_len)
+            ctx.graph_mode = True
+            try:
+                runner.capture()
+            except Exception as e:
+                ctx.graph_mode = False
+                self.tp_graph.disable(f"capture failed: {type(e).__name__}: {e}")
+                print(f"[TP graphs] disabled: {self.tp_graph.disabled_reason}", flush=True)
+                return None
+            finally:
+                ctx.graph_mode = False
+            runner.logits = out["logits"]
+            self.tp_graph.add(batch_size, seq_len, runner,
+                              state = return_last_state, last_id_only = last_id_only)
+
+            # Capture only *records* the work; it does not execute it. Replay once so this first
+            # decode step actually produces logits. Without this the caller reads the
+            # still-uninitialised logits buffer and the first token comes back as garbage (0).
+            ctx.graph_mode = True
+            try:
+                with torch.cuda.device(ctx.device):
+                    prev_stream = torch.cuda.current_stream(ctx.device)
+                    torch.cuda.set_stream(ctx.streams_dev[ctx.device])
+                    try:
+                        runner.replay()
+                    finally:
+                        torch.cuda.set_stream(prev_stream)
+            finally:
+                ctx.graph_mode = False
+            return runner
+
+        # Subsequent steps: update the dynamic inputs, then replay.
+        #
+        # The graph is launched on dev0's TP stream (that is the stream the capture was made on),
+        # so every dynamic input must be written on that same stream and the stream must still be
+        # current when replay() is called. Writing on a different stream, or restoring the previous
+        # stream before replaying, leaves a race in which the graph reads the previous token's id
+        # and position -- which presents exactly as the bug-39 repetition-loop signature.
+        ctx.graph_mode = True
+        try:
+            dev0_stream = ctx.streams_dev[ctx.device]
+            # set_stream() only affects the CURRENT device, so the device must be selected too.
+            # Without this the copy_ below runs on whichever device the previous module left
+            # current, and the graph (launched on dev0) reads the buffer before the copy lands.
+            # That is the lag-by-one-token symptom.
+            with torch.cuda.device(ctx.device):
+                prev_stream = torch.cuda.current_stream(ctx.device)
+                torch.cuda.set_stream(dev0_stream)
+                try:
+                    # Run the embedding eagerly (it is host work, so it is not in the graph) and
+                    # stage the result in the static device buffer the graph reads.
+                    _h0 = run_embedding(input_ids)
+                    runner.input_buf.copy_(_h0)
+                    ctx.set_pos(past_len)
+                    ctx.set_ring_pos(past_len - getattr(cache, "window_beg", 0))
+                    for _pl in ctx.past_len_tp.values():
+                        ctx.fill_tp(_pl, past_len)
+                    # Refresh the hd>256 FlashInfer decode plans for this step's kv_len
+                    # (host work, outside the graph) and order the replay after them.
+                    self._fi_tp_graph_plan(cache, past_len + seq_len)
+                    # Replay while dev0's stream is still current: CUDAGraph.replay() launches on
+                    # the torch current stream, and the graph's nodes were captured on this one.
+                    runner.replay()
+                finally:
+                    torch.cuda.set_stream(prev_stream)
+        finally:
+            ctx.graph_mode = False
+        return runner
 
     @torch.inference_mode()
     # @profile
@@ -994,32 +1495,81 @@ class ExLlamaV2:
 
         device = self.modules[0].device_idx
 
-        for idx, module in enumerate(self.modules):
+        # CUDA-graph decode path (BUG 43). Only the single-token decode step is captured:
+        # prefill shapes vary with the prompt and are not the bottleneck. Everything the step
+        # needs that used to come from the host (the sequence position) is read from
+        # tp_context.pos instead, so one graph replays correctly at every step.
+        graph_runner = None
+        # Change98: the graph path also serves the two MTP forwards.
+        #  * bonus commit: seq_len == 1 with return_last_state -- the graph copies the
+        #    pre-final-norm state into a static buffer. Only the head-1 extraction is
+        #    graphable; any other extract_state_indices falls back to eager.
+        #  * verify window: a fixed W-token forward marked explicitly by the caller
+        #    (graph_verify), so arbitrary prefill chunks are never captured.
+        graph_verify = kwargs.pop("graph_verify", False)
+        graph_state = return_last_state and extract_state_indices == {self.head_layer_idx - 1}
+        if (
+            self.tp_context is not None
+            and cache is not None
+            and (seq_len == 1 or graph_verify)
+            and not preprocess_only
+            and (not extract_state_indices or graph_state)
+            and not loras
+            and not kwargs.get("indexed_embeddings")
+            and self.tp_graph is not None
+            and self.tp_graph.can_capture(batch_size, seq_len, loras, allow_multi = graph_verify)
+        ):
+            graph_runner = self._tp_graph_step(
+                input_ids, cache, attn_params, past_len, batch_size, seq_len, last_id_only,
+                return_last_state = graph_state
+            )
+            if graph_runner is not None:
+                # The graph wrote its logits into the runner's static buffer; hand it back.
+                x = graph_runner.logits
+                if graph_state:
+                    r["states"][self.head_layer_idx - 1] = graph_runner.state_buf
+                    r["last_state"] = graph_runner.state_buf
 
-            if idx == self.head_layer_idx and last_id_only:
-                x = x.narrow(-2, -1, 1)
+        if graph_runner is None:
 
-            if idx in extract_state_indices:
-                r["states"][idx] = x.clone()
-                if idx == self.head_layer_idx - 1:
-                    r["last_state"] = r["states"][idx]
+            for idx, module in enumerate(self.modules):
 
-            # Respect abort signal
+                if idx == self.head_layer_idx and last_id_only:
+                    x = x.narrow(-2, -1, 1)
 
-            if abort_event and abort_event.is_set():
-                return None, None
+                if idx in extract_state_indices:
+                    r["states"][idx] = x.clone()
+                    if idx == self.head_layer_idx - 1:
+                        r["last_state"] = r["states"][idx]
 
-            # Onward
+                # Respect abort signal
 
-            n_device = module.device_idx
-            if n_device is not None and n_device != device and n_device >= 0:
-                x = safe_move_tensor(x, n_device, non_blocking = True)
+                if abort_event and abort_event.is_set():
+                    return None, None
 
-            x = module.forward(x, cache = cache, attn_params = attn_params, past_len = past_len, loras = loras, **kwargs)
+                # Onward
 
-            if preprocess_only and idx == self.last_kv_layer_idx:
-                x = None
-                break
+                n_device = module.device_idx
+                if n_device is not None and n_device != device and n_device >= 0:
+                    x = safe_move_tensor(x, n_device, non_blocking = True)
+
+                # BUG 77: a rank-local worker that does not own lm_head must not run it.
+                # Only rank 0 has the head loaded; the others stop after the last layer.
+                if idx == self.head_layer_idx and not getattr(self, "_tp_has_head", True):
+                    break
+
+                x = module.forward(x, cache = cache, attn_params = attn_params, past_len = past_len, loras = loras, **kwargs)
+
+                if os.environ.get("EXL2_TRACE_X") and not isinstance(x, torch.Tensor):
+                    print(f"[TRACE] module {idx} {type(module).__name__} key={getattr(module, 'key', '?')} "
+                          f"returned {type(x).__name__} "
+                          f"len={len(x) if isinstance(x, (list, tuple)) else '-'} "
+                          f"shapes={[tuple(t.shape) for t in x] if isinstance(x, (list, tuple)) else '-'}",
+                          flush=True)
+
+                if preprocess_only and idx == self.last_kv_layer_idx:
+                    x = None
+                    break
 
         # Advance cache
 
@@ -1027,9 +1577,21 @@ class ExLlamaV2:
             cache.current_seq_len += seq_len
 
         # Final sync if gathering logits
+        #
+        # Only when there is something to hand back to the host. This used to run on every TP
+        # forward, including the CUDA-graph decode path, which drained all four devices to the
+        # host on every token and made the GPUs unable to overlap:
+        #
+        #   decode 13.31 ms/token wall, dev0 GPU busy 29.59 ms/token  (busy/wall = 2.22)
+        #   one thread pegged at 100% of wall, total CPU exactly 1.00 cores
+        #   profiler: only 0.39 ms/token of real aten work -> the thread was spinning in this
+        #   synchronise, not dispatching.
+        #
+        # When `x` is None (preprocess_only) or the step already produced its result through a
+        # captured graph, nothing is read on the host here and the sync is pure stall.
 
-        if self.tp_context:
-            self.tp_context.wait_streams()
+        if self.tp_context and x is not None:
+            self.tp_context.wait_streams(x.device.index)
 
         if x is not None and x.is_cuda:
             context = self.get_device_context(x.device.index)

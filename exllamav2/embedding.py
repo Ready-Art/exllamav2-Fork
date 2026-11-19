@@ -58,6 +58,29 @@ class ExLlamaV2Embedding(ExLlamaV2Module):
         self.embedding.weight = w
 
 
+    def tp_load_rank(self, rank: int):
+        """
+        Load the embedding table in full, pinned to one device, for a rank-local worker.
+
+        The table is replicated, not sharded: ``tp_split()`` only sets ``is_tp = True`` and
+        leaves the whole weight in place, because every rank needs to look up arbitrary token
+        ids. So the rank-local path is a full load.
+
+        ``is_tp`` must stay False here. In the single-threaded TP path it means "copy the
+        result into the pinned staging buffer so the next module can broadcast it", which a
+        worker process does not need -- its result is already on its own device.
+
+        :param rank:
+            Device index this worker owns.
+        """
+        # device_idx must be set BEFORE load(): load_weight() -> load_multi() reads
+        # self.device(), which reads self.device_idx.
+        self.device_idx = rank
+        self.load()
+        self.is_tp = False
+        if self.embedding is not None:
+            self.embedding.weight.data = safe_move_tensor(self.embedding.weight.data, rank)
+
     def unload(self):
 
         del self.embedding

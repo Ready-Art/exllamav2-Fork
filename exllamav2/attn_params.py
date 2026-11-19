@@ -133,23 +133,44 @@ class Params:
         return attn_masks
 
     def prep_tp(self, model):
-        if self.position_offsets_tp is not None:
-            return
+        # The KV split is per attention geometry (Gemma-4 mixes 16- and 4-kv-head layers),
+        # so the per-device tensors must be rebuilt when the geometry changes rather than
+        # cached once for the whole model.
+        _geo = getattr(model.tp_context, "geometry_key_active", None)
         split = model.tp_context.get_split(BROADCAST_KV)
-        self.position_offsets_tp = []
-        self.past_len_tp = []
+
+        # Per-geometry cache. Gemma-4 alternates two attention geometries layer by layer, so a
+        # single-slot cache thrashes: every layer change rebuilt the tensors, and the rebuild
+        # calls safe_move_tensor -> torch.cuda.synchronize(), which is illegal inside a CUDA
+        # graph capture region. Caching every geometry makes the in-capture call a pure lookup.
+        cache = getattr(self, "_prep_tp_cache", None)
+        if cache is None:
+            cache = {}
+            self._prep_tp_cache = cache
+
+        ent = cache.get(_geo)
+        if ent is not None and len(ent[1]) == len(split):
+            self.position_offsets_tp, self.past_len_tp = ent
+            return
+
+        position_offsets_tp = []
+        past_len_tp = []
         pl = torch.tensor([self.past_len] * self.batch_size, dtype = torch.int)
         for dev, a, b in split:
             context = model.get_device_context(dev)
             torch.cuda.set_stream(context.stream)
             if self.position_offsets is None:
-                self.position_offsets_tp.append(None)
+                position_offsets_tp.append(None)
             else:
-                self.position_offsets_tp.append(safe_move_tensor(self.position_offsets, dev, non_blocking = True))
+                position_offsets_tp.append(safe_move_tensor(self.position_offsets, dev, non_blocking = True))
             if self.past_len is None:
-                self.past_len_tp.append(None)
+                past_len_tp.append(None)
             else:
-                self.past_len_tp.append(safe_move_tensor(pl, dev, non_blocking = True))
+                past_len_tp.append(safe_move_tensor(pl, dev, non_blocking = True))
+        # Publish only once fully built, so a failure cannot leave a half-filled list behind.
+        cache[_geo] = (position_offsets_tp, past_len_tp)
+        self.position_offsets_tp = position_offsets_tp
+        self.past_len_tp = past_len_tp
 
     def get_alt_rope_embed(self, device):
         if not self.alt_rope_embed_dict:
@@ -215,6 +236,16 @@ class PagedParams(Params):
     is_sequential: bool
     first_index: int
 
+    # SWA ring-buffer support (workstream ③). PLAN.md §4.3 Phase 3B.
+    #
+    # `window_beg` is the absolute position of the ring's first slot, one per sequence. It is NOT a
+    # single global value: batch > 1 with different cache_seqlens needs a per-row value or the ring
+    # desynchronises silently. PLAN.md §8 trap 14.
+    #
+    # `sliding_window` is the window for the layer being run (0 = full attention, no ring).
+    window_beg: torch.Tensor | None
+    sliding_window: int
+
     def __init__(
         self,
         batch_size: int,
@@ -224,7 +255,9 @@ class PagedParams(Params):
         page_size: int,
         q_len: int = 0,
         alt_rope_embed: dict | None = None,
-        rope_offsets: torch.Tensor | None = None
+        rope_offsets: torch.Tensor | None = None,
+        window_beg: torch.Tensor | None = None,
+        sliding_window: int = 0
     ):
         super().__init__(
             batch_size = batch_size,
@@ -237,6 +270,8 @@ class PagedParams(Params):
         self.page_size = page_size
         self.alt_rope_embed = alt_rope_embed or {}
         self.rope_offsets = rope_offsets
+        self.window_beg = window_beg
+        self.sliding_window = sliding_window
 
         self.is_sequential = False
         assert self.block_index.device.type == "cpu"
@@ -285,9 +320,20 @@ class PagedParams(Params):
             self.rope_offsets = safe_move_tensor(self.rope_offsets, device_idx, non_blocking = True)
         return self.rope_offsets
 
+    def get_window_beg(self, device_idx: int) -> torch.Tensor | None:
+        """Per-row absolute position of the ring's first slot. None when no ring is in use."""
+        if self.window_beg is None:
+            return None
+        if self.window_beg.device.type == "cpu" or self.window_beg.device.index != device_idx:
+            self.window_beg = safe_move_tensor(self.window_beg, device_idx, non_blocking = True)
+        return self.window_beg
+
     def prep_tp(self, model):
-        if self.block_index_tp is not None:
+        # Per-geometry, see Params.prep_tp.
+        _geo = getattr(model.tp_context, "geometry_key_active", None)
+        if self.block_index_tp is not None and getattr(self, "_prep_tp_geo", None) == _geo:
             return
+        self._prep_tp_geo = _geo
         self.block_index_tp = []
         self.cache_seqlens_tp = []
         if self.is_sequential:

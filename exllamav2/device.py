@@ -116,20 +116,50 @@ class ExLlamaV2DeviceContext:
 
 
     def prepare_sincos(self):
+        """
+        Build the sin/cos tables for each rope variant.
+
+        Table index 0 is the base table (theta = ``rotary_embedding_base``); index 1 is the alt
+        table (theta = ``rotary_embedding_base_alt``) when present. ``model.py`` selects index 1
+        for sliding layers via ``rope_index``.
+
+        For Gemma-4 the base table serves the full-attention layers and must therefore be built
+        with ``global_head_dim`` (512) and *proportional* rope, while the alt table serves the
+        sliding layers with ``head_dim`` (256) and default rope. PLAN.md §2.2 step 4, §2.3.
+        """
 
         device = _torch_device(self.device_idx)
         cfg = self.model.config
 
+        # Per-table geometry. `table_head_dim` is the *full* head dim the table must span, and
+        # `rope_type` selects the frequency computation.
+        #
+        # TRAP (PLAN.md §8 trap 1): the sin/cos tensor width must be the full head_dim (512), NOT
+        # head_dim * partial_rotary_factor (128). The CUDA rope kernel derives `half_dim` from
+        # sincos_size and reads `column + half_dim`, so a 128-wide table makes it rotate the wrong
+        # span and silently corrupts the 512-dim layers.
+
+        has_global = getattr(cfg, "layer_types", None) is not None
+
         thetas = [cfg.rotary_embedding_base]
         scales = [cfg.scale_pos_emb]
+        table_head_dims = [cfg.global_head_dim if has_global else cfg.head_dim]
+        table_rope_types = [cfg.rope_type_global if has_global else None]
+        table_rope_props = [cfg.rope_partial_rotary_factor_global if has_global else None]
+
         if cfg.rotary_embedding_base_alt:
             thetas.append(cfg.rotary_embedding_base_alt)
             scales.append(cfg.scale_pos_emb_alt)
+            table_head_dims.append(cfg.head_dim)
+            table_rope_types.append(None)
+            table_rope_props.append(None)
 
         self.sin = []
         self.cos = []
 
-        for theta, lscale in zip(thetas, scales):
+        for theta, lscale, t_head_dim, t_rope_type, t_rope_prop in zip(
+            thetas, scales, table_head_dims, table_rope_types, table_rope_props
+        ):
 
             if self.archparams.rope_style == RopeStyle.NONE:
                 sin = torch.zeros((1,), device = device, dtype = torch.half)
@@ -140,7 +170,14 @@ class ExLlamaV2DeviceContext:
 
             # RoPE params
 
-            inv_freq, scaling_factor = rope.get_rope_params(device, cfg, theta)
+            inv_freq, scaling_factor = rope.get_rope_params(
+                device,
+                cfg,
+                theta,
+                head_dim = t_head_dim,
+                rope_type = t_rope_type,
+                rope_proportion = t_rope_prop,
+            )
 
             # Common
 
@@ -157,6 +194,12 @@ class ExLlamaV2DeviceContext:
                 emb = torch.repeat_interleave(freqs, 2, dim=-1)
             else:
                 raise ValueError()
+
+            # For proportional rope the zero-filled tail yields sin=0, cos=1, i.e. identity.
+            # Assert the width matches the full head dim so a future refactor cannot silently
+            # shrink the table.
+            assert emb.shape[-1] == t_head_dim, \
+                f"sincos table width {emb.shape[-1]} != head_dim {t_head_dim}"
 
             sin = emb.sin()[None, None, :, :]
             cos = emb.cos()[None, None, :, :]

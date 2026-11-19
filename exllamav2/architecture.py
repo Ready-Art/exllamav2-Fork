@@ -72,6 +72,10 @@ expect_keys_llama = [["lm_head"],
                      ["model.embed_tokens"]]
 expect_keys_gemma = [["model.norm"],
                      ["model.embed_tokens"]]
+# Gemma-4 nests one level deeper: lm_prefix is `model.language_model.`, so the
+# remaining keys are relative to that prefix.
+expect_keys_gemma4 = [["norm"],
+                      ["embed_tokens"]]
 expect_keys_starcoder2 = [["model.norm"],
                           ["model.embed_tokens"]]
 expect_keys_gpt2 = [["model.embed_tokens"]]
@@ -170,6 +174,16 @@ class ExLlamaV2ArchParams:
             # Constant bias for layernorm (Gemma quirk)
             norm_constant_bias = 0
 
+            # Constant bias for the per-head q_norm/k_norm (Gemma quirk).
+            #
+            # Gemma-2/3 store their norms as `w` and apply `(1 + w)`, so the loader adds 1 to every
+            # norm weight. Gemma-4 changed this: its `Gemma4RMSNorm` is a plain `x * w` with no +1
+            # (transformers/models/gemma4/modeling_gemma4.py:219-223), and the checkpoint stores the
+            # final weight directly. The main norms are covered by `norm_constant_bias = 0` for Gemma-4,
+            # but the per-head norms are loaded by a different module (headnorm.py) that historically
+            # reused the same flag. This field decouples them. PLAN.md §2.4 / §8 trap 19.
+            headnorm_constant_bias = 0
+
             # Alternate packing scheme for fused QKV tensor (InternLM2 quirk)
             fused_qkv_altpack = False
 
@@ -179,6 +193,34 @@ class ExLlamaV2ArchParams:
             sliding_rope_theta = None
             sliding_rope_scale = None
             pos_id_index = 0
+
+            # Per-layer attention geometry (Gemma-4). `layer_types` is the authoritative list
+            # from config.json; `global_head_dim` / `default_num_global_key_value_heads`
+            # describe the full-attention layers. For every other architecture these stay at
+            # their defaults and the geometry is uniform. PLAN.md §2.1.
+            layer_types: list[str] | None = None
+            global_head_dim = no_default
+            default_num_global_key_value_heads = no_default
+
+            # Full-attention layers have no v_proj; V is K (Gemma-4 `attention_k_eq_v`).
+            attention_k_eq_v = False
+
+            # Unweighted RMSNorm applied to V (Gemma-4 `v_norm`).
+            v_norm = False
+
+            # Per-layer scalar multiplier applied to the block output (Gemma-4 `layer_scalar`).
+            layer_scalar = False
+
+            # Proportional RoPE for the global-attention layers (Gemma-4).
+            rope_partial_rotary_factor = no_default
+
+            # Attention logit scaling. When True, sm_scale is 1.0 instead of 1/sqrt(head_dim).
+            # Gemma-4's Gemma4TextAttention sets `self.scaling = 1.0` because q_norm/k_norm
+            # already normalise each head vector to unit RMS, so the usual 1/sqrt(d) factor
+            # would attenuate every logit by a further 16x (head_dim 256) or 22.6x (head_dim
+            # 512) and flatten the softmax towards uniform.
+            # transformers/models/gemma4/modeling_gemma4.py:1170 `self.scaling = 1.0`.
+            unit_attn_scale = False
 
             # Model only works with eager attention
             eager_attn_only = False
@@ -225,6 +267,25 @@ class ExLlamaV2ArchParams:
             # Expected keys
             expect_keys: list[str] = field(default_factory = lambda: [])
             layer_keys: list[str] = field(default_factory = lambda: [])
+
+            # Root of the per-layer key path, relative to `lm_prefix`.
+            #
+            # Most architectures nest layers at `<lm_prefix>model.layers.N`. Gemma-4
+            # nests them at `<lm_prefix>layers.N` instead, because its lm_prefix is
+            # already `model.language_model.`. Hard-coding "model.layers" and then
+            # prepending lm_prefix produces `model.language_model.model.layers.N`,
+            # which does not exist in the checkpoint. PLAN.md §2.1.
+            layers_root = "model.layers"
+
+            # Embedding and final-norm key paths, relative to `lm_prefix`.
+            #
+            # Same nesting problem as `layers_root`: these were hard-coded as
+            # `<lm_prefix>model.embed_tokens` / `<lm_prefix>model.norm`, which for Gemma-4
+            # expands to `model.language_model.model.embed_tokens` — a key that does not
+            # exist. The real keys are `model.language_model.embed_tokens` and
+            # `model.language_model.norm`. PLAN.md §2.1.
+            embed_key = "model.embed_tokens"
+            norm_key = "model.norm"
 
             # Defaults because Gemma3
             default_vocab_size = no_default
@@ -650,6 +711,88 @@ class ExLlamaV2ArchParams:
                 "input_projection_norm": "mm_soft_emb_norm",
             })
             self.mmp.norm_constant_bias = 1
+
+        # Gemma4
+        #
+        # Text-only port. The checkpoint is `Gemma4ForConditionalGeneration` and carries a
+        # vision_tower, but vision is explicitly out of scope (PLAN.md §2.9): the loader accepts
+        # the architecture string and skips every vision_tower.* / multi_modal_projector.* tensor.
+        #
+        # The defining property is per-layer-varying attention geometry: 5 sliding layers
+        # (head_dim 256, 16 kv heads) then 1 full layer (head_dim 512, 4 kv heads), repeating.
+        # Full layers have no v_proj (attention_k_eq_v) and use proportional RoPE at 0.25.
+
+        if arch_string in ("Gemma4ForConditionalGeneration", "Gemma4ForCausalLM"):
+            arch_recognized = True
+            self.lm.layer_keys += \
+                layer_keys_gemma2_norms + \
+                layer_keys_llama_attn + \
+                layer_keys_llama_mlp
+            self.lm.expect_keys += \
+                expect_keys_gemma4
+            self.lm.keys.update({
+                "lm_head": "embed_tokens",
+                "norm_1": ".input_layernorm",
+                "norm_1_post": ".post_attention_layernorm",
+                "norm_2": ".pre_feedforward_layernorm",
+                "norm_2_post": ".post_feedforward_layernorm",
+            })
+            # Gemma-4 nests the text model one level deeper than Gemma-3, and its
+            # layers sit directly under the prefix rather than under `model.`.
+            self.lm_prefix = "model.language_model."
+            self.lm.layers_root = "layers"
+            self.lm.embed_key = "embed_tokens"
+            self.lm.norm_key = "norm"
+            self.lm.mlp_act_func = "gelu"
+            self.lm.normalize_embeddings = True
+            # Gemma-4's Gemma4RMSNorm is a plain `x * w` with NO `(1 + w)` bias, unlike Gemma-2/3.
+            # The checkpoint stores the final weight directly (verified: the final norm weight has
+            # rms 32.25, max 510, which is only sane as a direct multiplier). Setting this to 1 would
+            # add 1 to every norm weight and corrupt the whole residual stream.
+            # transformers/models/gemma4/modeling_gemma4.py:219-223. PLAN.md §2.4 / §8 trap 19.
+            self.lm.norm_constant_bias = 0
+            self.lm.headnorm_constant_bias = 0
+            self.lm.requires_bos = True
+            self.lm.alternating_swa = True
+            self.lm.residual_stream_fp32 = True
+            self.lm.sliding_rope_theta = 10000
+            self.lm.sliding_rope_scale = 1
+            self.lm.default_vocab_size = 262144
+            self.lm.default_rms_norm_eps = 1e-06
+            self.lm.default_head_dim = 256
+            self.lm.default_num_attention_heads = 32
+            self.lm.default_num_key_value_heads = 16
+            self.lm.default_use_qk_norm = True
+            self.lm.default_sliding_window_pattern = 6
+            self.lm.default_rope_theta = 1e6
+            self.lm.pos_id_index = 0
+            self.lm.headnorm = "rmsnorm"
+
+            # Per-layer geometry
+            self.lm.global_head_dim = 512
+            self.lm.default_num_global_key_value_heads = 4
+            self.lm.attention_k_eq_v = True
+            self.lm.v_norm = True
+            self.lm.layer_scalar = True
+            self.lm.rope_partial_rotary_factor = 0.25
+            # Gemma4TextAttention sets scaling = 1.0 (q_norm/k_norm already normalise the heads).
+            self.lm.unit_attn_scale = True
+
+            # Tensor parallelism. Gemma-4 mixes two attention geometries in one model
+            # (50 sliding layers: 16 kv heads / head_dim 256 / nkg 2; 10 full layers:
+            # 4 kv heads / head_dim 512 / nkg 8). A single global split cannot describe
+            # both, so the TP context carries one split set per geometry and the attention
+            # module selects the right one per layer. See tensor_p.py:define_split.
+            self.lm.supports_tp = True
+            self.lm.tp_per_layer_geometry = True
+
+            self.keymap = google_keymap
+            self.compile_fix_keymap = google_keymap
+
+            # Vision tower is declared so the loader can find and skip it, but nothing under
+            # vt_prefix is ever instantiated (PLAN.md §2.9).
+            self.vt_prefix = "vision_tower."
+            self.mmp_prefix = "multi_modal_projector."
 
         # StarCoder2
 

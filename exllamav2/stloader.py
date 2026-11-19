@@ -166,3 +166,73 @@ class STFile:
         if out_dtype:
             tensor = tensor.to(out_dtype)
         return tensor
+
+    def get_tensor_slice(
+        self,
+        key: str,
+        device,
+        start: int,
+        end: int,
+        out_dtype = None
+    ) -> torch.Tensor:
+        """
+        Load rows [start, end) of a tensor, without reading the rest of it.
+
+        A safetensors tensor is row-major contiguous, so a row range of a 2-D tensor (or an
+        element range of a 1-D tensor) is one contiguous byte range in the file. This is what
+        makes rank-local loading possible: a worker reads only the shard it owns instead of
+        materialising the full tensor and slicing it.
+
+        :param key:
+            Tensor name
+
+        :param device:
+            Target device
+
+        :param start:
+            First row (2-D) or element (1-D) to read, inclusive
+
+        :param end:
+            Last row/element to read, exclusive
+
+        :param out_dtype:
+            Force output datatype
+
+        :return:
+            torch.Tensor of shape (end - start, ...) for 2-D, or (end - start,) for 1-D
+        """
+        h = self.header[key]
+        dtype, esize = convert_dtype(h["dtype"])
+        beg, _end = h["data_offsets"]
+        shape = h["shape"]
+
+        if len(shape) == 0:
+            raise ValueError("get_tensor_slice: scalar tensor " + key)
+
+        rows = shape[0]
+        if start < 0 or end > rows or start > end:
+            raise ValueError(
+                "get_tensor_slice: range [%d,%d) out of bounds for %s with %d rows"
+                % (start, end, key, rows)
+            )
+
+        row_bytes = (_end - beg) // rows
+        if row_bytes * rows != (_end - beg):
+            raise ValueError("get_tensor_slice: non-uniform row size for " + key)
+
+        out_shape = (end - start,) + tuple(shape[1:])
+        tensor = torch.zeros(out_shape, dtype = dtype, device = device)
+        torch.cuda.synchronize()
+        assert tensor.is_contiguous, "Non-contiguous tensor"
+
+        if end > start:
+            ext_c.stloader_read(
+                self.filename,
+                beg + self.header_size + start * row_bytes,
+                (end - start) * row_bytes,
+                tensor
+            )
+
+        if out_dtype:
+            tensor = tensor.to(out_dtype)
+        return tensor

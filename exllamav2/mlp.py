@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -327,6 +328,24 @@ class ExLlamaV2MLP(ExLlamaV2Module):
     ) -> torch.Tensor | dict[str: torch.Tensor]:
 
         if self.is_tp:
+            # BUG 34c: the fused TP MLP kernel (ext_c.tp_mlp_forward_) has no post-FF norm
+            # parameter at all -- see ext_qmlp.cpp, which accepts pre_layernorm only. Gemma-4
+            # folds a post-FF norm into the MLP (post_layernorm), so on the fused path that
+            # norm was silently skipped and the residual stream came out un-normalised.
+            # forward_tp_old applies it explicitly (gather -> norm full-width -> residual add),
+            # which is the same order as the non-TP path, and was verified to reproduce the
+            # non-TP fused kernel to cos 1.0000093. Models without a post-FF norm keep the
+            # fused kernel.
+            if self.post_layernorm is not None:
+                return self.forward_tp_old(
+                    hidden_states,
+                    cache,
+                    attn_params,
+                    past_len,
+                    intermediates,
+                    loras,
+                    **kwargs
+                )
             return self.forward_tp(
                 hidden_states,
                 cache,
@@ -399,6 +418,35 @@ class ExLlamaV2MLP(ExLlamaV2Module):
         return ctx.get_pinned(0, batch_size, q_len, self.hidden_size)
 
 
+    def _post_norm_full(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply ``post_layernorm`` to a full-width tensor.
+
+        The norm is TP-split (``tp_split(BROADCAST_RS)``), so its ``forward()`` only
+        accepts per-device slices. Rebuild the full weight on the tensor's own device
+        (cached) and apply the RMSNorm math directly. BUG 34c.
+        """
+        norm = self.post_layernorm
+        if norm is None:
+            return x
+        if not getattr(norm, "is_tp", False):
+            return norm.forward(x, output_fp32 = self.archparams.residual_stream_fp32)
+
+        w = getattr(self, "_post_norm_w_full", None)
+        if w is None or w.device != x.device:
+            # tp_split(BROADCAST_RS) gives every device a FULL-width copy, so the list
+            # holds N identical tensors. Take one, do not concat.
+            parts = norm.weight if isinstance(norm.weight, list) else [norm.weight]
+            w = parts[0].to(x.device)
+            self._post_norm_w_full = w
+
+        # BUG 38: fused kernel instead of the pure-torch fp32 round trip. See the
+        # matching note in attn.py::_post_norm_full.
+        x = x.contiguous()
+        out = torch.empty_like(x)
+        ext_c.rms_norm(x, w, out, norm.variance_epsilon)
+        return out
+
     def forward_tp_old(
         self,
         hidden_states: torch.Tensor,
@@ -441,6 +489,39 @@ class ExLlamaV2MLP(ExLlamaV2Module):
         outputs = self.model.tp_context.allgather(1, outputs, BROADCAST_ID, BROADCAST_ID)
 
         down = self.down_proj.forward_tp(outputs, output_split = True)
+
+        # BUG 34c: the post-FF norm was missing here too. forward_tp_old went straight
+        # from down_proj to the residual add, while the non-TP path applies
+        # post_layernorm to the down_proj output first (mlp.py:503). Dropping it leaves
+        # the residual stream un-normalised, exactly as in the attention module.
+        #
+        # The norm needs the full hidden width for its RMS reduction, so gather first.
+        # exllamav3 does the equivalent with a separate full-width `mlp_post_norm` block
+        # (transformer.py:224).
+        if self.post_layernorm is not None:
+            dev0 = self.model.tp_context.device
+            context = self.model.get_device_context(dev0)
+            torch.cuda.set_stream(context.stream)
+            down_full = self.model.tp_context.gather(0, down, BROADCAST_RS)
+            down_full = down_full.to(dev0, non_blocking = True)
+            if os.environ.get("EXL2_MLP_DUMP") and self.key.endswith("layers.0"):
+                torch.save({
+                    "down_pre_norm": down_full.detach().float().cpu(),
+                    "res": (residual[0] if isinstance(residual, (list, tuple)) else residual).detach().float().cpu(),
+                    "w_shape": tuple(self._post_norm_w_full.shape),
+                    "x_shape": tuple(down_full.shape),
+                }, os.environ["EXL2_MLP_DUMP"] + "_tp_pre.pt")
+            down_full = self._post_norm_full(down_full)
+            if self.has_residual:
+                res = residual[0] if isinstance(residual, (list, tuple)) else residual
+                if res.device != down_full.device:
+                    res = res.to(down_full.device, non_blocking = True)
+                down_full = down_full + res
+            if os.environ.get("EXL2_MLP_DUMP") and self.key.endswith("layers.0"):
+                torch.save({
+                    "out": down_full.detach().float().cpu(),
+                }, os.environ["EXL2_MLP_DUMP"] + "_tp.pt")
+            return down_full.view(batch_size, q_len, down_full.shape[-1])
 
         if self.has_residual:
             self.model.tp_context.add_residual(down, residual, BROADCAST_RS)
@@ -503,6 +584,14 @@ class ExLlamaV2MLP(ExLlamaV2Module):
         if self.post_layernorm:
             down = self.post_layernorm.forward(down, output_fp32 = self.archparams.residual_stream_fp32)
         hidden_states = down + residual if self.has_residual else down
+        if os.environ.get("EXL2_MLP_DUMP") and self.key.endswith("layers.0"):
+            torch.save({
+                "post_norm": post_norm.detach().float().cpu(),
+                "down": down.detach().float().cpu(),
+                "residual": residual.detach().float().cpu(),
+                "out": hidden_states.detach().float().cpu(),
+                "post_ln_is_none": self.post_layernorm is None,
+            }, os.environ["EXL2_MLP_DUMP"] + "_nontp.pt")
 
         if self.archparams.residual_stream_fp32:
             hidden_states = hidden_states.float()
@@ -585,6 +674,48 @@ class ExLlamaV2MLP(ExLlamaV2Module):
 
         self.is_tp = True
 
+
+    def tp_load_rank(self, rank: int):
+        """
+        Load only this MLP block's slice for device ``rank``.
+
+        Mirrors :meth:`tp_split`. ``down_proj`` is loaded with ``unmap = True``, exactly as
+        ``ExLlamaV2MLP.load()`` does, and the permutation it returns is applied to
+        ``gate_proj`` / ``up_proj`` through ``tensor_remap`` -- see BUG 52. Getting this wrong
+        permutes the down_proj input twice and puts its GEMM 142% off peak.
+        """
+        cfg = self.model.config
+
+        if self.pre_layernorm is not None:
+            self.pre_layernorm.tp_load_rank(rank, BROADCAST_RS)
+        if self.post_layernorm is not None:
+            self.post_layernorm.tp_load_rank(rank, BROADCAST_RS)
+
+        # down_proj first: it yields the permutation that gate/up must be remapped with.
+        down_perm = self.down_proj.tp_load_rank(rank, BROADCAST_RS, unmap = True)
+
+        if self.gate_proj is not None:
+            self.gate_proj.tp_load_rank(rank, BROADCAST_ID, output_map = down_perm)
+
+        self.up_proj.tp_load_rank(rank, BROADCAST_ID, output_map = down_perm)
+
+        maxrows = cfg.max_batch_size * cfg.max_input_len
+        dtype = torch.half
+
+        ctx = self.model.tp_context
+        ctx.begin_scratch_alloc_tp()
+        ctx.reserve_scratch(self.tp_dq_size)
+        self.temp_bc0 = ctx.get_scratch_slice_tp_bc(maxrows, dtype, BROADCAST_RS)
+        self.temp_bc1 = ctx.get_scratch_slice_tp_bc(maxrows, dtype, BROADCAST_RS)
+        self.temp_bc2 = ctx.get_scratch_slice_tp_bc(maxrows, dtype, BROADCAST_ID)
+        self.temp_gate = ctx.get_scratch_slice_tp(maxrows, dtype, BROADCAST_ID)
+        self.temp_up = ctx.get_scratch_slice_tp(maxrows, dtype, BROADCAST_ID)
+        self.temp_down = ctx.get_scratch_slice_tp(maxrows, dtype, BROADCAST_RS)
+
+        self.is_tp = True
+        # BUG 72: forward_chunk() reads module.device_idx, which only set_device_idx()
+        # creates. Mirror attn.tp_load_rank, which ends the same way.
+        self.set_device_idx(None)
 
     def scratch_space_tp(self):
 

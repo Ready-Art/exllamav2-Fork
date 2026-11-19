@@ -18,6 +18,27 @@ BROADCAST_RS = 3
 BROADCAST_Q = 4
 
 
+def tp_reuse_buffers(cache: dict, specs: list):
+    """
+    Return reusable output buffers for a TP module.
+
+    ``specs`` is a list of (device, rows, cols, dtype). Buffers are keyed by
+    (device, cols, dtype) and reallocated only when the row count changes, so the
+    cache holds at most one buffer per device per module. BUG 41.
+    """
+    out = []
+    for dev, rows, cols, dtype in specs:
+        key = (dev, cols, dtype)
+        ent = cache.get(key)
+        if ent is None or ent[0] != rows:
+            buf = torch.empty((rows, cols), device = dev, dtype = dtype)
+            cache[key] = (rows, buf)
+        else:
+            buf = ent[1]
+        out.append(buf)
+    return out
+
+
 class TPContext:
 
     model: ExLlamaV2
@@ -81,6 +102,41 @@ class TPContext:
         self.sin = None
         self.cos = None
 
+        # Reusable destination buffers for broadcast()/gather_dev(). Allocating per call is
+        # not permitted inside a CUDA graph capture region. BUG 43.
+        self._bc_cache = None
+        self._gather_cache = None
+        self._ag_cache = None
+
+        # CUDA-graph mode. When set, gather() returns a *device* tensor on the primary device
+        # instead of a host view of pinned_temp, and skips the host drain. That removes the two
+        # things that make the decode step uncapturable. `pos` is the current sequence position
+        # as a device int32 tensor, so RoPE and the KV write read it on-device rather than
+        # having it baked into kernel arguments at capture time. BUG 43.
+        self.graph_mode = False
+        self.pos = None
+        self.pos_tp = {}
+
+        # Per-geometry state. Populated by define_split()/finalize(); declared here because
+        # scratch_space_tp() and tp_split() call get_split() during load, before finalize().
+        self.geometry_splits = {}
+        self.geometry_keys = []
+        self.geometry_key_active = None
+        self.ext_tp_contexts = {}
+
+        # Multiprocess mode: the device index this process owns, or None for the
+        # single-process path. Set by TPContext.set_rank() from a worker before loading.
+        self.rank = None
+
+        # FlashInfer paged decode wrappers for head_dim > 256 layers in CUDA-graph mode
+        # (Gemma-4's hd512 global layers). One wrapper per (device, geometry): all such
+        # layers share the per-device head split, so a single per-step plan serves every
+        # layer's run() inside the graph. plan() is host work and must run OUTSIDE the
+        # capture, before each replay; run() is captured. FlashInfer >= 0.7.4 serves
+        # hd512 on sm86 (verified cos 1.0); the contiguous per-device KV buffer is viewed
+        # as 128-token pages. See attn.py forward_tp_old / model.py _tp_graph_step.
+        self.fi_decode = {}
+
         self.define_split(gpu_split, expect_cache_tokens, expect_cache_base)
 
 
@@ -93,10 +149,116 @@ class TPContext:
 
     def all_devices(self) -> list[int]:
 
+        # Multiprocess mode: this process owns exactly one device. Returning the full set
+        # would make wait_streams()/_sync_all_devices() touch devices with no context here.
+        if self.rank is not None:
+            return [self.rank]
+
         devs = set([d for d, _, _ in self.kv_split])
         devs |= set([d for d, _, _ in self.id_split])
         devs |= set([d for d, _, _ in self.vc_split])
         return sorted(devs)
+
+    # ------------------------------------------------------------------ hd>256 graph decode
+
+    FI_DECODE_PAGE = 128
+
+    def fi_decode_plan(self, key, kv_len: int, k_cache_dev: torch.Tensor) -> bool:
+        """
+        Plan the shared per-device FlashInfer paged decode wrapper for this step.
+
+        Host-side work: must run OUTSIDE any CUDA graph capture, before warmup/capture
+        and before every replay. The contiguous ``(1, S, HKV, D)`` TP KV buffer is served
+        as ``S // 128`` pages; the valid prefix length is dynamic via indptr/last_page_len,
+        which is exactly what the per-step re-plan refreshes (the graph-safe hd512 pattern).
+
+        :param key: ``(dev, num_qo_heads, num_kv_heads, head_dim, sm_scale)``
+        :param kv_len: valid KV prefix including the token being decoded.
+        :param k_cache_dev: this device's KV buffer (for depth/dtype).
+        :return: True if the wrapper is ready, False if the shape cannot be served.
+        """
+        import flashinfer
+        from exllamav2 import attn_backend
+
+        dev, nq, nkv, hd, scale = key
+        page = self.FI_DECODE_PAGE
+        depth = k_cache_dev.shape[1]
+        if depth % page != 0 or kv_len < 1 or kv_len > depth:
+            return False
+
+        entry = self.fi_decode.get(key)
+        if entry is None:
+            workspace = attn_backend.FlashInferPaged._get_workspace(torch.device("cuda", dev))
+            entry = {
+                "wrapper": flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace, "NHD"),
+                "npages": depth // page,
+                "indices": torch.arange(depth // page, dtype = torch.int32, device = dev),
+                "indptr": torch.zeros(2, dtype = torch.int32, device = dev),
+                "last_page_len": torch.zeros(1, dtype = torch.int32, device = dev),
+            }
+            self.fi_decode[key] = entry
+
+        pages_valid = (kv_len + page - 1) // page
+        entry["indptr"][1] = pages_valid
+        entry["last_page_len"][0] = kv_len - (pages_valid - 1) * page
+
+        prev_dev = torch.cuda.current_device()
+        prev_stream = torch.cuda.current_stream(dev)
+        torch.cuda.set_device(dev)
+        torch.cuda.set_stream(self.streams_dev[dev])
+        try:
+            entry["wrapper"].plan(
+                indptr = entry["indptr"],
+                indices = entry["indices"],
+                last_page_len = entry["last_page_len"],
+                num_qo_heads = nq,
+                num_kv_heads = nkv,
+                head_dim = hd,
+                page_size = page,
+                pos_encoding_mode = "NONE",
+                window_left = -1,
+                logits_soft_cap = None,
+                sm_scale = scale,
+                q_data_type = torch.half,
+                kv_data_type = k_cache_dev.dtype,
+            )
+        finally:
+            torch.cuda.set_stream(prev_stream)
+            torch.cuda.set_device(prev_dev)
+        return True
+
+    def fi_decode_run(self, key, q: torch.Tensor, k_cache_dev: torch.Tensor, v_cache_dev: torch.Tensor):
+        """
+        Capturable hd>256 decode attention against the per-step plan. ``(1, 1, H, D)`` query,
+        contiguous per-device KV buffers; returns ``(1, 1, H * D)`` like _attn_torch.
+        """
+        entry = self.fi_decode[key]
+        page = self.FI_DECODE_PAGE
+        npages = entry["npages"]
+        nkv = k_cache_dev.shape[2]
+        hd = q.shape[3]
+        k_pages = k_cache_dev.view(npages, page, nkv, hd)
+        v_pages = v_cache_dev.view(npages, page, nkv, hd)
+        # run() expects 3-D q (batch, num_qo_heads, head_dim); a 2-D (H, D) tensor is
+        # misread as q_len_per_req=H by the non-tensor-core decode kernel.
+        out = entry["wrapper"].run(q.view(1, q.shape[2], hd), (k_pages, v_pages))
+        return out.view(1, 1, q.shape[2] * hd)
+
+    def fi_decode_order_before_replay(self):
+        """
+        Order dev0's replay launch after every device's plan work: record an event on each
+        device's TP stream (where fi_decode_plan ran) and make dev0's stream wait on them.
+        The graph's internal fork/join events then propagate that ordering to every device
+        branch, so no replayed run() can read a half-written plan.
+        """
+        dev0 = self.device
+        s0 = self.streams_dev[dev0]
+        for dev in self.all_devices():
+            if dev == dev0:
+                continue
+            ev = torch.cuda.Event()
+            ev.record(self.streams_dev[dev])
+            s0.wait_event(ev)
 
 
     def define_split(
@@ -136,7 +298,28 @@ class TPContext:
         else:
             bytes_per_element = 2
 
-        cache_size = 2 * bytes_per_element * cfg.num_key_value_heads * cfg.head_dim * cfg.num_hidden_layers * expect_cache_tokens
+        # Per-layer geometry: Gemma-4 mixes head_dim 256/512 and 16/4 kv heads, so summing
+        # num_key_value_heads * head_dim over layers is not the same as multiplying by
+        # num_hidden_layers. PLAN.md §2.2.
+        # Sliding-window layers only ever hold a ring of
+        #   ceil((sliding_window + overp) / page_size) * page_size
+        # tokens, not the full context. Sizing them at `expect_cache_tokens` over-reserves by
+        # orders of magnitude: for Gemma-4 at 64k that is 59 GB instead of ~1.4 GB, which
+        # zeroes the per-device split and then divides by zero in integer_split().
+        # PLAN.md §4.0.
+        _sw = getattr(cfg, "sliding_window", 0) or 0
+        _page = 128
+        _overp = getattr(cfg, "sliding_window_overp", None)
+        if _overp is None:
+            _overp = 2 * _page
+        _ring = (((_sw + _overp) + _page - 1) // _page) * _page if _sw else 0
+
+        kv_elements = 0
+        for _li in range(cfg.num_hidden_layers):
+            _hd, _, _kvh, _full = cfg.get_layer_attn_geometry(_li)
+            _tokens = expect_cache_tokens if (_full or not _ring) else min(_ring, expect_cache_tokens)
+            kv_elements += _kvh * _hd * _tokens
+        cache_size = 2 * bytes_per_element * kv_elements
         gpu_split = [max(0, gs - int(cache_size * r / 1024**2)) for gs, r in zip(gpu_split, attn_ratio)]
 
         # Subtract size of attn layers
@@ -175,6 +358,36 @@ class TPContext:
         self.rs_split, self.rs_split_devs = set_split(rs_split)
         self.q_split, self.q_split_devs = set_split(q_split)
 
+        # One split set per distinct attention geometry.
+        #
+        # For every architecture except Gemma-4 there is exactly one geometry, so this
+        # produces a single entry and the code path is identical to before. For Gemma-4 it
+        # produces two: (256, 32, 16, False) and (512, 32, 4, True). Each gets its own
+        # kv/q split, derived from the same post-subtraction `gpu_split`, so the per-device
+        # head counts are correct for that geometry (e.g. on 3 GPUs: 16 kv heads -> 6/5/5,
+        # 4 kv heads -> 2/1/1).
+        #
+        # The C++ ExtTPContext stores one split set, but `ext_tp_context` is read from the
+        # Python attribute on every call, so one context per geometry can be built and the
+        # active one swapped per layer by `set_geometry()`. No C++ change is required.
+        self.geometry_splits = {}
+        self.geometry_keys = []
+        for _li in range(cfg.num_hidden_layers):
+            _hd, _qh, _kvh, _full = cfg.get_layer_attn_geometry(_li)
+            self.geometry_keys.append((_hd, _qh, _kvh, _full))
+        for _key in dict.fromkeys(self.geometry_keys):
+            _hd, _qh, _kvh, _full = _key
+            _kv = integer_split(_kvh, gpu_split)
+            _nkg = _qh // _kvh
+            _q = [s * _nkg for s in _kv]
+            self.geometry_splits[_key] = {
+                "kv": set_split(_kv),
+                "q": set_split(_q),
+                "id": set_split(id_split),
+                "rs": set_split(rs_split),
+                "vc": set_split(vc_split),
+            }
+
         self.all_devs = self.all_devices()
         self.device = self.all_devs[0]
         self.num_devices = max(self.all_devs) + 1
@@ -183,8 +396,15 @@ class TPContext:
     def finalize(self):
         cfg = self.model.config
 
-        size = (cfg.max_output_len if cfg.max_output_len is not None else cfg.max_input_len) * cfg.vocab_size
-        size = max(size, cfg.max_input_len * cfg.intermediate_size)
+        if self.rank is not None:
+            # BUG 59: multiprocess mode never stages through host memory -- broadcast() is
+            # the identity and gather() is a NCCL all_gather -- so the full pinned buffer
+            # would be hundreds of MB of dead pinned memory per process. Keep a token-sized
+            # one so any code path that still touches pinned_temp stays in bounds.
+            size = 4096
+        else:
+            size = (cfg.max_output_len if cfg.max_output_len is not None else cfg.max_input_len) * cfg.vocab_size
+            size = max(size, cfg.max_input_len * cfg.intermediate_size)
 
         self.pinned_temp = [
             torch.empty((size,), dtype = torch.half, pin_memory = True)
@@ -194,23 +414,290 @@ class TPContext:
         devices = self.all_devices()
         max_device = max(devices)
 
-        self.streams = [0] * (max_device + 1)
+        # BUG 60: size by num_devices, not max_device + 1, and leave unowned slots as None.
+        # global_streams only contains devices whose ExLlamaV2DeviceContext was built, which
+        # in a worker is exactly one -- indexing it for any other device raises KeyError.
+        n_slots = self.num_devices if self.num_devices is not None else (max_device + 1)
+        # 0, not None: make_tp_context() takes Sequence[int] and pybind11 rejects None.
+        # The C++ side only indexes ctx->streams[dev] for devs in the filtered split.
+        self.streams = [0] * n_slots
+        # torch Stream wrappers for the same streams, needed to record/wait events on them
+        # during CUDA-graph capture (BUG 43).
+        self.streams_dev = {}
         for idx in devices:
-            self.streams[idx] = global_streams[idx].cuda_stream
+            s = global_streams.get(idx)
+            if s is None:
+                continue
+            self.streams[idx] = s.cuda_stream
+            self.streams_dev[idx] = s
 
-        self.ext_tp_context = ext_c.make_tp_context(
-            self.kv_split,
-            self.id_split,
-            self.vc_split,
-            self.rs_split,
-            self.q_split,
-            self.pinned_temp,
-            self.streams
-        )
+        # One C++ context per distinct geometry (see define_split). The default context is
+        # the first geometry's, so single-geometry models behave exactly as before.
+        self.ext_tp_contexts = {}
+        for _key, _sp in self.geometry_splits.items():
+            # BUG 60: in worker mode hand the C++ context only this rank's slice, so it
+            # never indexes ctx->streams at a device this process does not own.
+            if self.rank is not None:
+                def _own(lst):
+                    return [(d, a, b) for d, a, b in lst if d == self.rank]
+                _kv, _id, _vc, _rs, _q = (_own(_sp["kv"][0]), _own(_sp["id"][0]),
+                                          _own(_sp["vc"][0]), _own(_sp["rs"][0]),
+                                          _own(_sp["q"][0]))
+            else:
+                _kv, _id, _vc, _rs, _q = (_sp["kv"][0], _sp["id"][0], _sp["vc"][0],
+                                          _sp["rs"][0], _sp["q"][0])
+            self.ext_tp_contexts[_key] = ext_c.make_tp_context(
+                _kv, _id, _vc, _rs, _q,
+                self.pinned_temp,
+                self.streams
+            )
+        self.geometry_key_active = None
+        self.ext_tp_context = self.ext_tp_contexts[self.geometry_keys[0]]
 
+        # Device-side sequence position for CUDA-graph decode (BUG 43). Allocated once here so
+        # its address is stable for the lifetime of the model: a captured graph holds this
+        # pointer, and reallocating it would silently make the graph read freed memory.
+        #
+        # One per device. kv_write and the attention mask are built on every device, and a
+        # CUDA kernel can only dereference a pointer into its own device's memory, so a single
+        # dev0-resident `pos` made devices 1-3 read garbage -- which silently corrupted the KV
+        # write on those devices (the graph-vs-eager divergence at step 2).
+        self.pos = torch.zeros((1,), dtype = torch.int32, device = self.device)
+        self.pos_tp = {}
+        for _dev in devices:
+            self.pos_tp[_dev] = self.pos if _dev == self.device else \
+                torch.zeros((1,), dtype = torch.int32, device = _dev)
+
+        # BUG 94: ring-relative KV write position for the sliding-window layers, one per
+        # device (same per-device rationale as `pos`). The SWA attention writes its new K/V
+        # at ring position `past_len - window_beg` and reads the window from the ring; the
+        # absolute `pos` would run off the end of the 1280-deep ring once the sequence
+        # grows past it (the 16k prefill/decode crash).
+        self.ring_pos = torch.zeros((1,), dtype = torch.int32, device = self.device)
+        self.ring_pos_tp = {}
+        for _dev in devices:
+            self.ring_pos_tp[_dev] = self.ring_pos if _dev == self.device else \
+                torch.zeros((1,), dtype = torch.int32, device = _dev)
+
+        # Per-device cache_seqlens for flash_attn_with_kvcache, one tensor per device per
+        # attention geometry. These live here, not on attn_params, for the same reason `pos` does:
+        # a captured graph holds their addresses, so they must be allocated once and updated in
+        # place. attn_params is rebuilt on every forward() call, so anything cached on it is
+        # reallocated each step and the graph keeps reading the capture-time copy -- which froze
+        # every replay at the capture position (the graph-vs-eager divergence at step 2).
+        self.past_len_tp = {}
+        for _key in dict.fromkeys(self.geometry_keys):
+            _sp = self.geometry_splits[_key]["kv"][0]
+            if self.rank is not None:
+                _sp = [(d, a, b) for d, a, b in _sp if d == self.rank]
+            self.past_len_tp[_key] = [
+                torch.zeros((1,), dtype = torch.int32, device = _dev)
+                for _dev, _, _ in _sp
+            ]
+
+    def get_past_len_tp(self, geometry_key):
+        """Stable per-device cache_seqlens tensors for this geometry."""
+        return self.past_len_tp.get(geometry_key)
+
+    def set_pos(self, value: int):
+        """Set the device-side sequence position on every TP device, ordered before replay.
+
+        Each device needs its own copy because the kernels that read it (kv_write and the
+        attention mask) run on that device and can only dereference their own memory.
+
+        Ordering matters as much as the value. A plain ``fill_`` on a cuda:N tensor is issued on
+        that device's *default* stream, which is unrelated to the TP stream the graph launches on,
+        so the graph could read the previous token's position. That is the graph-vs-eager KV-write
+        divergence. Each fill is therefore issued on that device's TP stream and dev0's TP stream
+        (the one the graph is launched on) waits on an event recorded after it.
+        """
+        evs = []
+        for _dev, _t in self.pos_tp.items():
+            with torch.cuda.device(_dev):
+                _s = self.streams_dev[_dev]
+                _prev = torch.cuda.current_stream(_dev)
+                torch.cuda.set_stream(_s)
+                try:
+                    _t.fill_(value)
+                    _ev = torch.cuda.Event()
+                    _ev.record(_s)
+                    evs.append((_dev, _ev))
+                finally:
+                    torch.cuda.set_stream(_prev)
+
+        # Make the stream the graph is launched on wait for every fill above.
+        with torch.cuda.device(self.device):
+            _s0 = self.streams_dev[self.device]
+            for _dev, _ev in evs:
+                if _dev == self.device:
+                    continue
+                _s0.wait_event(_ev)
+
+    def set_ring_pos(self, value: int):
+        """BUG 94: like set_pos, but for the SWA ring write position (see ring_pos)."""
+        evs = []
+        for _dev, _t in self.ring_pos_tp.items():
+            with torch.cuda.device(_dev):
+                _s = self.streams_dev[_dev]
+                _prev = torch.cuda.current_stream(_dev)
+                torch.cuda.set_stream(_s)
+                try:
+                    _t.fill_(value)
+                    _ev = torch.cuda.Event()
+                    _ev.record(_s)
+                    evs.append((_dev, _ev))
+                finally:
+                    torch.cuda.set_stream(_prev)
+        with torch.cuda.device(self.device):
+            _s0 = self.streams_dev[self.device]
+            for _dev, _ev in evs:
+                if _dev == self.device:
+                    continue
+                _s0.wait_event(_ev)
+
+    def fill_tp(self, tensors, value: int):
+        """Fill one int tensor per device with ``value``, ordered before the graph launch.
+
+        ``tensors`` is a list parallel to ``get_split(BROADCAST_KV)``, i.e. one entry per device
+        (entries may be None). These are the ``past_len_tp`` tensors handed to
+        ``flash_attn_with_kvcache`` as ``cache_seqlens``.
+
+        A bare ``fill_`` on a cuda:N tensor is issued on that device's *default* stream, which is
+        unrelated to the TP stream the graph is launched on, so the graph can read the previous
+        token's length. That is the same ordering bug as ``set_pos`` and it is what kept every
+        replay attending to a frozen sequence length. Each fill is issued on that device's TP
+        stream, and dev0's TP stream waits on an event recorded after it.
+        """
+        evs = []
+        for _t in tensors:
+            if _t is None:
+                continue
+            _dev = _t.device.index if isinstance(_t.device, torch.device) else int(_t.device)
+            with torch.cuda.device(_dev):
+                _s = self.streams_dev.get(_dev)
+                if _s is None:
+                    _t.fill_(value)
+                    continue
+                _prev = torch.cuda.current_stream(_dev)
+                torch.cuda.set_stream(_s)
+                try:
+                    _t.fill_(value)
+                    _ev = torch.cuda.Event()
+                    _ev.record(_s)
+                    evs.append((_dev, _ev))
+                finally:
+                    torch.cuda.set_stream(_prev)
+
+        with torch.cuda.device(self.device):
+            _s0 = self.streams_dev[self.device]
+            for _dev, _ev in evs:
+                if _dev == self.device:
+                    continue
+                _s0.wait_event(_ev)
+
+
+    def geometry_key(self, layer_idx: int):
+        """Attention geometry key for a layer: (head_dim, num_q_heads, num_kv_heads, is_full)."""
+        return self.geometry_keys[layer_idx]
+
+    def set_geometry(self, layer_idx: int):
+        """
+        Select the split set and C++ context matching this layer's attention geometry.
+
+        No-op for single-geometry models, where every layer maps to the same entry.
+
+        IMPORTANT: this must work *before* ``finalize()``. ``tp_split()`` and
+        ``scratch_space_tp()`` both run during loading, when ``ext_tp_contexts`` has not been
+        built yet. An earlier version returned early whenever ``ext_tp_context`` was None,
+        which silently left every layer split with the FIRST geometry's ratios. For Gemma-4
+        that gave layer 5 (4 kv heads, head_dim 512) the 4-kv-heads-per-device split inherited
+        from layer 0 (16 kv heads), so ``k_proj`` was cut into four 2048-wide slices from a
+        2048-wide tensor and the GEMM read past the end of the weight buffer. See Stage L
+        bug 21 in IMPLEMENTED.md.
+        """
+        key = self.geometry_keys[layer_idx]
+        if key == self.geometry_key_active:
+            return
+        self.geometry_key_active = key
+        sp = self.geometry_splits[key]
+        self.kv_split, self.kv_split_devs = sp["kv"]
+        self.q_split, self.q_split_devs = sp["q"]
+        # Contexts only exist after finalize(); during loading the split sets are all that is
+        # needed, and `ext_tp_context` is read from this attribute at call time anyway.
+        if self.ext_tp_contexts and key in self.ext_tp_contexts:
+            self.ext_tp_context = self.ext_tp_contexts[key]
+
+    def set_rank(self, rank: int | None):
+        """
+        Enter multiprocess mode for this process, owning device ``rank``.
+
+        Must be called before any module loads, because get_split() starts filtering
+        immediately and the loaders size their shards from it.
+        """
+        self.rank = rank
+
+        # BUG 76: all_devs / device / num_devices were computed in define_split() while
+        # rank was still None, so they describe the FULL device set. Every worker would then
+        # think its primary device is 0 -- but load_tp_rank only allocates a context for its
+        # own rank, so get_device_context(0) returns None on ranks 1-3.
+        if rank is not None:
+            self.all_devs = [rank]
+            self.device = rank
+            # Keep num_devices as the GLOBAL device count: it sizes per-device lists that are
+            # indexed by global rank (out_features_tp etc.), and the loaders rely on it.
+            self.num_devices = max(
+                [d for d, _, _ in (self.kv_split or [])] + [rank]
+            ) + 1
+
+    def is_worker(self) -> bool:
+        return self.rank is not None
 
     def get_split(self, broadcast_type: int):
 
+        if self.geometry_key_active is not None:
+            sp = self.geometry_splits[self.geometry_key_active]
+            if broadcast_type == BROADCAST_KV: full = sp["kv"][0]
+            elif broadcast_type == BROADCAST_Q: full = sp["q"][0]
+            elif broadcast_type == BROADCAST_ID: full = sp["id"][0]
+            elif broadcast_type == BROADCAST_RS: full = sp["rs"][0]
+            elif broadcast_type == BROADCAST_VC: full = sp["vc"][0]
+            else: full = None
+        else:
+            full = [
+                self.kv_split,
+                self.id_split,
+                self.vc_split,
+                self.rs_split,
+                self.q_split
+            ][broadcast_type]
+
+        # Multiprocess mode: this process owns exactly one slice. Returning a one-element
+        # list keeps (a, b) ABSOLUTE, so the shard geometry matches the single-process
+        # split exactly and every existing `for dev, a, b in split` loop iterates once
+        # over the right device with the right column range.
+        if self.rank is not None:
+            for d, a, b in full:
+                if d == self.rank:
+                    return [(d, a, b)]
+            return []
+        return full
+
+
+    def get_split_full(self, broadcast_type: int):
+        """
+        The UNFILTERED split, i.e. every rank's slice.
+
+        get_split() returns only this process's slice in worker mode. The collectives still need
+        the whole picture: an all-gather has to know how wide every rank's contribution is, and
+        the C++ contexts are built from the full geometry. BUG 71.
+        """
+        if self.geometry_key_active is not None:
+            sp = self.geometry_splits[self.geometry_key_active]
+            if broadcast_type == BROADCAST_KV: return sp["kv"][0]
+            if broadcast_type == BROADCAST_Q: return sp["q"][0]
+            if broadcast_type == BROADCAST_ID: return sp["id"][0]
+            if broadcast_type == BROADCAST_RS: return sp["rs"][0]
+            if broadcast_type == BROADCAST_VC: return sp["vc"][0]
         return [
             self.kv_split,
             self.id_split,
@@ -218,7 +705,6 @@ class TPContext:
             self.rs_split,
             self.q_split
         ][broadcast_type]
-
 
     def get_devs(self, broadcast_type: int):
 
@@ -263,6 +749,21 @@ class TPContext:
         return scratch
 
 
+    def _sync_all_devices(self):
+        """
+        Wait for every TP device's stream to drain.
+
+        The pinned staging buffers in ``pinned_temp`` are shared by all devices and are used
+        for asynchronous D2H (gather) and H2D (broadcast) copies. Nothing else orders those
+        copies against the host-side reads and writes that follow, so both boundaries must be
+        synchronised explicitly. BUG 35.
+
+        Per-device, not a bare ``torch.cuda.synchronize()``: a gather writes from every
+        device, and a plain synchronize only waits on the current one.
+        """
+        for dev in self.all_devices():
+            torch.cuda.synchronize(dev)
+
     def get_pinned(self, buffer: int, batch_size: int, q_len: int, dim: int):
 
         pt = self.pinned_temp[buffer][:batch_size * q_len * dim]
@@ -277,11 +778,30 @@ class TPContext:
         broadcast_type: int,
         dim: int = 1
     ):
+        # Multiprocess mode: every rank already holds the full-width residual stream (it is
+        # reconstructed by gather()'s all_gather), so a broadcast is the identity. This is
+        # the whole point -- it deletes the pinned D2H/H2D round trip from the hot path.
+        if self.rank is not None:
+            return [input_tensor]
+
         split = self.get_split(broadcast_type)
 
-        bc_tensors = []
-        for idx, _, _ in split:
-            bc_tensors.append(torch.empty_like(input_tensor, device = idx))
+        # BUG 40: no host-side drain here any more. tp_broadcast now records an event on the
+        # source stream after its D2H and makes every target stream wait on it before its H2D
+        # (ext_tp.cpp), so the pinned buffer is correctly ordered without the host blocking.
+        # The bug-35 sync is still required in gather(), which hands a host view to the caller.
+
+        # Reuse the per-device destination buffers. Allocating here would put a
+        # torch.empty on the hot path of every module (and, more importantly, is not
+        # allowed inside a CUDA graph capture region). Keyed like tp_reuse_buffers so the
+        # cache holds at most one buffer per device per shape.
+        if self._bc_cache is None:
+            self._bc_cache = {}
+        bc_tensors = tp_reuse_buffers(
+            self._bc_cache,
+            [(idx, input_tensor.shape[0], input_tensor.shape[1], input_tensor.dtype)
+             for idx, _, _ in split]
+        )
 
         ext_c.tp_broadcast(
             self.ext_tp_context,
@@ -304,7 +824,23 @@ class TPContext:
         dim: int = 1
 
     ):
+        # Multiprocess mode: one NCCL all_gather along dim 1 reassembles the full width.
+        # `inputs` holds this rank's shard only.
+        if self.rank is not None:
+            return self._gather_nccl(inputs[0], broadcast_type, dim)
+
         split = self.get_split(broadcast_type)
+
+        # CUDA-graph mode: keep the result on the primary device and skip the host drain.
+        # Both the drain and the host view are illegal inside a capture region, and the host
+        # round trip is what forces the next module to re-broadcast from pinned memory.
+        # BUG 43.
+        if self.graph_mode:
+            if self._gather_cache is None:
+                self._gather_cache = {}
+            return self.gather_dev(
+                buffer, inputs, broadcast_type, dim, cache = self._gather_cache
+            )
 
         ext_c.tp_gather(
             self.ext_tp_context,
@@ -317,9 +853,187 @@ class TPContext:
             -1
         )
 
+        # BUG 35: tp_gather only *issues* the D2H copies. The caller reads the host view
+        # returned below, so they must have landed first.
+        self._sync_all_devices()
+
         pt = self.pinned_temp[buffer][:split[-1][2] * dim * inputs[0].shape[0]]
         pt = pt.view(inputs[0].shape[0], split[-1][2] * dim)
         return pt
+
+    def _gather_nccl(self, local: torch.Tensor, broadcast_type: int, dim: int = 1,
+                     tag: int = 0) -> torch.Tensor:
+        """
+        All-gather the per-rank shards of a column-parallel projection into full width.
+
+        Each rank contributes (rows, (b - a) * dim). The shards are contiguous column
+        ranges of the full tensor, so concatenating them in rank order along dim 1
+        reproduces the single-process result exactly.
+
+        ``tag`` separates the two callers that can otherwise collide on the cache key:
+        ``allgather`` (BROADCAST_Q in, full width out, feeding o_proj) and ``gather``
+        (BROADCAST_Q in, full width out, the layer output) have the same broadcast_type,
+        row count and width, so without a tag they would share one buffer and the second
+        call would clobber the first's result.
+        """
+        import torch.distributed as dist
+        if not (dist.is_available() and dist.is_initialized()):
+            return local
+
+        # BUG 71: the FULL split. get_split() is filtered to this rank in worker mode, so
+        # using it here made len(split) == 1 and skipped the gather entirely, leaving the
+        # residual stream at shard width.
+        split = self.get_split_full(broadcast_type)
+        if len(split) <= 1:
+            # Only one rank owns a slice of this split (e.g. a geometry where the other
+            # ranks get zero heads). Nothing to gather.
+            return local
+
+        # BUG 78: a REPLICATED split (BROADCAST_RS) gives every rank the FULL width --
+        # [(0,0,W), (1,0,W), ...] with identical ranges. All-gathering it would produce a
+        # 4W-wide tensor and corrupt everything downstream. The local tensor is already the
+        # full result, so return it as-is.
+        _ranges = set((a, b) for _, a, b in split)
+        if len(_ranges) == 1:
+            return local
+
+        world = dist.get_world_size()
+        if world == 1:
+            return local
+
+        widths = [0] * world
+        for d, a, b in split:
+            widths[d] = (b - a) * dim
+
+        # all_gather needs a contiguous input.
+        if not local.is_contiguous():
+            local = local.contiguous()
+
+        rows = local.shape[0]
+        dtype = local.dtype
+        if self._ag_cache is None:
+            self._ag_cache = {}
+
+        # BUG 82: cache the output buffer and the per-rank view list on the context,
+        # keyed by (broadcast_type, rows, width, dtype), and skip the pad/trim entirely
+        # when every rank has the same width.
+        #
+        # Measured, 4x 3090 over PCIe (6.3 GB/s/rank achievable):
+        #   prefill rows=1032, w=8192   8.264 ms -> 8.132 ms   (1.6% -- noise)
+        #   decode  rows=1,    w=8192   0.135 ms -> 0.072 ms   (47%)
+        # So this is NOT a prefill fix. Prefill is bandwidth-bound: the collectives move
+        # ~3.4 GB/rank and already run at ~90% of the PCIe ceiling, which is why the
+        # fresh `parts` list and `torch.cat` cost almost nothing there. The win is at
+        # decode, where the tensors are tiny, the collective is launch-bound rather than
+        # bandwidth-bound, and there are ~180 of them per token.
+        #
+        # Reuse is safe because the cache key includes broadcast_type and ``tag``, and no
+        # module gathers the same (type, width) twice before consuming the previous result.
+        #
+        # ALIASING CONTRACT -- the returned tensor is a cached buffer. It is double-buffered
+        # and alternated per key, because the caller can still be reading the previous
+        # result when the next gather runs: a layer's output IS the next layer's residual
+        # stream, and it is consumed by add_residual after the following layer has already
+        # issued its own gathers. Two buffers give a full layer of slack, which is more than
+        # the module order needs (per layer: attn[allgather Q tag=1] -> attn[gather Q tag=0]
+        # -> mlp[allgather ID] -> mlp[gather RS]; a buffer written by one of those is read
+        # only before the next write of the SAME key, two steps later).
+        dev = local.device
+        if len(set(widths)) == 1 and widths[0] == local.shape[1]:
+            w = widths[0]
+            key = (tag, broadcast_type, rows, w, dtype, dev)
+            ent = self._ag_cache.get(key)
+            if ent is None:
+                bufs = [torch.empty((rows, world * w), dtype = dtype, device = dev)
+                        for _ in range(2)]
+                parts = [[b[:, i * w:(i + 1) * w] for i in range(world)] for b in bufs]
+                ent = [bufs, parts, 0]
+                self._ag_cache[key] = ent
+            bufs, parts, i = ent
+            out = bufs[i]
+            ent[2] = 1 - i
+            # NCCL all_gather requires non-overlapping input and output. If the caller
+            # handed us a view of the buffer we are about to write, copy it out first.
+            if local.data_ptr() >= out.data_ptr() and \
+               local.data_ptr() < out.data_ptr() + out.numel() * out.element_size():
+                local = local.clone()
+            dist.all_gather(parts[i], local)
+            return out
+
+        # Uneven widths (a geometry where heads do not divide evenly between ranks):
+        # pad to the max width, gather, then trim each rank back to its real width.
+        max_w = max(widths)
+        key = (tag, broadcast_type, rows, max_w, dtype, dev)
+        ent = self._ag_cache.get(key)
+        if ent is None:
+            padded = torch.empty((rows, max_w), dtype = dtype, device = dev)
+            parts = [torch.empty_like(padded) for _ in range(world)]
+            self._ag_cache[key] = (padded, parts)
+        else:
+            padded, parts = ent
+        padded.zero_()
+        padded[:, :local.shape[1]] = local
+        dist.all_gather(parts, padded)
+        trimmed = [parts[d][:, :widths[d]] for d in range(world) if widths[d] > 0]
+        return torch.cat(trimmed, dim = 1)
+
+    def gather_dev(
+        self,
+        buffer: int,
+        inputs: list[torch.Tensor],
+        broadcast_type: int,
+        dim: int = 1,
+        cache: dict | None = None
+    ) -> torch.Tensor:
+        """
+        Gather the per-device slices into one full-width tensor that stays **on device 0**.
+
+        This is the CUDA-graph-safe counterpart of ``gather()``. ``gather()`` returns a *host*
+        view of ``pinned_temp``, which forces two things that make the decode step
+        uncapturable:
+
+        1. ``_sync_all_devices()`` -- a host drain in the middle of the step.
+        2. A host round trip per module: the caller reads the pinned buffer, and the next
+           module broadcasts it back to the devices. ~120 of those per token.
+
+        ``tp_gather_barrier`` already lands the assembled result in its ``targets`` device
+        tensors and orders the D2H against the H2D with CUDA events, so no host involvement is
+        needed at all. This wrapper just returns that device tensor instead of the pinned one.
+
+        ``cache`` (optional) supplies reusable output buffers keyed by
+        ``(device, rows, cols, dtype)`` so repeated calls reuse the same addresses, which is
+        required for graph capture.
+        """
+        split = self.get_split(broadcast_type)
+        rows = inputs[0].shape[0]
+        cols = split[-1][2] * dim
+        dtype = inputs[0].dtype
+
+        if cache is not None:
+            targets = tp_reuse_buffers(
+                cache,
+                [(dev, rows, cols, dtype) for dev, _, _ in split]
+            )
+        else:
+            targets = [
+                torch.empty((rows, cols), device = dev, dtype = dtype)
+                for dev, _, _ in split
+            ]
+
+        ext_c.tp_gather(
+            self.ext_tp_context,
+            buffer,
+            inputs,
+            broadcast_type,
+            targets,
+            broadcast_type,
+            dim,
+            -1
+        )
+
+        # No host sync: the D2H/H2D pair inside tp_gather_barrier is ordered by the
+        # cross-device event barrier, and the result is consumed on-device.
+        return targets[0]
 
     # @profile
     def allgather(
@@ -330,6 +1044,9 @@ class TPContext:
         broadcast_type_b: int,
         dim: int = 1
     ):
+        if self.rank is not None:
+            return [self._gather_nccl(inputs[0], broadcast_type_g, dim, tag = 1)]
+
         # split_g = self.get_split(broadcast_type_g)
         split_b = self.get_split(broadcast_type_b)
         sh = (inputs[0].shape[0], split_b[-1][-1] * dim)
@@ -362,6 +1079,39 @@ class TPContext:
         return pt
 
 
+    def all_reduce_split(
+        self,
+        tensors: list[torch.Tensor],
+        broadcast_type: int,
+        dim: int = 1
+    ):
+        """
+        Sum ``tensors`` across devices, where each device holds only its own slice of the
+        output (a partial sum over its input slice). Returns one full-width tensor.
+
+        This is the reduce half of Megatron row-parallelism. exl2's fused TP kernel only
+        implements column-parallel projections, so a row-parallel layer (one whose
+        ``out_features`` is not ``num_heads * head_dim``, e.g. Gemma-4's ``o_proj``) needs
+        this in Python. PLAN.md §2.5.
+        """
+        split = self.get_split(broadcast_type)
+        dev0 = split[0][0]
+        context = self.model.get_device_context(dev0)
+        torch.cuda.set_stream(context.stream)
+
+        # Start from device 0's slice, then add every other device's slice into it.
+        acc = tensors[0].clone()
+        for idx in range(1, len(split)):
+            dev, a, b = split[idx]
+            ctx_d = self.model.get_device_context(dev)
+            torch.cuda.set_stream(ctx_d.stream)
+            part = tensors[idx].to(dev0, non_blocking = True)
+            acc.add_(part)
+            part = None
+
+        torch.cuda.set_stream(context.stream)
+        return acc
+
     def add_residual(
         self,
         target: list[torch.Tensor],
@@ -377,7 +1127,24 @@ class TPContext:
             target[idx].add_(source[idx][:, a * dim : b * dim])
 
 
-    def wait_streams(self):
+    def wait_streams(self, device: int | None = None):
+        """
+        Wait for the TP step to finish.
+
+        ``device`` limits the wait to the device that owns the result. The caller only ever
+        needs the logits, which live on the primary device, and the gather's event chain has
+        already ordered every other device's contribution into it. Draining all four devices
+        plus a global ``torch.cuda.synchronize()`` on every token was pure host stall: it
+        pegged one core at 100% of wall time while the profiler showed 0.39 ms/token of real
+        aten work.
+        """
+        if self.rank is not None:
+            # One device per process: drain only our own stream.
+            global_streams[self.rank].synchronize()
+            return
+        if device is not None:
+            global_streams[device].synchronize()
+            return
         for dev in self.all_devs:
             s = global_streams[dev]
             s.synchronize()
@@ -407,6 +1174,20 @@ class TPContext:
                 devctx.begin_scratch_alloc()
 
 
+    def _devctx_or_none(self, dev: int):
+        """
+        Return this device's context, or None if this process does not own that device.
+
+        In the single-threaded TP path every device has a context and this is just
+        get_device_context(). In a multiprocess worker only one device does, and the scratch helpers
+        must skip the rest instead of dereferencing None.
+        """
+        contexts = self.model.device_context
+        if contexts and dev < len(contexts) and contexts[dev] is not None:
+            return contexts[dev]
+        return None
+
+
     def get_scratch_slice_tp_bc(self, rows: int, dtype: torch.dtype, broadcast_type: int, dim: int = 1):
 
         split = self.get_split(broadcast_type)
@@ -416,7 +1197,11 @@ class TPContext:
 
         tensors = []
         for dev, _, _ in split:
-            devctx = self.model.get_device_context(dev)
+            devctx = self._devctx_or_none(dev)
+            if devctx is None:
+                # A single-rank worker: keep the list aligned with the split but do not allocate.
+                tensors.append(None)
+                continue
             size_bytes = rows * dim * esize
             tensor = devctx.get_scratch_slice(size_bytes)
             tensor = tensor.view(rows, dim)
@@ -433,7 +1218,10 @@ class TPContext:
 
         tensors = []
         for dev, a, b in split:
-            devctx = self.model.get_device_context(dev)
+            devctx = self._devctx_or_none(dev)
+            if devctx is None:
+                tensors.append(None)
+                continue
             size_bytes = rows * (b - a) * dim * esize
             tensor = devctx.get_scratch_slice(size_bytes)
             tensor = tensor.view(rows, (b - a) * dim)
@@ -446,5 +1234,6 @@ class TPContext:
 
         for dev, s in enumerate(scratch):
             if s == 0: continue
-            devctx = self.model.get_device_context(dev)
+            devctx = self._devctx_or_none(dev)
+            if devctx is None: continue
             devctx.get_scratch_slice(s)

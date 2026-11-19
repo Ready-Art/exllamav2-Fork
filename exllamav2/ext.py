@@ -233,6 +233,7 @@ if build_jit:
         "cuda/layer_norm.cu",
         "cuda/rope.cu",
         "cuda/cache.cu",
+        "cuda/kv_write.cu",
         "cuda/util.cu",
         "cuda/softcap.cu",
         "cuda/tp.cu",

@@ -131,6 +131,24 @@ class ExLlamaV2Config:
     attention_multiplier: float | None
     partial_rotary_factor: float | None
 
+    # Per-layer attention geometry (Gemma-4). PLAN.md §2.1.
+    layer_types: list[str] | None
+    global_head_dim: int
+    num_global_key_value_heads: int
+    attention_k_eq_v: bool
+    v_norm: bool
+    layer_scalar: bool
+    rope_partial_rotary_factor_global: float
+    rope_type_global: str
+    rope_theta_global: float
+    rope_theta_local: float
+
+    # SWA KV compression (workstream ③). PLAN.md §4.3 Phase 3F.
+    sliding_window_overp: int | None
+    swa_compression: bool
+
+    no_flashinfer: bool
+
     vision_model_type: str | None
     vision_head_dim: int | None
     vision_num_attention_heads: int | None
@@ -184,6 +202,10 @@ class ExLlamaV2Config:
         self.no_flash_attn = 'EXLLAMA_NO_FLASH_ATTN' in os.environ
         self.no_xformers = 'EXLLAMA_NO_XFORMERS' in os.environ
         self.no_sdpa = 'EXLLAMA_NO_SDPA' in os.environ
+        # Change98: FlashInfer >= 0.7.4 is mandatory (hard dependency, enforced in
+        # attn_backend.py). EXLLAMA_NO_FLASHINFER no longer disables it; kept as an
+        # attribute (always False) for compatibility with callers that read it.
+        self.no_flashinfer = False
         self.load_in_q4 = False
         self.no_graphs = 'EXLLAMA_NO_GRAPHS' in os.environ
 
@@ -194,6 +216,93 @@ class ExLlamaV2Config:
             self.model_dir = None
 
         self.max_dq_size = 512*(1024**2)
+
+
+    def get_layer_attn_geometry(self, layer_idx: int) -> tuple[int, int, int, bool]:
+        """
+        Per-layer attention geometry.
+
+        :return:
+            ``(head_dim, num_q_heads, num_kv_heads, is_full_attention)``
+
+        For every architecture except Gemma-4 this returns the uniform config values, so callers
+        see no behaviour change. Gemma-4 alternates 5 sliding layers (head_dim 256, 16 kv heads)
+        with 1 full layer (head_dim 512, 4 kv heads). PLAN.md §2.2 step 1.
+        """
+
+        layer_types = getattr(self, "layer_types", None)
+
+        if layer_types is None:
+            # Uniform geometry. `is_full_attention` is True when the layer is not a sliding
+            # layer, which for non-alternating architectures means every layer.
+            return (self.head_dim, self.num_attention_heads, self.num_key_value_heads, True)
+
+        assert 0 <= layer_idx < len(layer_types), \
+            f"layer_idx {layer_idx} out of range for {len(layer_types)} layer_types"
+
+        is_full = layer_types[layer_idx] == "full_attention"
+
+        if is_full:
+            head_dim = getattr(self, "global_head_dim", self.head_dim)
+            num_kv_heads = getattr(self, "num_global_key_value_heads", self.num_key_value_heads)
+        else:
+            head_dim = self.head_dim
+            num_kv_heads = self.num_key_value_heads
+
+        # Q heads are the same for both layer types in Gemma-4 (32), but derive from head_dim
+        # rather than assume, so an unusual checkpoint is caught by the assertion below.
+        num_q_heads = self.num_attention_heads
+
+        assert num_q_heads % num_kv_heads == 0, \
+            f"Layer {layer_idx}: {num_q_heads} query heads not divisible by {num_kv_heads} kv heads"
+
+        return (head_dim, num_q_heads, num_kv_heads, is_full)
+
+
+    def layer_has_v_proj(self, layer_idx: int) -> bool:
+        """
+        Whether this layer carries a ``self_attn.v_proj`` weight in the checkpoint.
+
+        Gemma-4 sets ``attention_k_eq_v``: on the layers where it applies, V is literally K and
+        the checkpoint contains no ``v_proj`` tensor. This must be decided per layer, because the
+        flag only affects the full-attention layers (the 512-dim ones); the sliding layers keep
+        their own ``v_proj``. Verified against the real checkpoint: layer 0 has
+        ``self_attn.v_proj.weight``, layer 5 does not. PLAN.md §2.5.
+        """
+
+        if not getattr(self, "attention_k_eq_v", False):
+            return True
+
+        if getattr(self, "layer_types", None) is None:
+            # Non-alternating architecture: k-eq-v, if set, applies to every layer.
+            return False
+
+        _, _, _, is_full = self.get_layer_attn_geometry(layer_idx)
+        return not is_full
+
+
+    def get_layer_sincos_size(self, layer_idx: int) -> int:
+        """
+        Width of the sin/cos table this layer reads.
+
+        This is passed to the CUDA rope kernel as ``sincos_size``; the kernel derives
+        ``half_dim = sincos_size / 2`` and reads ``column + half_dim``, so it must be the *actual
+        table width*.
+
+        For proportional rope the table spans the full head_dim (512), NOT
+        ``head_dim * partial_rotary_factor`` (128). Getting this wrong rotates the wrong span and
+        silently corrupts the 512-dim layers. PLAN.md §2.3 / §8 trap 1.
+        """
+
+        if getattr(self, "layer_types", None) is None:
+            return int(self.head_dim * self.partial_rotary_factor)
+
+        head_dim, _, _, is_full = self.get_layer_attn_geometry(layer_idx)
+
+        if is_full and self.rope_type_global == "proportional":
+            return head_dim
+
+        return int(head_dim * self.partial_rotary_factor)
 
 
     # Set low-mem options
@@ -249,8 +358,29 @@ class ExLlamaV2Config:
         self.pad_token_id = read(read_config, int, "pad_token_id", None)  # 0
         self.vocab_size = read(read_config, int, "vocab_size", self.arch.lm.default_vocab_size, opt_subkey = "text_config")
 
-        if isinstance(self.eos_token_id, list):
-            self.eos_token_id = self.eos_token_id[0]  # TODO: Figure out a way to maybe use all the EOS tokens somehow
+        # Multi-token EOS. Gemma-4 ends a turn with <turn|> (106) rather than <eos> (1), and its
+        # generation_config.json lists [1, 106, 50]. Truncating to the first element means generation
+        # never stops at the real end-of-turn token and runs off into a repetition tail.
+        #
+        # Keep the whole set. generation_config.json is preferred because it is the more specific
+        # source (config.json's eos_token_id is often a subset); fall back to config.json when absent.
+        # `eos_token_id` stays the first element so every existing single-token consumer still works.
+        _gen_eos = getattr(self, "generation_config", {}).get("eos_token_id", None) \
+            if isinstance(getattr(self, "generation_config", None), dict) else None
+        _cfg_eos = self.eos_token_id
+
+        _all_eos: list[int] = []
+        for _src in (_gen_eos, _cfg_eos):
+            if _src is None:
+                continue
+            if isinstance(_src, int):
+                _src = [_src]
+            for _t in _src:
+                if isinstance(_t, int) and _t not in _all_eos:
+                    _all_eos.append(_t)
+
+        self.eos_token_ids: list[int] = _all_eos
+        self.eos_token_id = _all_eos[0] if _all_eos else None
 
         # Standard params
 
@@ -305,6 +435,78 @@ class ExLlamaV2Config:
         self.query_pre_attn_scalar = read(read_config, float, ["query_pre_attn_scalar"], None, opt_subkey = "text_config")
         self.attention_multiplier = read(read_config, float, ["attention_multiplier"], None, opt_subkey = "text_config")
 
+        # Per-layer attention geometry (Gemma-4). PLAN.md §2.1 step 3.
+        #
+        # For every other architecture these default to the uniform values already read above,
+        # so get_layer_attn_geometry() returns the same tuple for every layer and nothing else
+        # changes.
+
+        self.layer_types = read(read_config, list, "layer_types", None, opt_subkey = "text_config")
+        self.global_head_dim = read(read_config, int, "global_head_dim", self.head_dim, opt_subkey = "text_config")
+        self.num_global_key_value_heads = read(
+            read_config,
+            int,
+            "num_global_key_value_heads",
+            self.num_key_value_heads,
+            opt_subkey = "text_config",
+        )
+        self.attention_k_eq_v = read(read_config, bool, "attention_k_eq_v", False, opt_subkey = "text_config")
+        self.v_norm = getattr(self.arch.lm, "v_norm", False)
+        self.layer_scalar = getattr(self.arch.lm, "layer_scalar", False)
+
+        # Proportional RoPE parameters for the global-attention layers. PLAN.md §2.3.
+        self.rope_partial_rotary_factor_global = read(
+            read_config,
+            float,
+            "rope_parameters->full_attention->partial_rotary_factor",
+            1.0,
+            opt_subkey = "text_config",
+        )
+        self.rope_type_global = read(
+            read_config,
+            str,
+            "rope_parameters->full_attention->rope_type",
+            "default",
+            opt_subkey = "text_config",
+        )
+        self.rope_theta_global = read(
+            read_config,
+            float,
+            "rope_parameters->full_attention->rope_theta",
+            1e6,
+            opt_subkey = "text_config",
+        )
+        self.rope_theta_local = read(
+            read_config,
+            float,
+            "rope_parameters->sliding_attention->rope_theta",
+            10000.0,
+            opt_subkey = "text_config",
+        )
+
+        # SWA KV compression (workstream ③). PLAN.md §4.3 Phase 3F.
+        # `sliding_window_overp` gives the ring slack so a prefill chunk never has to shift
+        # mid-chunk. Defaults to 2 * page_size, matching exllamav3 sliding_attn.py:281.
+        self.sliding_window_overp = read(read_config, int, "sliding_window_overp", None, opt_subkey = "text_config")
+        self.swa_compression = read(read_config, bool, "swa_compression", True, opt_subkey = "text_config")
+
+        # Unsupported Gemma-4 features must fail loudly rather than silently producing garbage.
+        # PLAN.md §2.1 step 4.
+        _hspl = read(read_config, int, "hidden_size_per_layer_input", 0, opt_subkey = "text_config")
+        assert not _hspl, \
+            "Gemma-4 per-layer inputs (hidden_size_per_layer_input) are not implemented"
+        _moe = read(read_config, bool, "enable_moe_block", False, opt_subkey = "text_config")
+        assert not _moe, \
+            "Gemma-4 MoE block (enable_moe_block) is not implemented"
+
+        # Vision is out of scope for Gemma-4 (PLAN.md §2.9). Attention is therefore always
+        # causal, and any non-causal span machinery must not be engaged.
+        if self.arch.lm.layer_types is not None or self.layer_types is not None:
+            self.arch.lm.layer_types = self.layer_types
+            _bidir = read(read_config, str, "use_bidirectional_attention", None, opt_subkey = "text_config")
+            assert _bidir in (None, "vision"), \
+                f"Unsupported use_bidirectional_attention value: {_bidir}"
+
         # MLP params
 
         if self.arch.lm.default_inner_dim_mult is not None:
@@ -345,8 +547,17 @@ class ExLlamaV2Config:
         elif scale_depth:
             self.scale_depth = scale_depth / math.sqrt(self.num_hidden_layers)
 
-        self.attn_logit_softcapping = read(read_config, float, "attn_logit_softcapping", None)
-        self.final_logit_softcapping = read(read_config, float, "final_logit_softcapping", None)
+        # Both of these live under `text_config` in Gemma-4's checkpoint. Without
+        # `opt_subkey = "text_config"` they silently read as None, which disables the final
+        # softcap entirely: logits run unbounded, the calibration perplexity explodes to ~1e300
+        # and sampling degenerates. The key is absent for architectures that do not nest it, so
+        # the subkey lookup is a no-op for them.
+        self.attn_logit_softcapping = read(
+            read_config, float, "attn_logit_softcapping", None, opt_subkey = "text_config"
+        )
+        self.final_logit_softcapping = read(
+            read_config, float, "final_logit_softcapping", None, opt_subkey = "text_config"
+        )
 
         # Normalize weights in head layer
 
@@ -377,6 +588,24 @@ class ExLlamaV2Config:
 
         self.sliding_window = read(read_config, int, ["sliding_window", "sliding_window_size"], 0, opt_subkey = "text_config")
         self.sliding_window_pattern = read(read_config, int, ["sliding_window_pattern"], self.arch.lm.default_sliding_window_pattern)
+
+        # Validate the computed 5:1 SWA pattern against the checkpoint's own layer_types list.
+        # `sliding_window_pattern = 6` reproduces Gemma-4-31B's pattern exactly, but a future
+        # checkpoint may not follow the regular pattern, so assert rather than assume.
+        # PLAN.md §2.2 step 3 / §8 trap 10.
+        if self.layer_types is not None:
+            assert len(self.layer_types) == self.num_hidden_layers, \
+                f"text_config->layer_types has {len(self.layer_types)} entries but " \
+                f"num_hidden_layers is {self.num_hidden_layers}"
+            for _li, _lt in enumerate(self.layer_types):
+                if self.sliding_window_pattern > 1:
+                    _computed = "sliding_attention" if (_li + 1) % self.sliding_window_pattern != 0 \
+                        else "full_attention"
+                else:
+                    _computed = "sliding_attention" if _li % 2 == 0 else "full_attention"
+                assert _computed == _lt, \
+                    f"layer_types mismatch at layer {_li}: config says {_lt!r}, " \
+                    f"sliding_window_pattern={self.sliding_window_pattern} computes {_computed!r}"
 
         self.partial_rotary_factor = read(read_config, float, "partial_rotary_factor", 1.0)
 
@@ -436,8 +665,9 @@ class ExLlamaV2Config:
 
         # For loading checkpoints with fused MLP layers
 
-        if "model.layers.0.mlp.down_proj.weight" not in self.tensor_file_map and \
-            "model.layers.0.mlp.swiglu.w12.weight" in self.tensor_file_map:
+        _lr = getattr(self.arch.lm, "layers_root", "model.layers")
+        if f"{_lr}.0.mlp.down_proj.weight" not in self.tensor_file_map and \
+            f"{_lr}.0.mlp.swiglu.w12.weight" in self.tensor_file_map:
             self.checkpoint_fused_mlp = True
             self.arch.make_fused_mlp()
         else:
@@ -459,9 +689,18 @@ class ExLlamaV2Config:
                         per_layer_keys.add(tuple(skt))
                 per_layer_keys = list(per_layer_keys)
 
+            # `layers_root` is relative to lm_prefix. Most architectures use
+            # "model.layers"; Gemma-4 uses "layers" because its lm_prefix already
+            # ends in `model.language_model.`. PLAN.md §2.1.
+            layers_root = getattr(archparams, "layers_root", "model.layers")
             for layer_idx in range(self.num_hidden_layers):
+                # Gemma-4 full-attention layers are k-eq-v: they carry no v_proj at all,
+                # so requiring one here would fail on the very first full layer. PLAN.md §2.5.
+                skip_v_proj = not self.layer_has_v_proj(layer_idx)
                 for ks in per_layer_keys:
-                    prefixes = [f"model.layers.{layer_idx}.{k}" for k in ks]
+                    if skip_v_proj and any("v_proj" in k for k in ks):
+                        continue
+                    prefixes = [f"{layers_root}.{layer_idx}.{k}" for k in ks]
                     expect_keys.append(prefixes)
 
             if self.arch.lm_prefix:
@@ -492,6 +731,16 @@ class ExLlamaV2Config:
         # Vision models
 
         self.vision_model_type = read(read_config, str, "vision_config->model_type", None)
+
+        # Gemma-4 vision is explicitly out of scope (PLAN.md §2.9). The checkpoint carries a
+        # vision_tower, but we must not attempt to build it: no Gemma-4 vision module exists and
+        # `vlm/` is not to be extended. Force text-only so the loader skips every
+        # vision_tower.* / multi_modal_projector.* tensor instead of erroring on an unknown type.
+        self.vision_disabled = False
+        if self.arch.arch_string in ("Gemma4ForConditionalGeneration", "Gemma4ForCausalLM"):
+            if self.vision_model_type is not None:
+                self.vision_disabled = True
+                self.vision_model_type = None
 
         if self.vision_model_type:
             self.model_config = os.path.join(self.model_dir, "preprocessor_config.json")
@@ -632,7 +881,8 @@ class ExLlamaV2Config:
             has_flash_attn,
             has_flash_attn_with_window,
             has_flash_attn_with_softcap,
-            has_xformers
+            has_xformers,
+            has_flashinfer,
         )
 
         warnings = []
@@ -647,7 +897,14 @@ class ExLlamaV2Config:
             else:
                 warnings.append(" !! Warning: flash-attn, xformers and SDPA should be disabled for correct inference")
 
-        if has_flash_attn and not self.no_flash_attn:
+        # FlashInfer supports both sliding-window (`window_left`) and logit softcapping
+        # (`logits_soft_cap`) natively, so the "disable flash-attn for SWA/softcap models"
+        # workarounds below only apply when FlashInfer is unavailable. This is a real win: today
+        # Gemma-2/3/4 fall back to _attn_torch on older flash-attn, which is much slower.
+        # PLAN.md §3.5 step 6.
+        use_fi = has_flashinfer and not self.no_flashinfer
+
+        if has_flash_attn and not self.no_flash_attn and not use_fi:
             disable = False
             if self.attn_logit_softcapping and not has_flash_attn_with_softcap:
                 warnings.append(" !! Warning: model requires softcap, not supported in installed version of flash-attn")
@@ -670,6 +927,15 @@ class ExLlamaV2Config:
             if disable and not warn_only:
                 warnings.append(" !! Warning: disabling xformers")
                 self.no_xformers = True
+
+        # Gemma-4's global layers have head_dim 512. FlashInfer >= 0.7.4 serves them on
+        # sm86 (paged decode wrapper + single_decode, verified cos 1.0); the old
+        # "512 -> MLA / torch fallback" claim was wrong for Ampere. Informational only.
+        if use_fi and self.layer_types is not None and self.global_head_dim != self.head_dim:
+            warnings.append(
+                f" -- Note: {self.layer_types.count('full_attention')} full-attention layers have "
+                f"head_dim {self.global_head_dim} and use FlashInfer (hd512 verified on sm86)"
+            )
 
         if not quiet:
             for w in warnings:

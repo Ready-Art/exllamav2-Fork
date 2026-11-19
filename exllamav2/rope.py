@@ -149,8 +149,18 @@ def get_rope_params_default(
     device: torch.Device,
     cfg: ExLlamaV2Config,
     base: float,
+    head_dim: int | None = None,
 ):
-    head_dim = int(cfg.head_dim * cfg.partial_rotary_factor)
+    """
+    Standard RoPE over the first ``head_dim * partial_rotary_factor`` dimensions.
+
+    :param head_dim:
+        Override for the per-layer head dim. Gemma-4's global layers are 512 while the sliding
+        layers are 256, so the caller must pass the layer's own head_dim rather than letting this
+        read ``cfg.head_dim``.
+    """
+    if head_dim is None:
+        head_dim = int(cfg.head_dim * cfg.partial_rotary_factor)
 
     if cfg.scale_alpha_value and cfg.scale_alpha_value != 1.0:
         base *= cfg.scale_alpha_value ** (head_dim / (head_dim - 2))
@@ -159,11 +169,88 @@ def get_rope_params_default(
     return inv_freq, 1.0
 
 
+# Proportional (Gemma-4 global attention layers)
+
+def get_rope_params_proportional(
+    device: torch.Device,
+    cfg: ExLlamaV2Config,
+    base: float,
+    head_dim: int,
+    rope_proportion: float,
+):
+    """
+    Proportional RoPE: only the first ``rope_proportion`` fraction of the head is rotated; the
+    remaining dimensions pass through untouched.
+
+    Ported from ``exllamav3/util/rope.py:252`` ``_rope_params_proportional``.
+
+    The critical detail is that the divisor is the **full head_dim**, not ``rope_angles * 2``. That
+    is what makes the rotation "proportional": the rotated frequencies are computed as if they
+    spanned the whole head, then the non-rotated tail is zero-filled. Zero frequencies produce
+    ``sin = 0`` and ``cos = 1``, i.e. the identity, for the tail.
+
+    :param head_dim:
+        The layer's full head dim (512 for Gemma-4 global layers).
+
+    :param rope_proportion:
+        ``partial_rotary_factor`` from the config (0.25 for Gemma-4).
+    """
+
+    rope_angles = int(rope_proportion * head_dim // 2)
+
+    inv_freq_rotated = 1.0 / (
+        base ** (
+            torch.arange(0, 2 * rope_angles, 2, dtype = torch.int64, device = device).float() / head_dim
+        )
+    )
+
+    nope_angles = head_dim // 2 - rope_angles
+    if nope_angles > 0:
+        inv_freq = torch.cat(
+            (
+                inv_freq_rotated,
+                torch.zeros(nope_angles, dtype = torch.float32, device = device),
+            ),
+            dim = 0,
+        )
+    else:
+        inv_freq = inv_freq_rotated
+
+    return inv_freq, 1.0
+
+
 def get_rope_params(
     device: torch.Device,
     cfg: ExLlamaV2Config,
     base: float,
+    head_dim: int | None = None,
+    rope_type: str | None = None,
+    rope_proportion: float | None = None,
 ):
+    """
+    Dispatch to the appropriate RoPE frequency computation.
+
+    :param head_dim:
+        Per-layer head dim. Defaults to ``cfg.head_dim``.
+
+    :param rope_type:
+        Explicit rope type (``"proportional"``, ``"default"``). When None, falls back to the
+        ``cfg.alt_rope_method`` dispatch used by every non-Gemma-4 architecture.
+
+    :param rope_proportion:
+        ``partial_rotary_factor`` for proportional rope.
+    """
+
+    if rope_type == "proportional":
+        assert head_dim is not None, "proportional rope requires an explicit head_dim"
+        assert rope_proportion is not None, "proportional rope requires rope_proportion"
+        inv_freq, scaling_factor = get_rope_params_proportional(
+            device, cfg, base, head_dim, rope_proportion
+        )
+        if cfg.arch.lm.rope_freq_half:
+            inv_freq = inv_freq.half()
+        return inv_freq, scaling_factor
+
     if cfg.alt_rope_method == "su":
         inv_freq, scaling_factor = get_rope_params_su(device, cfg, base)
     elif cfg.alt_rope_method == "llama3":
@@ -171,7 +258,7 @@ def get_rope_params(
     elif cfg.alt_rope_method == "yarn":
         inv_freq, scaling_factor = get_rope_params_yarn(device, cfg, base)
     else:
-        inv_freq, scaling_factor = get_rope_params_default(device, cfg, base)
+        inv_freq, scaling_factor = get_rope_params_default(device, cfg, base, head_dim)
 
     if cfg.arch.lm.rope_freq_half:
         inv_freq = inv_freq.half()
