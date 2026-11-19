@@ -135,4 +135,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("tp_gather", &tp_gather, "tp_gather");
     m.def("tp_cross_device_barrier", &tp_cross_device_barrier, "tp_cross_device_barrier");
     m.def("tp_all_reduce", &tp_all_reduce, "tp_all_reduce");
+    m.def("tp_graph_capture_begin", &tp_graph_capture_begin, "tp_graph_capture_begin");
+    m.def("tp_graph_capture_end", &tp_graph_capture_end, "tp_graph_capture_end");
+    m.def("tp_graph_launch", &tp_graph_launch, "tp_graph_launch");
+    m.def("tp_graph_ready", &tp_graph_ready, "tp_graph_ready");
+    m.def("tp_graph_capture_status", &tp_graph_capture_status, "tp_graph_capture_status");
+    m.def("tp_set_capture_stream", &tp_set_capture_stream, "tp_set_capture_stream");
+    m.def("tp_raise_on_timeout", &tp_raise_on_timeout, "tp_raise_on_timeout");
+
+    // cuda-graph-safe kv write (position from device memory)
+
+    m.def("kv_write", &kv_write, "kv_write");
 }

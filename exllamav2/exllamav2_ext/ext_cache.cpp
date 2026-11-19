@@ -12,8 +12,52 @@
 #include "ext_cache.h"
 
 #include "cuda/cache.cuh"
+#include "cuda/kv_write.cuh"
 
 #include "cpp/util.h"
+
+// CUDA-graph-safe KV cache write. The position comes from a device tensor, so the same
+// captured graph replays correctly at every decode step.
+void kv_write
+(
+    torch::Tensor src_k,
+    torch::Tensor src_v,
+    torch::Tensor cache_k,
+    torch::Tensor cache_v,
+    torch::Tensor pos,
+    int batch_size,
+    int q_len,
+    int kv_heads,
+    int head_dim
+)
+{
+    TORCH_CHECK_DTYPE(src_k, kHalf);
+    TORCH_CHECK_DTYPE(src_v, kHalf);
+    TORCH_CHECK_DTYPE(cache_k, kHalf);
+    TORCH_CHECK_DTYPE(cache_v, kHalf);
+    TORCH_CHECK_DTYPE(pos, kInt);
+
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(cache_k));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    // cache is [batch, cache_len, kv_heads, head_dim]
+    int cache_len = (int) cache_k.size(1);
+
+    kv_write_cuda
+    (
+        stream,
+        (const half*) src_k.data_ptr(),
+        (const half*) src_v.data_ptr(),
+        (half*) cache_k.data_ptr(),
+        (half*) cache_v.data_ptr(),
+        (const int32_t*) pos.data_ptr(),
+        batch_size,
+        q_len,
+        kv_heads,
+        head_dim,
+        cache_len
+    );
+}
 
 void fp16_to_fp8(torch::Tensor in_tensor, torch::Tensor out_tensor, int batch_size, int offset, int width)
 {

@@ -1,5 +1,18 @@
 
 void fp16_to_fp8(torch::Tensor in_tensor, torch::Tensor out_tensor, int batch_size, int offset, int width);
+
+void kv_write
+(
+    torch::Tensor src_k,
+    torch::Tensor src_v,
+    torch::Tensor cache_k,
+    torch::Tensor cache_v,
+    torch::Tensor pos,
+    int batch_size,
+    int q_len,
+    int kv_heads,
+    int head_dim
+);
 void fp8_to_fp16(torch::Tensor in_tensor, torch::Tensor out_tensor, int batch_size, int offset, int width);
 
 void fp16_to_q_kv

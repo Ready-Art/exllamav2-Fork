@@ -167,15 +167,30 @@ void head_norm
 )
 {
     TORCH_CHECK_DTYPE(x, kHalf);
-    TORCH_CHECK_DTYPE(w, kHalf);
+    TORCH_CHECK_DTYPE_OPT(w, kHalf);
     TORCH_CHECK_DTYPE_OPT(b, kHalf);
     TORCH_CHECK_DTYPE(y, kHalf);
-    TORCH_CHECK_SHAPES(x, -1, w, -1, 1);
-    TORCH_CHECK_SHAPES(x, -2, w, -2, 1);
+
+    // `w` may be a meta tensor (or absent) for an unweighted RMSNorm, e.g. Gemma-4's `v_norm`.
+    // In that case the kernel normalizes without a scale multiply. Shape checks against `w` must
+    // be skipped, and `b` is then also meaningless.
+    const bool unweighted = w.device().is_meta() || w.numel() == 0;
+
+    if (!unweighted)
+    {
+        TORCH_CHECK_SHAPES(x, -1, w, -1, 1);
+        TORCH_CHECK_SHAPES(x, -2, w, -2, 1);
+        TORCH_CHECK_SHAPES_OPT(b, 0, w, 0, 1);
+        TORCH_CHECK_SHAPES_OPT(b, 1, w, 1, 1);
+    }
+    else
+    {
+        TORCH_CHECK(b.device().is_meta() || b.numel() == 0,
+                    "Unweighted head norm does not accept a bias");
+    }
+
     TORCH_CHECK_SHAPES(x, 0, y, 0, 1);
     TORCH_CHECK_SHAPES(x, 1, y, 1, 1);
-    TORCH_CHECK_SHAPES_OPT(b, 0, w, 0, 1);
-    TORCH_CHECK_SHAPES_OPT(b, 1, w, 1, 1);
 
     int head_dim = x.size(-1);
     int num_heads = x.size(-2);
@@ -188,8 +203,8 @@ void head_norm
     (
         stream,
         (half*) x.data_ptr(),
-        (half*) w.data_ptr(),
-        b.device().is_meta() ? NULL : (half*) b.data_ptr(),
+        unweighted ? NULL : (half*) w.data_ptr(),
+        (unweighted || b.device().is_meta()) ? NULL : (half*) b.data_ptr(),
         (half*) y.data_ptr(),
         epsilon,
         rms,

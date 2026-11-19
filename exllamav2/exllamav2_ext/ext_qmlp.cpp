@@ -455,19 +455,20 @@ void tp_mlp_forward_
 
     };
 
-    #ifdef TP_MULTITHREADED
-
-        std::vector<std::future<void>> threads;
-        Barrier sync_point(ctx->all_devices.size());
-        for (const auto &dev : ctx->all_devices)
-            threads.push_back(ctx->thread_pool->enqueue(run_thread, dev, &sync_point));
-        for (auto &t : threads)
-            t.get();
-
-    #else
-
-        run_thread(-1, NULL);
-
-    #endif
+    // BUG 90b: the per-device run_thread dispatch on the shared numdevs-sized pool deadlocks.
+    // Each run_thread occupies one pool worker, then re-enters tp_broadcast / tp_gather_barrier,
+    // which (under TP_MULTITHREADED) enqueue their per-device copy tasks on the SAME pool and
+    // block on t.get(). With numdevs workers all busy running the numdevs run_thread tasks, no
+    // worker is left to run the inner copy tasks -> every thread parks in a futex, GPUs idle at
+    // 0%. Nested thread-pool saturation deadlock, NOT a counter/collective deadlock (those spin
+    // the GPUs to 100%).
+    //
+    // Fix: run the fused MLP single-threaded (t_device = -1). The inner collectives then use the
+    // pool correctly (one level deep, no nesting) when called with t_device = -1 from this thread,
+    // and the tp_broadcast source block runs exactly once per collective (bc_seq advances by one,
+    // not once per device). This is the known-good pre-TP_MULTITHREADED baseline. The fused path
+    // is not on the Gemma-31B critical path (Gemma uses forward_tp_old), so dropping host-side
+    // multithreading here costs nothing for the target model.
+    run_thread(-1, NULL);
 
 }

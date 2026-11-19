@@ -285,6 +285,14 @@ void gemm_half_q_half_tp
             NULL,
             force_cuda
         );
+        if (ctx->graph_capture)
+        {
+            cudaError_t _e = cudaGetLastError();
+            if (_e != cudaSuccess)
+                fprintf(stderr, "[tp gemm] dev=%d m=%d n=%d k=%d err=%s\n",
+                        dev, (int) c[i].size(0), (int) c[i].size(1), (int) a[i].size(1),
+                        cudaGetErrorString(_e));
+        }
     }
 }
 

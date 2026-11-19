@@ -479,20 +479,13 @@ void tp_attn_forward_paged_
 
     };
 
-    #ifdef TP_MULTITHREADED
-
-        std::vector<std::future<void>> threads;
-        Barrier sync_point(ctx->all_devices.size());
-        for (const auto &dev : ctx->all_devices)
-            threads.push_back(ctx->thread_pool->enqueue(run_thread, dev, &sync_point));
-        for (auto &t : threads)
-            t.get();
-
-    #else
-
-        run_thread(-1, NULL);
-
-    #endif
+    // BUG 90b (same defect as tp_mlp_forward_): dispatching numdevs run_thread tasks onto the
+    // shared numdevs-sized pool deadlocks -- each run_thread re-enters tp_broadcast /
+    // tp_gather_barrier, which enqueue their copy tasks on the SAME pool and block on t.get(),
+    // but all workers are busy running the outer run_thread tasks. Signature: every thread in a
+    // futex, GPUs idle at 0%. Run single-threaded instead (t_device = -1); the inner collectives
+    // use the pool one level deep, which is safe.
+    run_thread(-1, NULL);
 
 }
 
@@ -716,19 +709,12 @@ void tp_attn_forward_
 
     };
 
-    #ifdef TP_MULTITHREADED
-
-        std::vector<std::future<void>> threads;
-        Barrier sync_point(ctx->all_devices.size());
-        for (const auto &dev : ctx->all_devices)
-            threads.push_back(ctx->thread_pool->enqueue(run_thread, dev, &sync_point));
-        for (auto &t : threads)
-            t.get();
-
-    #else
-
-        run_thread(-1, NULL);
-
-    #endif
+    // BUG 90b (same defect as tp_mlp_forward_): dispatching numdevs run_thread tasks onto the
+    // shared numdevs-sized pool deadlocks -- each run_thread re-enters tp_broadcast /
+    // tp_gather_barrier, which enqueue their copy tasks on the SAME pool and block on t.get(),
+    // but all workers are busy running the outer run_thread tasks. Signature: every thread in a
+    // futex, GPUs idle at 0%. Run single-threaded instead (t_device = -1); the inner collectives
+    // use the pool one level deep, which is safe.
+    run_thread(-1, NULL);
 
 }

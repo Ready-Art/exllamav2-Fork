@@ -7,7 +7,7 @@
 #define BROADCAST_RS 3
 #define BROADCAST_Q 4
 
-//#define TP_MULTITHREADED
+#define TP_MULTITHREADED
 
 //#include <nccl.h>
 #include "cpp/threadpool.h"
@@ -33,6 +33,35 @@ public:
     void* mapped_globals;
 
     std::vector<cudaEvent_t> sync_events;
+    // BUG 40: orders tp_broadcast's D2H (source stream) against its H2Ds (target streams).
+    std::vector<cudaEvent_t> bc_events;
+
+    // BUG 86: the REVERSE edge of the broadcast hazard.
+    //
+    // bc_events[src] orders "source finished writing" before "target reads". It does NOT order
+    // "target finished reading" before "source overwrites the buffer next module". Without that second
+    // edge, a fast source device reuses its buffer while a slow target is still reading it -- which is
+    // exactly the corruption seen when the per-collective barrier was removed.
+    //
+    // read_events[target] is recorded on the target's stream after its copy, and the source's stream
+    // waits on every target's read event before its next write. That is a per-target dependency edge in
+    // both directions, which is what the global barrier was approximating.
+    std::vector<cudaEvent_t> read_events;
+
+    // BUG 43: CUDA-graph capture support.
+    //
+    // torch.cuda.graph cannot capture this step (it requires one stream on one device), so the
+    // capture is driven from C++ with the raw API. `real_streams` is the per-device stream set
+    // the kernels launch on; `capture_stream` is the primary device's stream that the capture
+    // begins and ends on. `graph_capture` is true between begin and end.
+    std::vector<cudaStream_t> real_streams;
+    cudaStream_t capture_stream = nullptr;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
+    bool graph_capture = false;
+    // Fork/join events used to bring each device stream into the capture region.
+    std::vector<cudaEvent_t> fork_events;
+    std::vector<cudaEvent_t> join_events;
 //    std::vector<ncclComm_t> comms;
 //    std::vector<int> comms_index;
 
@@ -106,6 +135,18 @@ void tp_cross_device_barrier
     int stage = -1,
     int next_stage = -1
 );
+
+// BUG 43: CUDA-graph capture driver for the TP decode step. torch.cuda.graph cannot capture
+// multi-device work, so capture is done here with the raw CUDA API.
+void tp_graph_capture_begin(uintptr_t tp_context);
+void tp_graph_capture_end(uintptr_t tp_context);
+void tp_graph_launch(uintptr_t tp_context);
+bool tp_graph_ready(uintptr_t tp_context);
+int tp_graph_capture_status(uintptr_t tp_context);
+void tp_set_capture_stream(uintptr_t tp_context, uintptr_t stream);
+
+// BUG 87: raise if any spin kernel timed out (collective-ordering deadlock).
+void tp_raise_on_timeout(uintptr_t tp_context);
 
 //void tp_all_reduce
 //(
