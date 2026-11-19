@@ -189,12 +189,32 @@ class TPContext:
         entry = self.fi_decode.get(key)
         if entry is None:
             workspace = attn_backend.FlashInferPaged._get_workspace(torch.device("cuda", dev))
+            npages = depth // page
+            # BUG 103 (proper fix): use FlashInfer's native CUDA-graph mode. In non-graph
+            # mode plan() reallocates internal metadata/split-KV buffers as kv_len changes,
+            # staling the addresses a captured graph run() holds (variable-onset garbage at
+            # long context). use_cuda_graph=True freezes those buffers: plan() copies the
+            # dynamic indptr/indices/last_page_len into the fixed buffers below instead of
+            # reallocating, and split-KV intermediates stay in the fixed workspace. This
+            # keeps split-KV parallelism (full hd512 decode speed) AND graph-safe addresses.
+            # backend="fa2" is explicit: under cuda graphs "auto" resolves to cuDNN, which
+            # is not the verified hd512/sm86 path. batch=1 / q_len=1 are fixed for decode.
+            indices = torch.arange(npages, dtype = torch.int32, device = dev)
+            indptr = torch.zeros(2, dtype = torch.int32, device = dev)
+            last_page_len = torch.zeros(1, dtype = torch.int32, device = dev)
             entry = {
-                "wrapper": flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace, "NHD"),
-                "npages": depth // page,
-                "indices": torch.arange(depth // page, dtype = torch.int32, device = dev),
-                "indptr": torch.zeros(2, dtype = torch.int32, device = dev),
-                "last_page_len": torch.zeros(1, dtype = torch.int32, device = dev),
+                "wrapper": flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+                    workspace, "NHD",
+                    use_cuda_graph = True,
+                    backend = "fa2",
+                    paged_kv_indptr_buffer = indptr,
+                    paged_kv_indices_buffer = indices,
+                    paged_kv_last_page_len_buffer = last_page_len,
+                ),
+                "npages": npages,
+                "indices": indices,
+                "indptr": indptr,
+                "last_page_len": last_page_len,
             }
             self.fi_decode[key] = entry
 
@@ -221,13 +241,9 @@ class TPContext:
                 sm_scale = scale,
                 q_data_type = torch.half,
                 kv_data_type = k_cache_dev.dtype,
-                # BUG 103: auto split-KV picks a schedule (and reduction-buffer sizes)
-                # that changes with kv_len, so plan() reallocates the buffers a captured
-                # graph run() holds addresses of -> stale reads -> variable-onset token
-                # garbage at long context (short context, no split, is clean). Disabling
-                # split-KV keeps a single-pass decode with stable buffer addresses across
-                # replays, which is what makes the hd512 graph decode actually graph-safe.
-                disable_split_kv = True,
+                # BUG 103: split-KV stays ENABLED (full parallel reduction). Graph safety
+                # comes from use_cuda_graph=True above (fixed buffers), not from disabling
+                # split-KV -- disabling it cost long-context decode speed unnecessarily.
             )
         finally:
             torch.cuda.set_stream(prev_stream)
