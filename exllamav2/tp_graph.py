@@ -47,11 +47,16 @@ Design
 
 from __future__ import annotations
 
+import faulthandler
 import gc
 import os
 import torch
 
 from exllamav2.ext import exllamav2_ext as ext_c
+
+# BUG 110: dump the Python stack of every thread on SIGSEGV so a graph-replay crash
+# pinpoint the offending runner/key instead of only the native cuGraphLaunch frame.
+faulthandler.enable()
 
 
 def graphs_enabled() -> bool:
@@ -149,8 +154,34 @@ class TPGraphRunner:
         gc.collect()
         torch.cuda.synchronize(dev0)
         torch.cuda.set_stream(self.capture_stream)
+
+        # BUG 110: force the graph-mode collective destination buffers to be allocated
+        # INSIDE the capture region (graph-pool-owned). The warmup above populated the
+        # row-keyed graph caches with REGULAR (pre-capture) allocations; reusing them during
+        # capture bakes pre-capture addresses into the graph nodes, and a later reallocation
+        # frees that memory -> cuGraphLaunch segfault on replay (seen on SP's multi-device
+        # capture). Emptying the caches here makes capture allocate fresh pool-owned buffers
+        # that live as long as the graph. Previously captured graphs keep their OWN pool
+        # memory alive independently, so dropping their cache entries does not free them.
+        for _gc in (getattr(ctx, "_bc_cache_graph", None),
+                    getattr(ctx, "_gather_cache_graph", None)):
+            if _gc is not None:
+                _gc.clear()
+
+        # BUG 110 (SP multi-device): capture_begin pools allocations on the CURRENT device
+        # (dev0) only. In the single-process TP path the step also allocates on dev1-3; without
+        # routing those to the graph pool they are REGULAR allocations that get freed/recycled
+        # after capture, so a later replay dereferences freed memory -> cuGraphLaunch segfault
+        # (the bonus graph crashed on its second replay, after the verify capture recycled its
+        # dev1-3 buffers). Explicitly begin allocation-to-pool on every other device for the
+        # duration of the capture so ALL graph buffers are pool-owned (live as long as the graph).
+        _pool = torch.cuda.graph_pool_handle()
+        _pooled_devs = [d for d in ctx.all_devices() if d != dev0]
+        for _d in _pooled_devs:
+            torch._C._cuda_beginAllocateToPool(_d, _pool)
+
         try:
-            self.graph.capture_begin(pool = torch.cuda.graph_pool_handle())
+            self.graph.capture_begin(pool = _pool)
 
             # Tell the C++ context which stream the capture is on, so the host-staged D2H in
             # tp_broadcast is issued on a stream that belongs to the capture rather than on the
@@ -203,6 +234,13 @@ class TPGraphRunner:
             self.graph = None
             raise
         finally:
+            # BUG 110: stop routing dev1-3 allocations to the pool (capture_begin/end handles
+            # dev0 internally). Always run, even if capture failed, so the allocators recover.
+            for _d in _pooled_devs:
+                try:
+                    torch._C._cuda_endAllocateToPool(_d, _pool)
+                except Exception:
+                    pass
             for _c in (ctx.ext_tp_contexts.values() if ctx.ext_tp_contexts
                        else [ctx.ext_tp_context]):
                 if _c:
@@ -214,6 +252,7 @@ class TPGraphRunner:
             self.cache.current_seq_len = _saved_seq_len
 
         torch.cuda.synchronize(dev0)
+        print(f"[TP graph] captured key={self.key} dev={dev0}", flush=True)
 
     def release(self):
         """
@@ -233,6 +272,8 @@ class TPGraphRunner:
         self.state_buf = None
 
     def replay(self):
+        if self.num_replays == 0:
+            print(f"[TP graph] first replay key={self.key}", flush=True)
         self.graph.replay()
         self.num_replays += 1
 

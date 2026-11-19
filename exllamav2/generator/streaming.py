@@ -175,6 +175,13 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
         self.mtp_pending_pos = 0         # sequence position of the first pending row
         self.mtp_resync_count = 0        # sampling deviations that forced a rewind+recommit
         self.mtp_base_logits = None      # (1, 1, vocab) base-token logits predicting pos+1
+        # BUG 106: probabilistic speculative acceptance (ported from the MP driver). When a
+        # round is "decided", its emitted tokens were sampled at round time from the target's
+        # verified distribution and their KV is already cached -- consumption hands them out
+        # directly (no re-sample, no resync forward). mtp_pending_probs holds each decided
+        # token's dense target distribution for prob / top-token reporting.
+        self.mtp_pending_decided = False
+        self.mtp_pending_probs = []      # list of (vocab,) fp32 CPU tensors, one per pending token
         if mtp_drafter is not None:
             assert draft_model is None, "specify either draft_model or mtp_drafter, not both"
             if not num_speculative_tokens:
@@ -380,6 +387,8 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
         self.mtp_pending_tokens = []
         self.mtp_pending_pos = 0
         self.mtp_base_logits = None
+        self.mtp_pending_decided = False
+        self.mtp_pending_probs = []
 
         # Ingest prompt
 
@@ -657,6 +666,8 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
             self.mtp_pending_tokens = []
             self.mtp_pending_pos = 0
             self.mtp_base_logits = None
+            self.mtp_pending_decided = False
+            self.mtp_pending_probs = []
             return cp["offending_token"], off_text
 
         if self.banned_strings_utf32_offsets is not None:
@@ -1074,6 +1085,12 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
         Every emitted token is sampled from the TARGET's verified logits, so output is
         identical to plain autoregressive generation (modulo the sampler's own randomness),
         while each round emits ``m_acc + 1`` tokens per verification forward.
+
+        BUG 106: under sampling (no filters / post-sampling hooks / token healing) the round
+        uses probabilistic speculative acceptance -- tokens are decided at round time and
+        handed out directly, so a temp-1 deviation never costs a resync forward. Greedy and
+        filter/healing requests keep the exact argmax + resync protocol. BUG 107: the verify
+        forward is CUDA-graphed (graph-safe FlashInfer paged prefill), not eager.
         """
 
         # An external rewind (token healing, banned strings) may have truncated the
@@ -1082,6 +1099,8 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
             if self.cache.current_seq_len != self.mtp_pending_pos + self.mtp_pending_logits.shape[1]:
                 self.mtp_pending_logits = None
                 self.mtp_pending_tokens = []
+                self.mtp_pending_probs = []
+                self.mtp_pending_decided = False
                 self.mtp_state = None
 
         if self.mtp_pending_logits is None:
@@ -1103,50 +1122,55 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
             draft, _ = self.mtp_drafter.draft_window(
                 base_tok.cpu(), base_state, pos, self.num_speculative_tokens)   # (1, W)
             self.total_draft_tokens += draft.shape[-1]
+            draft_flat = draft[0].tolist()
 
             # 3. verify: target forward over the draft tokens, writing their KV.
             #    vlogits[i] (processing draft[i] at position pos+i) predicts pos+i+1.
-            # NOTE (Change98): graph_verify was tried here but reverted — it broke exact
-            # base==mtp parity on long prose (fp16 SDPA-vs-decode near-tie divergence) and
-            # the streaming generator's host overhead dominates anyway. The fast SP path is
-            # a DIRECT forward loop, not the streaming generator (see MP_DECODE_ANALYSIS.md).
+            # BUG 107: graph the fixed-shape verify window. The q_len>1 graph attention now
+            # uses a graph-safe FlashInfer paged-prefill kernel (re-planned per step outside
+            # the graph), replacing the full-cache-depth SDPA that made Change98's graphed
+            # verify ~250 ms. Only mark it when no per-call mask/offset/LoRA would perturb
+            # the captured step; otherwise forward_chunk stays eager.
+            _gv = (self.input_mask is None and self.position_offsets is None
+                   and not self.active_loras)
             vlogits = self.model.forward(
                 draft.cpu(), self.cache,
                 loras = self.active_loras,
                 input_mask = self.input_mask,
-                position_offsets = self.position_offsets)                        # (1, W, vocab)
+                position_offsets = self.position_offsets,
+                graph_verify = _gv)                                            # (1, W, vocab)
             vlogits = vlogits.float().cpu()
 
-            # 4. accept the longest draft prefix the target agrees with.
-            #    The target's prediction for position pos+k is mtp_base_logits (k==0) or
-            #    argmax(vlogits[k-1]) (k>=1).
-            m_acc = 0
-            draft_flat = draft[0].tolist()
-            v_argmax = vlogits[0].argmax(dim = -1).tolist()
-            bonus_pred = int(self.mtp_base_logits[0, 0].argmax())
-            for k in range(draft.shape[-1]):
-                pred = bonus_pred if k == 0 else v_argmax[k - 1]
-                if pred == draft_flat[k]:
-                    m_acc = k + 1
-                else:
-                    break
+            # 4. acceptance. BUG 106: under sampling (no filters / hooks / healing) use
+            #    probabilistic speculative acceptance -- the round's emitted tokens are
+            #    sampled NOW from the target's verified distribution and their KV is already
+            #    cached, so consumption never resyncs (the temp-1 killer of the old path).
+            #    Greedy, filters, post-sampling hooks and token healing keep the exact
+            #    argmax + resync protocol below.
+            decided = (not self.filters
+                       and not gen_settings.post_sampling_hooks
+                       and prefix_token is None)
+            if decided:
+                m_acc, bonus_id, pending_probs = self._mtp_accept_probabilistic(
+                    gen_settings, draft_flat, vlogits, self.current_blocked_tokens)
+                self.mtp_pending_decided = True
+                self.mtp_pending_probs = pending_probs
+            else:
+                m_acc, bonus_id = self._mtp_accept_argmax(draft_flat, vlogits)
+                self.mtp_pending_decided = False
+                self.mtp_pending_probs = []
             self.accepted_draft_tokens += m_acc
 
             # Verified logits for the emitted tokens: base logits (position pos) + the
-            # accepted drafts' rows -> m_acc + 1 rows.
+            # accepted drafts' rows -> m_acc + 1 rows (kept for prob/logit reporting).
             self.mtp_pending_logits = torch.cat(
                 [self.mtp_base_logits, vlogits[:, :m_acc, :]], dim = 1)
-            # The KV cache now holds these tokens at pos..pos+m_acc. With sampling,
-            # the token actually emitted from a pending row can differ from the cached
-            # one; the consumption step below checks this and resyncs on deviation.
-            self.mtp_pending_tokens = draft_flat[:m_acc]
+            self.mtp_pending_tokens = draft_flat[:m_acc] + [bonus_id]
             self.mtp_pending_pos = pos
 
             # 5. rewind past the unaccepted tail; the new base is the bonus token
             #    (target's own pick at position pos+m_acc, i.e. the last pending row).
             self.cache.current_seq_len = pos + m_acc
-            bonus_id = int(self.mtp_pending_logits[0, m_acc].argmax())
-            self.mtp_pending_tokens.append(bonus_id)
             base_tok = torch.tensor([[bonus_id]], dtype = torch.long)
             dev_logits, base_state = self.model.forward(
                 base_tok, self.cache,
@@ -1162,22 +1186,38 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
 
         # ---- consume one verified token ----
         logits = self.mtp_pending_logits[:, :1, :]
-        token, ptokens, pprobs, prob, eos = ExLlamaV2Sampler.sample(
-            logits,
-            gen_settings,
-            self.sequence_ids[:1, :], random.random(),
-            self.tokenizer,
-            prefix_token,
-            self.return_top_tokens,
-            blocked_tokens = self.current_blocked_tokens,
-            filters = self.filters,
-            filter_prefer_eos = self.filter_prefer_eos
-        )
         expected = self.mtp_pending_tokens[0]
+        if self.mtp_pending_decided:
+            # BUG 106: the token was already sampled at round time from the target's
+            # distribution; hand it out directly (no re-sample -> no deviation -> no resync).
+            token = torch.tensor([[expected]], dtype = torch.long)
+            p = self.mtp_pending_probs[0]
+            prob = torch.tensor([[float(p[expected])]], dtype = torch.float)
+            if self.return_top_tokens:
+                tv, ti = torch.topk(p, self.return_top_tokens)
+                ptokens = ti.view(1, 1, -1).long()
+                pprobs = tv.view(1, 1, -1).float()
+            else:
+                ptokens = none_tensor
+                pprobs = none_tensor
+            eos = False
+            self.mtp_pending_probs = self.mtp_pending_probs[1:]
+        else:
+            token, ptokens, pprobs, prob, eos = ExLlamaV2Sampler.sample(
+                logits,
+                gen_settings,
+                self.sequence_ids[:1, :], random.random(),
+                self.tokenizer,
+                prefix_token,
+                self.return_top_tokens,
+                blocked_tokens = self.current_blocked_tokens,
+                filters = self.filters,
+                filter_prefer_eos = self.filter_prefer_eos
+            )
         self.mtp_pending_logits = self.mtp_pending_logits[:, 1:, :]
         self.mtp_pending_tokens = self.mtp_pending_tokens[1:]
         self.mtp_pending_pos += 1
-        if int(token[0, 0]) != expected:
+        if not self.mtp_pending_decided and int(token[0, 0]) != expected:
             # Sampling deviated from the cached draft/bonus token (greedy never does:
             # acceptance is argmax-based). The cache holds `expected` at this position
             # but the emitted token is different, so every later pending row was
@@ -1188,6 +1228,7 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
             self.cache.current_seq_len = self.mtp_pending_pos - 1
             self.mtp_pending_logits = None
             self.mtp_pending_tokens = []
+            self.mtp_pending_probs = []
             dev_logits, base_state = self.model.forward(
                 token, self.cache,
                 loras = self.active_loras,
@@ -1198,9 +1239,68 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
             self.mtp_base_logits = dev_logits.float().cpu()
         elif self.mtp_pending_logits.shape[1] == 0:
             self.mtp_pending_logits = None
+            self.mtp_pending_probs = []
+            self.mtp_pending_decided = False
         self.total_tokens += 1
 
         return token, ptokens, pprobs, prob, eos, logits
+
+    def _mtp_accept_argmax(self, draft_flat, vlogits):
+        """Greedy acceptance: longest draft prefix the target's argmax agrees with.
+
+        Returns (m_acc, bonus_id); the bonus is the target's argmax at position pos+m_acc
+        (base logits when m_acc == 0, else verify row m_acc-1).
+        """
+        m_acc = 0
+        v_argmax = vlogits[0].argmax(dim = -1).tolist()
+        bonus_pred = int(self.mtp_base_logits[0, 0].argmax())
+        for k in range(len(draft_flat)):
+            pred = bonus_pred if k == 0 else v_argmax[k - 1]
+            if pred == draft_flat[k]:
+                m_acc = k + 1
+            else:
+                break
+        bonus_id = bonus_pred if m_acc == 0 else int(vlogits[0, m_acc - 1].argmax())
+        return m_acc, bonus_id
+
+    def _mtp_accept_probabilistic(self, gen_settings, draft_flat, vlogits, ban_tokens):
+        """BUG 106: exact speculative sampling for a greedy draft (ported from MTPMPDriver).
+
+        The draft is greedy, so q_k is a point mass on draft_flat[k]: accept draft[k] with
+        probability p_target_k(draft[k]); on rejection resample from the residual
+        normalize(max(0, p_target_k - q_k)) and truncate the round. No extra forward on
+        rejection -- the bonus commit seeds the next base. Returns (m_acc, bonus_id, probs)
+        where probs holds the dense target distribution used for each emitted token
+        (m_acc accepted drafts + 1 bonus), for prob / top-token reporting at consumption.
+        """
+        from exllamav2.mtp_mp import MTPMPDriver
+        W = len(draft_flat)
+        seq = self.sequence_ids[:1, :]
+        probs = []
+        m_acc = 0
+        bonus_id = None
+        for k in range(W):
+            row = self.mtp_base_logits if k == 0 else vlogits[:, k - 1:k, :]
+            p = MTPMPDriver._dense_probs(row, gen_settings, self.tokenizer, seq, ban_tokens)
+            dk = draft_flat[k]
+            if random.random() < float(p[dk]):
+                m_acc = k + 1
+                probs.append(p)
+                seq = torch.cat([seq, torch.tensor([[dk]], dtype = torch.long)], dim = -1)
+                continue
+            resid = p.clone()
+            resid[dk] = 0.0
+            s = float(resid.sum())
+            resid = resid / s if s > 1e-12 else p
+            bonus_id = MTPMPDriver._sample_from(resid, random.random())
+            probs.append(resid)
+            break
+        if bonus_id is None:
+            pW = MTPMPDriver._dense_probs(vlogits[:, W - 1:W, :], gen_settings,
+                                          self.tokenizer, seq, ban_tokens)
+            bonus_id = MTPMPDriver._sample_from(pW, random.random())
+            probs.append(pW)
+        return m_acc, bonus_id, probs
 
 
     # Speculative decoding with n-gram predictions

@@ -219,13 +219,10 @@ class MTPMPDriver:
         _t = self._time.perf_counter()
 
         # 2. draft a greedy window (with per-step logits when sampling, for q)
-        if settings is None:
-            draft, _ = self.d.draft_window(base_tok, base_state, pos, self.window)   # (1,W) cpu
-            draft_logits = None
-        else:
-            draft, draft_logits = self.d.draft_window(
-                base_tok, base_state, pos, self.window, return_logits=True)
-            draft_logits = draft_logits.float().cpu()
+        # BUG 105/106: the draft is greedy, so probabilistic acceptance only needs the
+        # draft IDS (q_k is a point mass on draft[k]) -- the per-step full-vocab logits are
+        # never read. Don't collect/return them (saves W x vocab fp32 copies + a PCIe hop).
+        draft, _ = self.d.draft_window(base_tok, base_state, pos, self.window)   # (1,W) cpu
         self.total_draft += draft.shape[-1]
         self.t_draft += self._time.perf_counter() - _t
         _t = self._time.perf_counter()
@@ -237,12 +234,15 @@ class MTPMPDriver:
         #    path already sends CPU ids and _worker_forward moves them per-rank).
         #    graph_verify: the window is a fixed shape (1, W), so every rank captures
         #    it once and replays it per round (Change98) instead of running eager.
-        # BUG 105 perf: verify EAGER (graph_verify=False). The graphed verify path feeds
-        # _attn_torch the FULL cache depth (160k) with a dynamic mask, and SDPA's hd512
-        # kernel scales linearly with kv_len -> ~250 ms/verify. The eager path narrows K/V
-        # to the valid prefix and uses FlashInfer prefill for hd512 -> ~tens of ms.
+        # BUG 107: verify GRAPHED again. Change98's graphed verify was slow (~250 ms)
+        # because the q_len>1 graph attention fell back to _attn_torch/SDPA over the FULL
+        # 160k cache depth on the hd512 layers. The graph path now uses a graph-safe
+        # FlashInfer paged-prefill kernel (use_cuda_graph=True, re-planned per step outside
+        # the capture -- the BUG 103 decode pattern), so the captured window replays at
+        # ~the graphed-decode cost instead of eager host dispatch + full-depth SDPA. If
+        # capture fails, forward_chunk falls back to eager automatically (still correct).
         vlogits = self.pg.forward(draft.cpu(), pos, draft.shape[-1], 1, False,
-                                  graph_verify = False)
+                                  graph_verify = True)
         self.t_verify += self._time.perf_counter() - _t
         vlogits = vlogits.float().cpu()
 

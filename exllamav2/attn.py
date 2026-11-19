@@ -2216,11 +2216,31 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                             attn_output = self.model.tp_context.fi_decode_run(
                                 _fi_key, q[idx], k_cache[idx], v_cache[idx]
                             )
+                        elif (q_len > 1 and batch_size == 1 and _fi_hd
+                                and all((_fi_key + (i,)) in self.model.tp_context.fi_decode
+                                        for i in range(q_len))):
+                            # BUG 109: graph-safe MTP verify window via per-row FI DECODE.
+                            # Each query row i is a decode query attending to its causal
+                            # prefix kv_len = pos + i + 1 (planned per row outside the graph,
+                            # model._fi_tp_graph_plan). The decode wrapper is graph-safe
+                            # (BUG 103: use_cuda_graph=True freezes its buffers) and reads
+                            # ONLY the valid prefix -- not the full 160k allocation. This
+                            # replaces both the full-depth matmul (slow, BUG 108) and the FI
+                            # paged-prefill wrapper (re-plan realloc -> segfault). Serves
+                            # hd512 full AND hd256 SWA (window_left in the plan). The W rows'
+                            # KV is already written above, so row i sees draft[0..i] too.
+                            _rows = []
+                            for i in range(q_len):
+                                _rows.append(self.model.tp_context.fi_decode_run(
+                                    _fi_key + (i,), q[idx][:, i:i + 1],
+                                    k_cache[idx], v_cache[idx]
+                                ))
+                            attn_output = torch.cat(_rows, dim = 1)   # (1, q_len, nq*hd)
                         else:
-                            # Torch fallback with a dynamic device mask: hd256 layers,
-                            # the multi-token MTP verify window (q_len > 1), or hd512
-                            # when no plan exists. Attention must only see the valid
-                            # prefix; pure tensor ops, no .item() (illegal in capture).
+                            # Torch fallback with a dynamic device mask: shapes FlashInfer
+                            # cannot serve (no plan, softcap, odd depth). Attention must
+                            # only see the valid prefix; pure tensor ops, no .item()
+                            # (illegal in capture).
                             cache_b = k_cache[idx].shape[1]
                             _dev = k_cache[idx].device
                             _ki = torch.arange(cache_b, device = _dev).view(1, cache_b)

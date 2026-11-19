@@ -121,6 +121,9 @@ class ExLlamaV2:
         # which keep using the existing fused-kernel graph path in q_attn.cu / q_mlp.cu.
         # Change98: the static input/logits/state buffers live on each TPGraphRunner, not here.
         self.tp_graph = None
+        # BUG 107: set if the MTP verify-window graph capture fails; later verifies stay
+        # eager WITHOUT disabling the decode/bonus graphs (see _tp_graph_step).
+        self._tp_graph_verify_failed = False
 
         # Build model
 
@@ -1176,15 +1179,24 @@ class ExLlamaV2:
             return result, last_state
 
 
-    def _fi_tp_graph_plan(self, cache, kv_len: int):
+    def _fi_tp_graph_plan(self, cache, kv_len: int, q_len: int = 1):
         """
-        Refresh the FlashInfer hd>256 paged decode plans for a graphed step.
+        Refresh the FlashInfer paged attention plans for a graphed step.
 
         Host-side work, called OUTSIDE the capture region: once before warmup/capture and
         once before every replay (the plan encodes the dynamic kv_len). All hd512 layers
         share the per-device geometry, so one wrapper per (device, geometry) serves every
         layer's captured run(). After planning, order dev0's replay launch after every
         device's plan work so no replayed run() reads a half-written plan.
+
+        BUG 109: the graphed MTP verify window (q_len > 1) is served by q_len FI DECODE
+        wrappers -- one per query row i, planned to that row's causal prefix
+        kv_len_i = past_len + i + 1 (ring-relative for SWA). The decode wrapper is
+        graph-safe (BUG 103: use_cuda_graph=True freezes its buffers) and reads ONLY the
+        valid prefix -- unlike a full-160k-depth matmul (slow, BUG 108) or the FI
+        paged-prefill wrapper (re-plan reallocates captured buffers -> segfault). Each
+        unique (device, geometry, row) wrapper is planned ONCE per replay; layers sharing
+        a geometry reuse it (this also removes the old per-layer redundant re-plans).
         """
         from exllamav2.attn import use_flashinfer
         from exllamav2.tensor_p import BROADCAST_KV
@@ -1194,33 +1206,44 @@ class ExLlamaV2:
         if not use_flashinfer(cfg) or cfg.attn_logit_softcapping:
             return
         planned = False
+        seen = set()
+        past_len = kv_len - q_len
         for m in self.modules:
             if not isinstance(m, ExLlamaV2Attention):
                 continue
-            # FlashInfer now serves both full hd512 layers and SWA hd256 layers (the
-            # latter with window_left), so FA2 is no longer needed on the graphed decode
-            # path. SWA layers keep K/V in a ring: their valid length is ring-relative
-            # (absolute kv_len minus window_beg), clamped to the ring depth.
+            # SWA layers keep K/V in a ring: row i's valid length is ring-relative
+            # (past_len - window_beg + i + 1), clamped to the ring depth. Full layers use
+            # the absolute causal prefix past_len + i + 1.
             window_left = m.sliding_window if m.sliding_window else -1
             if m.sliding_window:
-                layer_kv = kv_len - getattr(cache, "window_beg", 0)
+                base = past_len - getattr(cache, "window_beg", 0)
                 ring_depth = getattr(cache, "kv_state_size", None)
-                if ring_depth:
-                    layer_kv = min(layer_kv, ring_depth)
             else:
-                layer_kv = kv_len
-            if layer_kv < 1:
-                continue
+                base = past_len
+                ring_depth = None
             ctx.set_geometry(m.layer_idx)
             split = ctx.get_split(BROADCAST_KV)
-            k_cache, _ = cache.get_kv_state(m.layer_idx, 1, 0, max(0, layer_kv - 1))
+            k_cache, _ = cache.get_kv_state(m.layer_idx, 1, 0, 1)
             for idx, (dev, a, b) in enumerate(split):
-                key = (
-                    dev, (b - a) * m.num_key_value_groups, b - a,
-                    m.head_dim, m.scaling, window_left
-                )
-                if ctx.fi_decode_plan(key, layer_kv, k_cache[idx]):
-                    planned = True
+                nq = (b - a) * m.num_key_value_groups
+                nkv = b - a
+                for i in range(q_len):
+                    row_kv = base + i + 1
+                    if ring_depth:
+                        row_kv = min(row_kv, ring_depth)
+                    if row_kv < 1:
+                        continue
+                    # q_len == 1 keeps the legacy 6-tuple key (attn decode branch); the
+                    # verify rows append the row index so each row gets its own plan.
+                    if q_len == 1:
+                        key = (dev, nq, nkv, m.head_dim, m.scaling, window_left)
+                    else:
+                        key = (dev, nq, nkv, m.head_dim, m.scaling, window_left, i)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    if ctx.fi_decode_plan(key, row_kv, k_cache[idx]):
+                        planned = True
         if planned:
             ctx.fi_decode_order_before_replay()
 
@@ -1384,7 +1407,7 @@ class ExLlamaV2:
                 stage_inputs(input_buf)
                 # hd>256 FlashInfer decode plans must exist before warmup/capture: run() is
                 # captured, plan() is host work and cannot run inside the capture region.
-                self._fi_tp_graph_plan(cache, past_len + seq_len)
+                self._fi_tp_graph_plan(cache, past_len + seq_len, q_len = seq_len)
                 ctx.graph_mode = True
                 try:
                     runner.capture()
@@ -1394,6 +1417,14 @@ class ExLlamaV2:
                     ctx.graph_mode = False
                     runner = None
             if runner is None:
+                if seq_len > 1:
+                    # BUG 107: a verify-window capture failure must NOT disable the proven
+                    # decode/bonus graphs (that would regress the whole path to eager).
+                    # Fall back to eager VERIFY only and skip future verify captures.
+                    self._tp_graph_verify_failed = True
+                    print(f"[TP graphs] verify capture failed ({type(_capture_err).__name__}: "
+                          f"{_capture_err}); eager verify fallback, decode graphs kept", flush=True)
+                    return None
                 self.tp_graph.disable(f"capture failed: {type(_capture_err).__name__}: {_capture_err}")
                 print(f"[TP graphs] disabled: {self.tp_graph.disabled_reason}", flush=True)
                 return None
@@ -1446,7 +1477,7 @@ class ExLlamaV2:
                         ctx.fill_tp(_pl, past_len)
                     # Refresh the hd>256 FlashInfer decode plans for this step's kv_len
                     # (host work, outside the graph) and order the replay after them.
-                    self._fi_tp_graph_plan(cache, past_len + seq_len)
+                    self._fi_tp_graph_plan(cache, past_len + seq_len, q_len = seq_len)
                     # Replay while dev0's stream is still current: CUDAGraph.replay() launches on
                     # the torch current stream, and the graph's nodes were captured on this one.
                     runner.replay()
@@ -1539,6 +1570,7 @@ class ExLlamaV2:
             and not loras
             and not kwargs.get("indexed_embeddings")
             and self.tp_graph is not None
+            and not (graph_verify and self._tp_graph_verify_failed)
             and self.tp_graph.can_capture(batch_size, seq_len, loras, allow_multi = graph_verify)
         ):
             graph_runner = self._tp_graph_step(

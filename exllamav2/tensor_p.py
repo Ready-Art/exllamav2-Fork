@@ -18,17 +18,22 @@ BROADCAST_RS = 3
 BROADCAST_Q = 4
 
 
-def tp_reuse_buffers(cache: dict, specs: list):
+def tp_reuse_buffers(cache: dict, specs: list, key_rows: bool = False):
     """
     Return reusable output buffers for a TP module.
 
     ``specs`` is a list of (device, rows, cols, dtype). Buffers are keyed by
     (device, cols, dtype) and reallocated only when the row count changes, so the
     cache holds at most one buffer per device per module. BUG 41.
+
+    BUG 110: with ``key_rows=True`` the row count is part of the key, so different q_len
+    shapes get DISTINCT, never-reallocated entries. Required for graph-mode collectives:
+    a captured graph bakes the buffer address into its nodes, and reallocating it for another
+    shape (bonus q_len=1 vs verify q_len=W) frees that address -> cuGraphLaunch segfault.
     """
     out = []
     for dev, rows, cols, dtype in specs:
-        key = (dev, cols, dtype)
+        key = (dev, rows, cols, dtype) if key_rows else (dev, cols, dtype)
         ent = cache.get(key)
         if ent is None or ent[0] != rows:
             buf = torch.empty((rows, cols), device = dev, dtype = dtype)
@@ -107,6 +112,15 @@ class TPContext:
         self._bc_cache = None
         self._gather_cache = None
         self._ag_cache = None
+        # BUG 110: separate, ROW-KEYED, never-evicted caches for graph-mode collectives.
+        # The eager caches above key by (dev, cols, dtype) and reallocate when the row count
+        # changes -- so the bonus graph (q_len=1) and the verify graph (q_len=W) clobbered
+        # each other's captured buffer, freeing memory a graph baked into its nodes ->
+        # cuGraphLaunch segfault on SP replay. Graph shapes are only {1, W}, so a row-keyed
+        # cache holds a few tiny buffers permanently (each graph keeps its own address);
+        # eager prefill keeps the realloc cache so large chunk shapes are not all retained.
+        self._bc_cache_graph = None
+        self._gather_cache_graph = None
 
         # CUDA-graph mode. When set, gather() returns a *device* tensor on the primary device
         # instead of a host view of pinned_temp, and skips the host drain. That removes the two
@@ -136,6 +150,14 @@ class TPContext:
         # hd512 on sm86 (verified cos 1.0); the contiguous per-device KV buffer is viewed
         # as 128-token pages. See attn.py forward_tp_old / model.py _tp_graph_step.
         self.fi_decode = {}
+
+        # BUG 107: FlashInfer paged PREFILL wrappers for the graphed MTP verify window
+        # (q_len > 1). Same graph-safe pattern as fi_decode (use_cuda_graph=True, backend
+        # "fa2", fixed indptr/indices/last_page_len buffers refreshed by a per-step plan
+        # outside the capture), but with a fixed qo_indptr = [0, q_len] so the captured
+        # multi-token attention replays at every round. One wrapper per (device, geometry,
+        # q_len). Replaces the full-cache-depth SDPA that made the graphed verify ~250 ms.
+        self.fi_prefill = {}
 
         self.define_split(gpu_split, expect_cache_tokens, expect_cache_base)
 
@@ -183,7 +205,10 @@ class TPContext:
         import flashinfer
         from exllamav2 import attn_backend
 
-        dev, nq, nkv, hd, scale, window_left = key
+        # BUG 109: the key is a 6-tuple for plain decode, or a 7-tuple (…, row_index) for
+        # the per-row MTP verify wrappers. The row index only discriminates the dict entry
+        # (one wrapper per verify row); the plan parameters are the first six elements.
+        dev, nq, nkv, hd, scale, window_left = key[:6]
         page = self.FI_DECODE_PAGE
         depth = k_cache_dev.shape[1]
         if depth % page != 0 or kv_len < 1 or kv_len > depth:
@@ -269,6 +294,105 @@ class TPContext:
         # misread as q_len_per_req=H by the non-tensor-core decode kernel.
         out = entry["wrapper"].run(q.view(1, q.shape[2], hd), (k_pages, v_pages))
         return out.view(1, 1, q.shape[2] * hd)
+
+    def fi_prefill_plan(self, key, kv_len: int, k_cache_dev: torch.Tensor) -> bool:
+        """
+        BUG 107: plan the shared per-device FlashInfer paged PREFILL wrapper for the
+        graphed MTP verify window (q_len > 1). Host-side work, OUTSIDE the capture, before
+        warmup/capture and before every replay -- exactly the fi_decode_plan pattern.
+
+        :param key: ``(dev, num_qo_heads, num_kv_heads, head_dim, sm_scale, window_left, q_len)``
+            q_len is part of the key: the fixed query shape is baked into qo_indptr.
+        :param kv_len: valid KV prefix including the q_len verify tokens (ring-relative for
+            SWA layers, absolute for full layers).
+        :return: True if the wrapper is ready, False if the shape cannot be served.
+        """
+        import flashinfer
+        from exllamav2 import attn_backend
+
+        dev, nq, nkv, hd, scale, window_left, q_len = key
+        page = self.FI_DECODE_PAGE
+        depth = k_cache_dev.shape[1]
+        if depth % page != 0 or kv_len < 1 or kv_len > depth or q_len < 1:
+            return False
+
+        entry = self.fi_prefill.get(key)
+        if entry is None:
+            workspace = attn_backend.FlashInferPaged._get_workspace(torch.device("cuda", dev))
+            npages = depth // page
+            # use_cuda_graph=True + backend="fa2": plan() refreshes the FA2 scheduling
+            # metadata in fixed buffers (the BUG 103 decode fix), so a captured run()
+            # replays correctly as kv_len grows. "auto" would resolve to cuDNN under
+            # graphs, which is not the verified hd512/sm86 path. batch=1, q_len fixed.
+            qo_indptr = torch.tensor([0, q_len], dtype = torch.int32, device = dev)
+            indices = torch.arange(npages, dtype = torch.int32, device = dev)
+            indptr = torch.zeros(2, dtype = torch.int32, device = dev)
+            last_page_len = torch.zeros(1, dtype = torch.int32, device = dev)
+            entry = {
+                "wrapper": flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                    workspace, "NHD",
+                    use_cuda_graph = True,
+                    backend = "fa2",
+                    qo_indptr_buf = qo_indptr,
+                    paged_kv_indptr_buf = indptr,
+                    paged_kv_indices_buf = indices,
+                    paged_kv_last_page_len_buf = last_page_len,
+                ),
+                "npages": npages,
+                "qo_indptr": qo_indptr,
+                "indices": indices,
+                "indptr": indptr,
+                "last_page_len": last_page_len,
+            }
+            self.fi_prefill[key] = entry
+
+        pages_valid = (kv_len + page - 1) // page
+        entry["indptr"][1] = pages_valid
+        entry["last_page_len"][0] = kv_len - (pages_valid - 1) * page
+
+        prev_dev = torch.cuda.current_device()
+        prev_stream = torch.cuda.current_stream(dev)
+        torch.cuda.set_device(dev)
+        torch.cuda.set_stream(self.streams_dev[dev])
+        try:
+            entry["wrapper"].plan(
+                qo_indptr = entry["qo_indptr"],
+                paged_kv_indptr = entry["indptr"],
+                paged_kv_indices = entry["indices"],
+                paged_kv_last_page_len = entry["last_page_len"],
+                num_qo_heads = nq,
+                num_kv_heads = nkv,
+                head_dim_qk = hd,
+                page_size = page,
+                causal = True,
+                pos_encoding_mode = "NONE",
+                window_left = window_left,
+                logits_soft_cap = None,
+                sm_scale = scale,
+                q_data_type = torch.half,
+                kv_data_type = k_cache_dev.dtype,
+            )
+        finally:
+            torch.cuda.set_stream(prev_stream)
+            torch.cuda.set_device(prev_dev)
+        return True
+
+    def fi_prefill_run(self, key, q: torch.Tensor, k_cache_dev: torch.Tensor, v_cache_dev: torch.Tensor):
+        """
+        Capturable multi-token (verify-window) attention against the per-step prefill plan.
+        ``(1, q_len, H, D)`` query, contiguous per-device KV buffers; returns
+        ``(1, q_len, H * D)`` like _attn_torch.
+        """
+        entry = self.fi_prefill[key]
+        page = self.FI_DECODE_PAGE
+        npages = entry["npages"]
+        nkv = k_cache_dev.shape[2]
+        hd = q.shape[3]
+        q_len = q.shape[1]
+        k_pages = k_cache_dev.view(npages, page, nkv, hd)
+        v_pages = v_cache_dev.view(npages, page, nkv, hd)
+        out = entry["wrapper"].run(q.view(q_len, q.shape[2], hd), (k_pages, v_pages))
+        return out.view(1, q_len, q.shape[2] * hd)
 
     def fi_decode_order_before_replay(self):
         """
@@ -819,15 +943,19 @@ class TPContext:
 
         # Reuse the per-device destination buffers. Allocating here would put a
         # torch.empty on the hot path of every module (and, more importantly, is not
-        # allowed inside a CUDA graph capture region). Keyed like tp_reuse_buffers so the
-        # cache holds at most one buffer per device per shape.
-        if self._bc_cache is None:
-            self._bc_cache = {}
-        bc_tensors = tp_reuse_buffers(
-            self._bc_cache,
-            [(idx, input_tensor.shape[0], input_tensor.shape[1], input_tensor.dtype)
-             for idx, _, _ in split]
-        )
+        # allowed inside a CUDA graph capture region). BUG 110: in graph mode use the
+        # row-keyed, never-evicted graph cache so the bonus (q_len=1) and verify (q_len=W)
+        # graphs keep distinct stable buffers; eager mode keeps the realloc cache.
+        _specs = [(idx, input_tensor.shape[0], input_tensor.shape[1], input_tensor.dtype)
+                  for idx, _, _ in split]
+        if self.graph_mode:
+            if self._bc_cache_graph is None:
+                self._bc_cache_graph = {}
+            bc_tensors = tp_reuse_buffers(self._bc_cache_graph, _specs, key_rows = True)
+        else:
+            if self._bc_cache is None:
+                self._bc_cache = {}
+            bc_tensors = tp_reuse_buffers(self._bc_cache, _specs)
 
         ext_c.tp_broadcast(
             self.ext_tp_context,
@@ -862,10 +990,10 @@ class TPContext:
         # round trip is what forces the next module to re-broadcast from pinned memory.
         # BUG 43.
         if self.graph_mode:
-            if self._gather_cache is None:
-                self._gather_cache = {}
+            if self._gather_cache_graph is None:
+                self._gather_cache_graph = {}
             return self.gather_dev(
-                buffer, inputs, broadcast_type, dim, cache = self._gather_cache
+                buffer, inputs, broadcast_type, dim, cache = self._gather_cache_graph
             )
 
         ext_c.tp_gather(
@@ -1046,9 +1174,12 @@ class TPContext:
         dtype = inputs[0].dtype
 
         if cache is not None:
+            # BUG 110: gather_dev is the graph-mode path; key by rows so each captured
+            # q_len shape keeps its own stable buffer (never reallocated for another shape).
             targets = tp_reuse_buffers(
                 cache,
-                [(dev, rows, cols, dtype) for dev, _, _ in split]
+                [(dev, rows, cols, dtype) for dev, _, _ in split],
+                key_rows = True
             )
         else:
             targets = [
