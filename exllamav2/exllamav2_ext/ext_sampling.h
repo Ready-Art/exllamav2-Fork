@@ -43,6 +43,25 @@ std::vector<float> sample_basic
     float skew
 );
 
+void sample_probs
+(
+    torch::Tensor logits,           // shape [bsz, 1, vocab_size]
+    float temperature,
+    int top_k,
+    float top_p,
+    float top_a,
+    float min_p,
+    float tfs,
+    float typical,
+    torch::Tensor output_probs,     // shape [bsz, vocab_size] dense processed probs
+    torch::Tensor logit_filter,     // shape [bsz, vocab_size] bool or meta
+    float post_temperature,
+    float min_temp,
+    float max_temp,
+    float temp_exponent,
+    float smoothing_factor
+);
+
 void logit_filter_exclusive
 (
     torch::Tensor filter,                                       // shape [bsz, vocab_size]

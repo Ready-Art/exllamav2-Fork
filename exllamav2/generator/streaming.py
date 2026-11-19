@@ -1100,7 +1100,7 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
             self.mtp_drafter.gather_target(self.cache)
 
             # 2. draft a greedy window (CPU ids; the target's embedding is CPU-resident in TP)
-            draft = self.mtp_drafter.draft_window(
+            draft, _ = self.mtp_drafter.draft_window(
                 base_tok.cpu(), base_state, pos, self.num_speculative_tokens)   # (1, W)
             self.total_draft_tokens += draft.shape[-1]
 

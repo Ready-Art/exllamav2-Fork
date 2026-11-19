@@ -524,7 +524,7 @@ class Gemma4AssistantDrafter:
     # ------------------------------------------------------------------ draft window
 
     def draft_window(self, last_token: torch.Tensor, last_state: torch.Tensor, pos: int,
-                     window: int | None = None) -> torch.Tensor:
+                     window: int | None = None, return_logits: bool = False):
         """
         Produce a speculative window of ``window`` token ids (greedy) starting from
         ``last_token`` / ``last_state``.
@@ -556,12 +556,17 @@ class Gemma4AssistantDrafter:
         # erasing the launch-overhead saving: net neutral @4k/counting, a LOSS @32k vs eager.
         # Eager FI reads only kv_len in fp16 with optimized kernels. Re-enable only if a
         # graph-safe dynamic-length hd512 FI kernel becomes available.
-        if (self._kf_base is not None and not self._graph_failed
+        # BUG 105: the graph draft path only produces argmax ids (no per-step logits), so
+        # when the caller needs logits for probabilistic acceptance (return_logits=True) we
+        # must use the eager path, which returns (ids, logits). Otherwise the sampling caller
+        # would unpack a single ids tensor and crash.
+        if (self._kf_base is not None and not self._graph_failed and not return_logits
                 and os.environ.get("EXL2_MTP_DRAFT_GRAPH", "0") == "1"):
             self._ensure_draft_graph()
             if self._draft_graph is not None:
-                return self._draft_window_graph(last_token, last_state, pos, window)
+                return self._draft_window_graph(last_token, last_state, pos, window), None
         ids = []
+        logits_list = []
         tok = last_token.to(self.dev, non_blocking = True)
         state = last_state.to(self.dev, non_blocking = True).half()
         if state.dim() == 1:                      # tolerate a flattened (H,) state
@@ -570,8 +575,15 @@ class Gemma4AssistantDrafter:
             logits, state = self._step(tok, state, pos, first = (k == 0))
             nxt = torch.argmax(logits, dim = -1)         # (1,1)
             ids.append(nxt)
+            logits_list.append(logits.float())
             tok = nxt
-        return torch.cat(ids, dim = -1)                  # (1, window)
+        ids_t = torch.cat(ids, dim = -1)                 # (1, window)
+        # BUG 105: ALWAYS return a 2-tuple (ids, logits_or_None) so callers never unpack a
+        # bare tensor (which iterates the window dim and crashes with a window-size-dependent
+        # "not enough values to unpack"). logits is None unless return_logits=True.
+        if return_logits:
+            return ids_t, torch.cat(logits_list, dim = 1)
+        return ids_t, None
 
     # ------------------------------------------------------------------ draft graph
 

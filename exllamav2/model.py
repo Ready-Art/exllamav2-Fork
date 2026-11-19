@@ -1197,17 +1197,29 @@ class ExLlamaV2:
         for m in self.modules:
             if not isinstance(m, ExLlamaV2Attention):
                 continue
-            if m.head_dim <= 256 or m.sliding_window:
+            # FlashInfer now serves both full hd512 layers and SWA hd256 layers (the
+            # latter with window_left), so FA2 is no longer needed on the graphed decode
+            # path. SWA layers keep K/V in a ring: their valid length is ring-relative
+            # (absolute kv_len minus window_beg), clamped to the ring depth.
+            window_left = m.sliding_window if m.sliding_window else -1
+            if m.sliding_window:
+                layer_kv = kv_len - getattr(cache, "window_beg", 0)
+                ring_depth = getattr(cache, "kv_state_size", None)
+                if ring_depth:
+                    layer_kv = min(layer_kv, ring_depth)
+            else:
+                layer_kv = kv_len
+            if layer_kv < 1:
                 continue
             ctx.set_geometry(m.layer_idx)
             split = ctx.get_split(BROADCAST_KV)
-            k_cache, _ = cache.get_kv_state(m.layer_idx, 1, 0, max(0, kv_len - 1))
+            k_cache, _ = cache.get_kv_state(m.layer_idx, 1, 0, max(0, layer_kv - 1))
             for idx, (dev, a, b) in enumerate(split):
                 key = (
                     dev, (b - a) * m.num_key_value_groups, b - a,
-                    m.head_dim, m.scaling
+                    m.head_dim, m.scaling, window_left
                 )
-                if ctx.fi_decode_plan(key, kv_len, k_cache[idx]):
+                if ctx.fi_decode_plan(key, layer_kv, k_cache[idx]):
                     planned = True
         if planned:
             ctx.fi_decode_order_before_replay()

@@ -172,15 +172,18 @@ class TPContext:
         as ``S // 128`` pages; the valid prefix length is dynamic via indptr/last_page_len,
         which is exactly what the per-step re-plan refreshes (the graph-safe hd512 pattern).
 
-        :param key: ``(dev, num_qo_heads, num_kv_heads, head_dim, sm_scale)``
-        :param kv_len: valid KV prefix including the token being decoded.
+        :param key: ``(dev, num_qo_heads, num_kv_heads, head_dim, sm_scale, window_left)``
+            ``window_left`` is the sliding window (>=0) for SWA layers, else -1. Including
+            it in the key gives SWA hd256 layers their own wrapper distinct from full hd512.
+        :param kv_len: valid KV prefix including the token being decoded. For SWA layers
+            this is the ring-relative fill (ring_pos + q_len), not the absolute position.
         :param k_cache_dev: this device's KV buffer (for depth/dtype).
         :return: True if the wrapper is ready, False if the shape cannot be served.
         """
         import flashinfer
         from exllamav2 import attn_backend
 
-        dev, nq, nkv, hd, scale = key
+        dev, nq, nkv, hd, scale, window_left = key
         page = self.FI_DECODE_PAGE
         depth = k_cache_dev.shape[1]
         if depth % page != 0 or kv_len < 1 or kv_len > depth:
@@ -236,7 +239,7 @@ class TPContext:
                 head_dim = hd,
                 page_size = page,
                 pos_encoding_mode = "NONE",
-                window_left = -1,
+                window_left = window_left,
                 logits_soft_cap = None,
                 sm_scale = scale,
                 q_data_type = torch.half,

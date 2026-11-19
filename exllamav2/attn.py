@@ -2106,7 +2106,11 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                 # path, and installing flash-attn made has_flash_attn_with_paged True so this
                 # branch raised "FlashAttention forward only supports head dimension at most
                 # 256". Keep the head_dim guard.
-                if has_flash_attn_with_paged and not cfg.no_flash_attn and self.head_dim <= 256:
+                if has_flash_attn_with_paged and not cfg.no_flash_attn and self.head_dim <= 256 \
+                        and not self.model.tp_context.graph_mode:
+                    # FA2 is kept only for the EAGER TP path. Graphed decode (incl. SWA hd256)
+                    # is served by FlashInfer's use_cuda_graph wrapper below, phasing FA2 out
+                    # of the captured path entirely.
                     # CUDA-graph mode: cache_seqlens must come from a tensor whose address is
                     # stable across steps, because the captured graph holds that address. The
                     # per-device tensors on attn_params are rebuilt every forward() call, so the
@@ -2165,11 +2169,11 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                     # layers) on sm86: single_decode eagerly, paged decode wrapper in
                     # graph mode (re-planned per step outside the graph), and prefill
                     # eagerly. The torch path remains the fallback for everything else.
+                    # FlashInfer serves hd512 full layers AND hd256 SWA layers (window_left
+                    # set in the plan), so the graphed decode no longer needs FA2.
                     _fi_hd = (
-                        self.head_dim > 256
-                        and use_flashinfer(cfg)
+                        use_flashinfer(cfg)
                         and not cfg.attn_logit_softcapping
-                        and not self.sliding_window
                     )
                     if self.model.tp_context.graph_mode:
                         # CUDA-graph mode: the write offset comes from device memory, so the
@@ -2201,7 +2205,8 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                         )
                         _fi_key = (
                             dev, q[idx].shape[2], k_cache[idx].shape[2],
-                            self.head_dim, self.scaling
+                            self.head_dim, self.scaling,
+                            self.sliding_window if self.sliding_window else -1
                         )
                         if (_fi_hd and q_len == 1 and batch_size == 1
                                 and _fi_key in self.model.tp_context.fi_decode):

@@ -310,6 +310,146 @@ std::vector<float> sample_basic
     return mirostat_mu;
 }
 
+// BUG 105: return the full processed probability distribution (dense, by token id) using
+// the SAME pipeline as sample_basic (softmax + top_k/top_p/top_a/min_p/tfs/typical +
+// post-temperature), but WITHOUT sampling or top-token extraction. sample_basic with
+// num_probs == vocab_size runs an O(V^2) fake-index loop that made speculative acceptance
+// ~0.5 tok/s; this scatter path is O(V) and gives the exact target distribution needed for
+// probabilistic acceptance / residual resampling.
+void sample_probs
+(
+    torch::Tensor logits,           // shape [bsz, 1, vocab_size]
+    float temperature,
+    int top_k,
+    float top_p,
+    float top_a,
+    float min_p,
+    float tfs,
+    float typical,
+    torch::Tensor output_probs,     // shape [bsz, vocab_size] dense processed probs
+    torch::Tensor logit_filter,     // shape [bsz, vocab_size] bool or meta
+    float post_temperature,
+    float min_temp,
+    float max_temp,
+    float temp_exponent,
+    float smoothing_factor
+)
+{
+    TORCH_CHECK_DTYPE(logits, kFloat);
+    TORCH_CHECK_DTYPE(output_probs, kFloat);
+    TORCH_CHECK_DTYPE_OPT(logit_filter, kBool);
+
+    int vocab_size = logits.size(-1);
+    int bsz = logits.size(0);
+
+    float* temp_probs = (float*) _mm_malloc(vocab_size * sizeof(float), 32);
+    int* temp_indices = (int*) _mm_malloc(vocab_size * sizeof(int), 32);
+    float* logits_ptr = (float*) logits.data_ptr();
+    float* out_ptr = (float*) output_probs.data_ptr();
+    bool* logits_filter_ptr = logit_filter.device().is_meta() ? NULL : (bool*) logit_filter.data_ptr();
+
+    Py_BEGIN_ALLOW_THREADS
+
+    if (temperature < 0.01f)
+    {
+        temperature = 1.0f;
+        top_k = 1;
+    }
+
+    for (int i = 0; i < bsz; i++)
+    {
+        float exponent = 1.0f;
+        float temp_i = temperature;
+        if (smoothing_factor > 0)
+        {
+            exponent = 2.0f;
+            temp_i /= smoothing_factor;
+        }
+
+        int maxlogit = softmax_cpu
+        (
+            vocab_size, temp_i,
+            logits_ptr + i * vocab_size,
+            logits_filter_ptr ? logits_filter_ptr + i * vocab_size : NULL,
+            exponent, temp_probs
+        );
+
+        for (int j = 0; j < vocab_size; j++) temp_indices[j] = j;
+        int num_candidates = vocab_size;
+
+        if (top_k > 0 && top_k < vocab_size)
+        {
+            num_candidates = top_k_cpu(num_candidates, temp_probs, temp_indices, top_k, maxlogit);
+            normalize_cpu(num_candidates, temp_probs);
+        }
+        if (num_candidates > 1 && top_p > 0.0f && top_p < 1.0f)
+        {
+            // BUG 105 perf: with top_k disabled, top_p_cpu's heap runs over the FULL vocab
+            // (O(V log V) per call) which dominated MTP acceptance. Bound the candidate set
+            // with a cheap top-K prefilter first. EXACT whenever the top-K mass covers top_p
+            // (the nucleus is then a subset of the top-K); only falls back to the full vocab
+            // for near-flat distributions where the nucleus extends past K.
+            if (top_k <= 0 && num_candidates > 4096)
+            {
+                int K = 4096;
+                int nc = top_k_cpu(num_candidates, temp_probs, temp_indices, K, maxlogit);
+                float mass = 0.0f;
+                for (int j = 0; j < nc; j++) mass += temp_probs[j];
+                if (mass >= top_p)
+                {
+                    num_candidates = nc;
+                    normalize_cpu(num_candidates, temp_probs);
+                }
+                else
+                {
+                    // top_k_cpu rearranged temp_probs/temp_indices; restore the original
+                    // dense probs by re-running softmax, then top_p over the full vocab.
+                    softmax_cpu(vocab_size, temp_i, logits_ptr + i * vocab_size,
+                                logits_filter_ptr ? logits_filter_ptr + i * vocab_size : NULL,
+                                exponent, temp_probs);
+                    for (int j = 0; j < vocab_size; j++) temp_indices[j] = j;
+                    num_candidates = vocab_size;
+                }
+            }
+            num_candidates = top_p_cpu(num_candidates, temp_probs, temp_indices, top_p);
+            normalize_cpu(num_candidates, temp_probs);
+        }
+        if (num_candidates > 1 && top_a > 0.0f)
+        {
+            num_candidates = top_a_cpu(num_candidates, temp_probs, temp_indices, top_a);
+            normalize_cpu(num_candidates, temp_probs);
+        }
+        if (num_candidates > 1 && min_p > 0.0f && min_p < 1.0f)
+        {
+            num_candidates = min_p_cpu(num_candidates, temp_probs, temp_indices, min_p);
+            normalize_cpu(num_candidates, temp_probs);
+        }
+        if (num_candidates > 1 && tfs > 0.0f && tfs < 1.0f)
+        {
+            num_candidates = tfs_cpu(num_candidates, temp_probs, temp_indices, tfs);
+            normalize_cpu(num_candidates, temp_probs);
+        }
+        if (num_candidates > 1 && typical > 0.0f && typical < 1.0f)
+        {
+            num_candidates = typical_cpu(num_candidates, temp_probs, temp_indices, typical);
+            normalize_cpu(num_candidates, temp_probs);
+        }
+        if (num_candidates > 1 && (post_temperature != 1.0f || max_temp > min_temp))
+        {
+            num_candidates = post_softmax_temperature(num_candidates, temp_probs, temp_indices, post_temperature, min_temp, max_temp, temp_exponent);
+        }
+
+        float* out_i = out_ptr + i * vocab_size;
+        for (int j = 0; j < vocab_size; j++) out_i[j] = 0.0f;
+        for (int j = 0; j < num_candidates; j++) out_i[temp_indices[j]] = temp_probs[j];
+    }
+
+    Py_END_ALLOW_THREADS
+
+    _mm_free(temp_probs);
+    _mm_free(temp_indices);
+}
+
 void logit_filter_exclusive
 (
     torch::Tensor filter,                                       // shape [bsz, vocab_size]

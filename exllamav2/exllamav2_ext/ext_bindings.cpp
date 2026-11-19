@@ -40,6 +40,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
     m.def("apply_rep_penalty", &apply_rep_penalty, "apply_rep_penalty");
     m.def("sample_basic", &sample_basic, "sample_basic");
+    m.def("sample_probs", &sample_probs, "sample_probs");
     m.def("logit_filter_exclusive", &logit_filter_exclusive, "logit_filter_exclusive");
     m.def("fast_fill_cpu_ones_bool", &fast_fill_cpu_ones_bool, "fast_fill_cpu_ones_bool");
     m.def("fast_fadd_cpu", &fast_fadd_cpu, "fast_fadd_cpu");
