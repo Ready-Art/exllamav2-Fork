@@ -142,9 +142,11 @@ class ExLlamaV2BaseGenerator:
 
         if filters is None: filters = []
 
-        # Default stop token
-
-        if stop_token == -1: stop_token = self.tokenizer.eos_token_id
+        # Default stop token(s). -1 means "use every EOS token the model declares", which for
+        # Gemma-4 is [<eos>, <turn|>, <|tool_response>]. Stopping only on <eos> lets generation
+        # run past the end of the turn.
+        if stop_token == -1: stop_token = self.tokenizer.eos_token_ids
+        if isinstance(stop_token, int): stop_token = [stop_token]
 
         # Accept LoRA or list of LoRAs
 
@@ -280,9 +282,9 @@ class ExLlamaV2BaseGenerator:
                 unhealed_token_copy = unhealed_token
                 healed_token = token
 
-            if stop_token is not None:
+            if stop_token:
                 for b in range(batch_size):
-                    if token[b, 0].item() == stop_token:
+                    if token[b, 0].item() in stop_token:
                         batch_eos[b] = True
                         if all(batch_eos): eos = True
                     if batch_eos[b]:

@@ -148,7 +148,8 @@ async def infer(request, ws, server, response):
 
         # Stop conditions
 
-        sc = [server.tokenizer.eos_token_id]
+        # Start from the full multi-token EOS set (Gemma-4: <eos>, <turn|>, <|tool_response>)
+        sc = list(getattr(server.tokenizer, "eos_token_ids", None) or [server.tokenizer.eos_token_id])
         if "stop_conditions" in request:
             ss = request["stop_conditions"]
             if not isinstance(ss, list): ss = [ss]

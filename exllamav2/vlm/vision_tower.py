@@ -44,6 +44,14 @@ class ExLlamaV2VisionTower(ExLlamaV2):
 
         self.tp_context = None
 
+        # Gemma-4 vision is out of scope (PLAN.md §2.9). Fail loudly rather than silently
+        # producing garbage or dropping the image.
+        if getattr(cfg, "vision_disabled", False):
+            raise NotImplementedError(
+                "Gemma-4 vision is not implemented in exllamav2. This build is text-only; "
+                "do not pass images to the model."
+            )
+
         # Preprocessor
 
         if cfg.vision_model_type == "pixtral":

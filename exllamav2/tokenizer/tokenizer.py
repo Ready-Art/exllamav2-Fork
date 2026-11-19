@@ -195,6 +195,11 @@ class ExLlamaV2Tokenizer:
 
         self.unk_token_id = self.tokenizer_model.unk_id()
         self.eos_token_id = config.eos_token_id
+        # Full multi-token EOS set (Gemma-4: <eos>, <turn|>, <|tool_response>). Consumers that
+        # can stop on several tokens should use this rather than the single `eos_token_id`.
+        self.eos_token_ids = list(getattr(config, "eos_token_ids", None) or (
+            [config.eos_token_id] if config.eos_token_id is not None else []
+        ))
         self.bos_token_id = config.bos_token_id
         self.pad_token_id = config.pad_token_id
 

@@ -4,7 +4,7 @@ from exllamav2 import ExLlamaV2, ExLlamaV2Tokenizer, SeqTensor, ExLlamaV2Lora
 from exllamav2.generator import ExLlamaV2Sampler
 from exllamav2.generator.filters import ExLlamaV2Filter
 from exllamav2.generator.dynamic_embeddings import ExLlamaV2MMEmbedding
-from exllamav2.cache import ExLlamaV2CacheBase, ExLlamaV2Cache_8bit
+from exllamav2.cache import ExLlamaV2CacheBase, ExLlamaV2Cache_8bit, ExLlamaV2Cache_SWA
 from exllamav2.attn import ExLlamaV2Attention, assert_paged_attn
 from exllamav2.ext import exllamav2_ext as ext_c, none_tensor
 from exllamav2.util import cuda_sync_active, timed
@@ -30,7 +30,17 @@ from dataclasses import dataclass
 #  - Input embeddings
 #  - Faster hash algorithm (Murmur?)
 
-PAGED_PAGE_SIZE = 256
+# Granularity of the paged KV cache.
+#
+# 128, not 256: FlashInfer's fast-path tuple is (16, 32, 64, 128) and treats 256 as a fallback
+# backend. Since every decode step runs through this, the fast path is worth more than the extra
+# allocation slack a larger page would save. PLAN.md §3.6.
+#
+# Consequence for workstream ③: the SWA ring size becomes
+#   ceil((sliding_window + overp) / PAGE_SIZE) * PAGE_SIZE
+#   = ceil((1024 + 256) / 128) * 128 = 1280 tokens
+# (it was 1536 at PAGE_SIZE 256).
+PAGED_PAGE_SIZE = 128
 
 def _tensor_blake2b_checksum(tensor: torch.Tensor, prev_hash: bytes | None) -> bytes:
     hasher = hashlib.blake2b(digest_size = 16)
@@ -390,6 +400,16 @@ class ExLlamaV2DynamicGenerator:
             f"cache.max_seq_len must be multiple of {PAGED_PAGE_SIZE}, received {cache.max_seq_len}"
         self.max_pages = max(cache.max_seq_len // self.page_size, 1)
         self.max_total_tokens = cache.max_seq_len
+
+        # SWA ring buffers (workstream ③). The ring is a separate per-layer allocation, not part
+        # of the page table: `reset_page_table` and the page allocator assume one table covering
+        # all layers, whereas the ring is per-layer and fixed-size. PLAN.md §8 trap 16.
+        if isinstance(cache, ExLlamaV2Cache_SWA):
+            assert cache.page_size == self.page_size, \
+                f"SWA cache page_size {cache.page_size} != generator page_size {self.page_size}"
+            # The ring must be able to hold the whole window plus the overp slack.
+            assert cache.kv_state_size >= cache.sliding_window, \
+                f"SWA ring {cache.kv_state_size} smaller than sliding_window {cache.sliding_window}"
 
         self.reset_page_table()
 
@@ -879,7 +899,9 @@ class ExLlamaV2DynamicGenerator:
         cache_seqlens: torch.Tensor,
         q_len: int,
         alt_rope_embed: dict | None = None,
-        rope_offsets: torch.Tensor | None = None
+        rope_offsets: torch.Tensor | None = None,
+        window_beg: torch.Tensor | None = None,
+        sliding_window: int = 0
     ):
 
         assert batch_size == 1 or not alt_rope_embed, \
@@ -900,6 +922,8 @@ class ExLlamaV2DynamicGenerator:
                 q_len = q_len,
                 alt_rope_embed = alt_rope_embed,
                 rope_offsets = rope_offsets,
+                window_beg = window_beg,
+                sliding_window = sliding_window,
             )
         else:
             assert cache_seqlens.shape[0] == 1
@@ -1153,6 +1177,12 @@ class ExLlamaV2DynamicGenerator:
         block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
         cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
 
+        # Per-sequence ring position for SWA layers (workstream ③). PLAN.md §4.3 Phase 3E.
+        # `window_beg` is per row, not global: batch > 1 with different cache_seqlens needs
+        # a per-row value or the rings desynchronise silently (§8 trap 14).
+        window_beg = torch.zeros((batch_size,), dtype = torch.int32)
+        swa_active = isinstance(self.cache, ExLlamaV2Cache_SWA)
+
         batch = 0
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
@@ -1163,7 +1193,38 @@ class ExLlamaV2DynamicGenerator:
                 seq_block_index = job.get_block_index(seq, t_len)
                 block_index[batch, :seq_block_index.shape[-1]].copy_(seq_block_index)
                 cache_seqlens[batch] = seq.kv_position
+                if swa_active:
+                    window_beg[batch] = seq.window_beg
                 batch += 1
+
+        # SWA ring shift, done once per forward pass so every sliding layer shifts by the same
+        # amount. Shifting per layer would desynchronise the rings.
+        #
+        # The shift must be a whole number of pages: a non-page-aligned shift makes the block table
+        # point at the wrong slots and degrades output gradually rather than failing loudly.
+        # PLAN.md §4.3 Phase 3C / §8 trap 13.
+        if swa_active:
+            ring_size = self.cache.kv_state_size
+            page_size = self.page_size
+            batch = 0
+            for job in self.active_jobs:
+                if not job.is_prefill_done():
+                    continue
+                for seq in job.sequences:
+                    # Position within the ring at which this chunk starts.
+                    cache_pos = seq.kv_position - seq.window_beg
+                    overflow = cache_pos + q_len - ring_size
+                    if overflow > 0:
+                        shift_tokens = ((overflow + page_size - 1) // page_size) * page_size
+                        assert shift_tokens % page_size == 0
+                        assert shift_tokens < ring_size, \
+                            f"Ring shift {shift_tokens} >= ring_size {ring_size}"
+                        for li in range(self.cache.num_hidden_layers):
+                            if self.cache.is_swa_layer[li]:
+                                self.cache.shift_ring(li, shift_tokens)
+                        seq.window_beg += shift_tokens
+                        window_beg[batch] = seq.window_beg
+                    batch += 1
 
         # Collect input IDs and indexed embeddings
 
@@ -1197,7 +1258,9 @@ class ExLlamaV2DynamicGenerator:
             block_index,
             cache_seqlens,
             batch_ids.shape[-1],
-            rope_offsets = torch.tensor(rope_offsets_list, dtype = torch.int) if rope_offsets_list is not None else None
+            rope_offsets = torch.tensor(rope_offsets_list, dtype = torch.int) if rope_offsets_list is not None else None,
+            window_beg = window_beg if swa_active else None,
+            sliding_window = self.cache.sliding_window if swa_active else 0,
         )
 
         device_logits = self.model.forward_chunk(
@@ -1524,6 +1587,10 @@ class ExLlamaV2DynamicJob:
         block_index_tensor: torch.Tensor | None
         prefill_complete: bool
         live: bool
+        # SWA ring position: absolute position of the ring's first slot for this sequence.
+        # Kept per sequence, not per batch, because batch > 1 with different cache_seqlens
+        # needs a per-row value or the rings desynchronise silently. PLAN.md §8 trap 14.
+        window_beg: int
 
     sequences: list[Sequence]
     all_unique_hashes: list[bytes]
@@ -1727,6 +1794,9 @@ class ExLlamaV2DynamicJob:
             seq.new_unique_pages = 0
             seq.allocated_pages = None
             seq.block_index_tensor = None
+            # Ring position for SWA layers. Reset alongside kv_position so a reused
+            # sequence does not inherit a stale ring offset. PLAN.md §4.3 Phase 3E item 3.
+            seq.window_beg = 0
             seq.live = True
             seq.prefill_complete = False
             self.sequences.append(seq)

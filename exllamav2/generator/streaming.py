@@ -121,7 +121,7 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
     filter_prefer_eos: bool
 
 
-    def __init__(self, model, cache, tokenizer, draft_model = None, draft_cache = None, num_speculative_tokens = 5):
+    def __init__(self, model, cache, tokenizer, draft_model = None, draft_cache = None, num_speculative_tokens = 5, mtp_drafter = None):
         super().__init__(model, cache, tokenizer)
 
         # Stop conditions
@@ -129,7 +129,9 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
         self.stop_strings = set()
         self.stop_strings_utf32_buffer = None
         self.stop_strings_utf32_offsets = None
-        self.stop_tokens = {tokenizer.eos_token_id,}
+        # Default to the full multi-token EOS set. Gemma-4 ends a turn with <turn|> (106), not
+        # <eos> (1), so stopping only on eos_token_id lets generation run past the answer.
+        self.stop_tokens = set(tokenizer.eos_token_ids) or {tokenizer.eos_token_id,}
         self.remaining_tokens = 0
 
         # Generation settings
@@ -162,6 +164,19 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
         else:
             self.draft_model = None
             self.draft_cache = None
+
+        # MTP drafter (Gemma-4 assistant). Unlike a standalone draft model it cross-attends
+        # to the TARGET's KV cache: it has no cache of its own, needs no prefill, and is a
+        # single-device model even when the target runs TP/MP. See exllamav2/mtp_drafter.py.
+        self.mtp_drafter = mtp_drafter
+        self.mtp_state = None            # (base_tok, base_state, base_pos) | None
+        self.mtp_pending_logits = None   # (1, R, vocab) verified logits not yet consumed
+        self.mtp_base_logits = None      # (1, 1, vocab) base-token logits predicting pos+1
+        if mtp_drafter is not None:
+            assert draft_model is None, "specify either draft_model or mtp_drafter, not both"
+            if not num_speculative_tokens:
+                num_speculative_tokens = getattr(mtp_drafter, "num_draft_tokens", 6)
+            self.num_speculative_tokens = num_speculative_tokens
 
         self.speculative_prob_threshold = 0.25
 
@@ -355,10 +370,16 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
         self.held_logits = self.no_logits
         self.settings = gen_settings
 
+        # MTP drafter state (reset per stream)
+
+        self.mtp_state = None
+        self.mtp_pending_logits = None
+        self.mtp_base_logits = None
+
         # Ingest prompt
 
-        assert input_embeddings is None or self.draft_model is None, \
-            "Can not use input embeddings with draft model"
+        assert input_embeddings is None or (self.draft_model is None and self.mtp_drafter is None), \
+            "Can not use input embeddings with a draft model or MTP drafter"
 
         self._gen_begin_reuse(input_ids, gen_settings)
         self.heal_next_token = (token_healing and self.sequence_ids.shape[-1] >= 2)
@@ -623,6 +644,12 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
             self.future_tokens = None
             self.ban_checkpoint = None
             self.reuse_logits = cp["next_logits"]
+            # The MTP round window (if any) was verified against the pre-rewind
+            # trajectory; its un-consumed rows are now stale. Drop it -- the next
+            # round re-establishes a consistent base via _mtp_commit_base.
+            self.mtp_state = None
+            self.mtp_pending_logits = None
+            self.mtp_base_logits = None
             return cp["offending_token"], off_text
 
         if self.banned_strings_utf32_offsets is not None:
@@ -799,6 +826,12 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
             token, ptokens, pprobs, prob, eos, logits = self._gen_single_token_ngram(gen_settings, prefix_token)
             dev_logits = None
 
+        elif self.mtp_drafter is not None:
+
+            token, ptokens, pprobs, prob, eos, logits = \
+                self._gen_single_token_mtp(gen_settings, prefix_token)
+            dev_logits = None
+
         elif self.draft_model is None:
 
             if self.reuse_logits is not None:
@@ -938,6 +971,190 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
             self.future_logits = None
         else:
             self.accepted_draft_tokens += 1
+        self.total_tokens += 1
+
+        return token, ptokens, pprobs, prob, eos, logits
+
+
+    # Speculative decoding with an MTP drafter (Gemma-4 assistant)
+
+    def _mtp_commit_base(self):
+        """
+        (Re)commit the base token so the drafter has a fresh base.
+
+        Entry situations:
+          * fresh: the cache holds everything but the LAST token of ``sequence_ids``
+            (right after prefill / ``_gen_begin_reuse``, or after a token-healing /
+            banned-string rewind, which truncate both consistently). The last token is
+            forwarded once so its KV lands in the cache at its own position.
+          * desync: the cache is already at or past the last sequence token (a normal
+            round boundary). Re-commit the token at ``base_pos = current_seq_len - 1``:
+            an idempotent KV rewrite (healing/rewinds may have left a stale one) that
+            also refreshes the pre-final-norm state and the next-position logits.
+
+        Leaves ``cache.current_seq_len == base_pos + 1`` and sets ``mtp_state`` /
+        ``mtp_base_logits``.
+        """
+        # Fast path: base already committed and everything in sync.
+        if (self.mtp_state is not None
+                and self.cache.current_seq_len == self.mtp_state[2] + 1
+                and self.sequence_ids.shape[-1] >= self.cache.current_seq_len
+                and int(self.sequence_ids[0, self.mtp_state[2]]) == int(self.mtp_state[0][0, 0])):
+            return
+
+        if self.cache.current_seq_len == self.sequence_ids.shape[-1] - 1:
+            # Fresh: the last sequence token is NOT in the cache yet (prefill only wrote
+            # ``sequence_ids[:, :-1]``). Forward it so its KV lands at its own position.
+            base_tok = self.sequence_ids[:, -1:].clone()
+            dev_logits, base_state = self.model.forward(
+                base_tok, self.cache,
+                loras = self.active_loras,
+                input_mask = self.input_mask,
+                position_offsets = self.position_offsets,
+                return_last_state = True)           # advances current_seq_len by 1
+        else:
+            # Desync / round boundary: re-commit the token that belongs at base_pos.
+            # (Defensive: in steady state the fast path above handles every entry; the
+            # only way to reach here is a moved-out-from-under-us bookkeeping state.)
+            seq_len = self.sequence_ids.shape[-1]
+            base_pos = self.cache.current_seq_len - 1
+            if base_pos >= seq_len:
+                # The cache is one ahead of sequence_ids (the bonus token was committed
+                # but not yet appended by _gen_single_token). Rewind past it and commit
+                # the last sequence token fresh at its own position.
+                self.cache.current_seq_len = seq_len - 1
+                base_tok = self.sequence_ids[:, -1:].clone()
+                dev_logits, base_state = self.model.forward(
+                    base_tok, self.cache,
+                    loras = self.active_loras,
+                    input_mask = self.input_mask,
+                    position_offsets = self.position_offsets,
+                    return_last_state = True)
+            else:
+                base_tok = self.sequence_ids[:, base_pos:base_pos + 1].clone()
+                self.cache.current_seq_len = base_pos
+                dev_logits, base_state = self.model.forward(
+                    base_tok, self.cache,
+                    loras = self.active_loras,
+                    input_mask = self.input_mask,
+                    position_offsets = self.position_offsets,
+                    return_last_state = True)       # advances back to base_pos + 1
+        # base_state is (1, 1, backbone); keep it 3-D -- draft_window/_step expect (1,1,H).
+        self.mtp_state = (base_tok, base_state[:, -1:, :].clone(), self.cache.current_seq_len - 1)
+        self.mtp_base_logits = dev_logits.float().cpu()
+
+    def _gen_single_token_mtp(self, gen_settings, prefix_token = None):
+        """
+        One streamed token via the MTP drafter.
+
+        Protocol (mirrors the standalone draft-verify loop; the drafter reads the target's
+        KV, so there is no draft cache to advance):
+
+          round start: the base token is committed at ``base_pos``
+            (``cache.current_seq_len == base_pos + 1``); ``mtp_base_logits`` predicts
+            position ``base_pos + 1``.
+          1. gather the target's last full/sliding K/V onto the drafter device;
+          2. draft a greedy window from (base_tok, base_state) at frontier position
+             ``pos = base_pos + 1``;
+          3. verify: one target forward over the draft tokens, writing their KV;
+          4. accept the longest matching prefix ``m_acc``; the verified logits for the
+             emitted tokens (m_acc accepted drafts + 1 bonus) become
+             ``mtp_pending_logits`` (consumed one per call, exactly like the draft-model
+             path);
+          5. rewind the cache past the unaccepted tail and commit the bonus token (a
+             single-token forward) to obtain the next round's base state.
+
+        Every emitted token is sampled from the TARGET's verified logits, so output is
+        identical to plain autoregressive generation (modulo the sampler's own randomness),
+        while each round emits ``m_acc + 1`` tokens per verification forward.
+        """
+
+        if self.mtp_pending_logits is None:
+
+            # ---- begin a round ----
+            base_tok, base_state, base_pos = self.mtp_state if self.mtp_state else (None, None, -1)
+            if self.mtp_state is None or self.cache.current_seq_len != base_pos + 1:
+                # First round, or the cache/sequence was moved out from under us (token
+                # healing, banned-string rewind): re-establish a consistent base.
+                self._mtp_commit_base()
+                base_tok, base_state, base_pos = self.mtp_state
+
+            pos = self.cache.current_seq_len              # == base_pos + 1
+
+            # 1. gather target K/V for the drafter (once per round)
+            self.mtp_drafter.gather_target(self.cache)
+
+            # 2. draft a greedy window (CPU ids; the target's embedding is CPU-resident in TP)
+            draft = self.mtp_drafter.draft_window(
+                base_tok.cpu(), base_state, pos, self.num_speculative_tokens)   # (1, W)
+            self.total_draft_tokens += draft.shape[-1]
+
+            # 3. verify: target forward over the draft tokens, writing their KV.
+            #    vlogits[i] (processing draft[i] at position pos+i) predicts pos+i+1.
+            # NOTE (Change98): graph_verify was tried here but reverted — it broke exact
+            # base==mtp parity on long prose (fp16 SDPA-vs-decode near-tie divergence) and
+            # the streaming generator's host overhead dominates anyway. The fast SP path is
+            # a DIRECT forward loop, not the streaming generator (see MP_DECODE_ANALYSIS.md).
+            vlogits = self.model.forward(
+                draft.cpu(), self.cache,
+                loras = self.active_loras,
+                input_mask = self.input_mask,
+                position_offsets = self.position_offsets)                        # (1, W, vocab)
+            vlogits = vlogits.float().cpu()
+
+            # 4. accept the longest draft prefix the target agrees with.
+            #    The target's prediction for position pos+k is mtp_base_logits (k==0) or
+            #    argmax(vlogits[k-1]) (k>=1).
+            m_acc = 0
+            draft_flat = draft[0].tolist()
+            v_argmax = vlogits[0].argmax(dim = -1).tolist()
+            bonus_pred = int(self.mtp_base_logits[0, 0].argmax())
+            for k in range(draft.shape[-1]):
+                pred = bonus_pred if k == 0 else v_argmax[k - 1]
+                if pred == draft_flat[k]:
+                    m_acc = k + 1
+                else:
+                    break
+            self.accepted_draft_tokens += m_acc
+
+            # Verified logits for the emitted tokens: base logits (position pos) + the
+            # accepted drafts' rows -> m_acc + 1 rows.
+            self.mtp_pending_logits = torch.cat(
+                [self.mtp_base_logits, vlogits[:, :m_acc, :]], dim = 1)
+
+            # 5. rewind past the unaccepted tail; the new base is the bonus token
+            #    (target's own pick at position pos+m_acc, i.e. the last pending row).
+            self.cache.current_seq_len = pos + m_acc
+            bonus_id = int(self.mtp_pending_logits[0, m_acc].argmax())
+            base_tok = torch.tensor([[bonus_id]], dtype = torch.long)
+            dev_logits, base_state = self.model.forward(
+                base_tok, self.cache,
+                loras = self.active_loras,
+                input_mask = self.input_mask,
+                position_offsets = self.position_offsets,
+                return_last_state = True)           # writes slot pos+m_acc; NOTE: model.forward
+                                                    # already advanced current_seq_len to pos+m_acc+1 --
+                                                    # do NOT add 1 again (that desyncs the cache
+                                                    # bookkeeping by one slot per round).
+            self.mtp_state = (base_tok, base_state[:, -1:, :].clone(), self.cache.current_seq_len - 1)
+            self.mtp_base_logits = dev_logits.float().cpu()
+
+        # ---- consume one verified token ----
+        logits = self.mtp_pending_logits[:, :1, :]
+        token, ptokens, pprobs, prob, eos = ExLlamaV2Sampler.sample(
+            logits,
+            gen_settings,
+            self.sequence_ids[:1, :], random.random(),
+            self.tokenizer,
+            prefix_token,
+            self.return_top_tokens,
+            blocked_tokens = self.current_blocked_tokens,
+            filters = self.filters,
+            filter_prefer_eos = self.filter_prefer_eos
+        )
+        self.mtp_pending_logits = self.mtp_pending_logits[:, 1:, :]
+        if self.mtp_pending_logits.shape[1] == 0:
+            self.mtp_pending_logits = None
         self.total_tokens += 1
 
         return token, ptokens, pprobs, prob, eos, logits
