@@ -144,6 +144,8 @@ void tp_graph_launch(uintptr_t tp_context);
 bool tp_graph_ready(uintptr_t tp_context);
 int tp_graph_capture_status(uintptr_t tp_context);
 void tp_set_capture_stream(uintptr_t tp_context, uintptr_t stream);
+void tp_force_end_capture(uintptr_t stream);
+void tp_reset_counters(uintptr_t tp_context);
 
 // BUG 87: raise if any spin kernel timed out (collective-ordering deadlock).
 void tp_raise_on_timeout(uintptr_t tp_context);

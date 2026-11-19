@@ -57,7 +57,7 @@ architectures are untested here — treat them as experimental and verify correc
   `PATH` (built with nvcc 13.5 against cu132 torch — a minor-version mismatch is only a warning).
 - **FlashInfer ≥ 0.7.4** (hard requirement — importing the library raises if it is missing or older):
   ```sh
-  pip install "flashinfer-python>=0.7.4"
+  uv pip install "flashinfer-python>=0.7.4"
   flashinfer download-kernels      # kernel wheels are CUDA/torch-version specific
   ```
   Re-run `flashinfer download-kernels` after every FlashInfer upgrade.
@@ -65,7 +65,7 @@ architectures are untested here — treat them as experimental and verify correc
   dynamic-generator paths still call flash-attn kernels directly, so `flash_attn` must be installed
   alongside FlashInfer. Prebuilt wheel for the tested stack (Python 3.12 / torch 2.15 / CUDA 13.2):
   ```sh
-  pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v1.5.0/flash_attn-2.8.3+cu132torch2.15-cp312-cp312-linux_x86_64.whl"
+  uv pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v1.5.0/flash_attn-2.8.3+cu132torch2.15-cp312-cp312-linux_x86_64.whl"
   ```
   The wheel must match your Python/torch/CUDA combination — for other builds pick a wheel from the
   [mjun0812 prebuilt-wheels releases](https://github.com/mjun0812/flash-attention-prebuild-wheels/releases).
@@ -76,22 +76,30 @@ Verified on Ubuntu 26.10, 4× RTX 3090 (sm86), Python 3.12.15, torch 2.15.0+cu13
 FlashInfer 0.7.4, flash-attn 2.8.3. Install torch **before** building the fork: `setup.py` precompiles
 the CUDA extension against the installed torch, and `--no-build-isolation` makes the build use it.
 
+Use [uv](https://docs.astral.sh/uv/getting-started/installation/) to manage Python — it installs
+Python 3.12 itself, so no system Python 3.12 package is needed:
+
 ```sh
-# Python 3.12 environment + CUDA 13.2 torch (tested combination)
-python3.12 -m venv venv && source venv/bin/activate
-pip install torch==2.15.0+cu132 --index-url https://download.pytorch.org/whl/cu132
+# uv + Python 3.12 environment (tested combination)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv python install 3.12
+uv venv venv --python 3.12
+source venv/bin/activate
+
+# CUDA 13.2 torch — install BEFORE building the fork
+uv pip install torch==2.15.0+cu132 --index-url https://download.pytorch.org/whl/cu132
 
 # Fork + CUDA extension (nvcc must be on PATH; "8.6" = RTX 3090)
 git clone https://github.com/Ready-Art/exllamav2-Fork
 cd exllamav2-Fork
-pip install -r requirements.txt
-TORCH_CUDA_ARCH_LIST="8.6" pip install . --no-build-isolation
+uv pip install -r requirements.txt
+TORCH_CUDA_ARCH_LIST="8.6" uv pip install . --no-build-isolation
 
 # FlashInfer kernels (hard requirement; re-run after every FlashInfer upgrade)
 flashinfer download-kernels
 
 # Flash-Attention 2 — required for now even with FlashInfer (see Requirements)
-pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v1.5.0/flash_attn-2.8.3+cu132torch2.15-cp312-cp312-linux_x86_64.whl"
+uv pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v1.5.0/flash_attn-2.8.3+cu132torch2.15-cp312-cp312-linux_x86_64.whl"
 
 # single-GPU sanity check
 python test_inference.py -m <path_to_model> -p "Once upon a time,"

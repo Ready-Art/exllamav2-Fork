@@ -1352,30 +1352,40 @@ class ExLlamaV2:
                 attn_params.prep_tp(self)
             ctx.set_geometry(0)
 
-            runner = TPGraphRunner(step_fn, ctx.device,
-                                   (batch_size, seq_len, return_last_state, last_id_only),
-                                   tp_context = ctx)
-            # Let capture() restore the KV cache position after its warmup iterations. The
-            # warmup runs the real step, which advances current_seq_len and writes KV rows.
-            runner.cache = cache
-            runner.input_buf = input_buf
-            runner.state_buf = state_buf
-            # Stage the real inputs so warmup and capture run at the caller's position with the
-            # caller's tokens (the warmup KV writes are idempotent: same rows, same values).
-            stage_inputs(input_buf)
-            # hd>256 FlashInfer decode plans must exist before warmup/capture: run() is
-            # captured, plan() is host work and cannot run inside the capture region.
-            self._fi_tp_graph_plan(cache, past_len + seq_len)
-            ctx.graph_mode = True
-            try:
-                runner.capture()
-            except Exception as e:
-                ctx.graph_mode = False
-                self.tp_graph.disable(f"capture failed: {type(e).__name__}: {e}")
+            # BUG 100: capture invalidation is often a transient allocator/GC race, so
+            # retry once with a fresh runner before giving up. capture() force-ends the
+            # capture and resets the TP counter protocol on failure, so the retry (and
+            # the eager fallback if it also fails) starts from a clean protocol state.
+            runner = None
+            _capture_err = None
+            for _attempt in range(2):
+                runner = TPGraphRunner(step_fn, ctx.device,
+                                       (batch_size, seq_len, return_last_state, last_id_only),
+                                       tp_context = ctx)
+                # Let capture() restore the KV cache position after its warmup iterations. The
+                # warmup runs the real step, which advances current_seq_len and writes KV rows.
+                runner.cache = cache
+                runner.input_buf = input_buf
+                runner.state_buf = state_buf
+                # Stage the real inputs so warmup and capture run at the caller's position with the
+                # caller's tokens (the warmup KV writes are idempotent: same rows, same values).
+                stage_inputs(input_buf)
+                # hd>256 FlashInfer decode plans must exist before warmup/capture: run() is
+                # captured, plan() is host work and cannot run inside the capture region.
+                self._fi_tp_graph_plan(cache, past_len + seq_len)
+                ctx.graph_mode = True
+                try:
+                    runner.capture()
+                    break
+                except Exception as e:
+                    _capture_err = e
+                    ctx.graph_mode = False
+                    runner = None
+            if runner is None:
+                self.tp_graph.disable(f"capture failed: {type(_capture_err).__name__}: {_capture_err}")
                 print(f"[TP graphs] disabled: {self.tp_graph.disabled_reason}", flush=True)
                 return None
-            finally:
-                ctx.graph_mode = False
+            ctx.graph_mode = False
             runner.logits = out["logits"]
             self.tp_graph.add(batch_size, seq_len, runner,
                               state = return_last_state, last_id_only = last_id_only)

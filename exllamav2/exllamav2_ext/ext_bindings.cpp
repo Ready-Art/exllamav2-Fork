@@ -141,6 +141,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("tp_graph_ready", &tp_graph_ready, "tp_graph_ready");
     m.def("tp_graph_capture_status", &tp_graph_capture_status, "tp_graph_capture_status");
     m.def("tp_set_capture_stream", &tp_set_capture_stream, "tp_set_capture_stream");
+    m.def("tp_force_end_capture", &tp_force_end_capture, "tp_force_end_capture");
+    m.def("tp_reset_counters", &tp_reset_counters, "tp_reset_counters");
     m.def("tp_raise_on_timeout", &tp_raise_on_timeout, "tp_raise_on_timeout");
 
     // cuda-graph-safe kv write (position from device memory)

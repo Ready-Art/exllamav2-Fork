@@ -1023,6 +1023,42 @@ void tp_set_capture_stream(uintptr_t tp_context, uintptr_t stream)
     ctx->graph_capture = true;
 }
 
+// BUG 100: recovery from a failed graph capture. An invalidated capture can leave the
+// stream in capture mode (capture_end throws before cudaStreamEndCapture runs), so every
+// later eager kernel is recorded instead of executed and the host blocks forever on a
+// spin/sync that can never complete. Force the stream out of capture mode and discard
+// the partial graph; errors are expected here and cleared.
+void tp_force_end_capture(uintptr_t stream)
+{
+    cudaGraph_t graph = nullptr;
+    cudaError_t e = cudaStreamEndCapture(reinterpret_cast<cudaStream_t> (stream), &graph);
+    if (e != cudaSuccess) cudaGetLastError();
+    if (graph) cudaGraphDestroy(graph);
+}
+
+// BUG 100: reset the cross-device counter protocol after a failed capture. The counters
+// live in mapped host memory; rewriting them is only safe with no TP work in flight, so
+// drain every device first. Without this, a capture abandoned mid-protocol can leave
+// bc_seq/rd_seq out of lockstep and the eager fallback's spin kernels wait forever.
+void tp_reset_counters(uintptr_t tp_context)
+{
+    ExtTPContext* ctx = reinterpret_cast<ExtTPContext*> (tp_context);
+    for (int dev : ctx->all_devices)
+    {
+        cudaSetDevice(dev);
+        cudaDeviceSynchronize();
+        cudaGetLastError();
+    }
+    init_tp_data(ctx->tp_data);
+    for (int dev : ctx->all_devices)
+    {
+        cudaSetDevice(dev);
+        cudaDeviceSynchronize();
+        cudaGetLastError();
+    }
+    if (!ctx->all_devices.empty()) cudaSetDevice(ctx->all_devices.front());
+}
+
 // Diagnostic: 0 = not capturing, 1 = capture active, 2 = capture invalidated.
 // Used to locate the first operation that invalidates a capture.
 int tp_graph_capture_status(uintptr_t tp_context)

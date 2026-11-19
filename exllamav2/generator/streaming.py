@@ -171,6 +171,9 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
         self.mtp_drafter = mtp_drafter
         self.mtp_state = None            # (base_tok, base_state, base_pos) | None
         self.mtp_pending_logits = None   # (1, R, vocab) verified logits not yet consumed
+        self.mtp_pending_tokens = []     # cache token id expected for each pending row
+        self.mtp_pending_pos = 0         # sequence position of the first pending row
+        self.mtp_resync_count = 0        # sampling deviations that forced a rewind+recommit
         self.mtp_base_logits = None      # (1, 1, vocab) base-token logits predicting pos+1
         if mtp_drafter is not None:
             assert draft_model is None, "specify either draft_model or mtp_drafter, not both"
@@ -374,6 +377,8 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
 
         self.mtp_state = None
         self.mtp_pending_logits = None
+        self.mtp_pending_tokens = []
+        self.mtp_pending_pos = 0
         self.mtp_base_logits = None
 
         # Ingest prompt
@@ -649,6 +654,8 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
             # round re-establishes a consistent base via _mtp_commit_base.
             self.mtp_state = None
             self.mtp_pending_logits = None
+            self.mtp_pending_tokens = []
+            self.mtp_pending_pos = 0
             self.mtp_base_logits = None
             return cp["offending_token"], off_text
 
@@ -1069,6 +1076,14 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
         while each round emits ``m_acc + 1`` tokens per verification forward.
         """
 
+        # An external rewind (token healing, banned strings) may have truncated the
+        # cache mid-window; the pending rows' positions would then be stale.
+        if self.mtp_pending_logits is not None:
+            if self.cache.current_seq_len != self.mtp_pending_pos + self.mtp_pending_logits.shape[1]:
+                self.mtp_pending_logits = None
+                self.mtp_pending_tokens = []
+                self.mtp_state = None
+
         if self.mtp_pending_logits is None:
 
             # ---- begin a round ----
@@ -1121,11 +1136,17 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
             # accepted drafts' rows -> m_acc + 1 rows.
             self.mtp_pending_logits = torch.cat(
                 [self.mtp_base_logits, vlogits[:, :m_acc, :]], dim = 1)
+            # The KV cache now holds these tokens at pos..pos+m_acc. With sampling,
+            # the token actually emitted from a pending row can differ from the cached
+            # one; the consumption step below checks this and resyncs on deviation.
+            self.mtp_pending_tokens = draft_flat[:m_acc]
+            self.mtp_pending_pos = pos
 
             # 5. rewind past the unaccepted tail; the new base is the bonus token
             #    (target's own pick at position pos+m_acc, i.e. the last pending row).
             self.cache.current_seq_len = pos + m_acc
             bonus_id = int(self.mtp_pending_logits[0, m_acc].argmax())
+            self.mtp_pending_tokens.append(bonus_id)
             base_tok = torch.tensor([[bonus_id]], dtype = torch.long)
             dev_logits, base_state = self.model.forward(
                 base_tok, self.cache,
@@ -1152,8 +1173,30 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
             filters = self.filters,
             filter_prefer_eos = self.filter_prefer_eos
         )
+        expected = self.mtp_pending_tokens[0]
         self.mtp_pending_logits = self.mtp_pending_logits[:, 1:, :]
-        if self.mtp_pending_logits.shape[1] == 0:
+        self.mtp_pending_tokens = self.mtp_pending_tokens[1:]
+        self.mtp_pending_pos += 1
+        if int(token[0, 0]) != expected:
+            # Sampling deviated from the cached draft/bonus token (greedy never does:
+            # acceptance is argmax-based). The cache holds `expected` at this position
+            # but the emitted token is different, so every later pending row was
+            # conditioned on the wrong prefix. Rewind to this position, commit the
+            # sampled token, and start a fresh round next call. This keeps the output
+            # distribution exactly target-autoregressive under any sampler settings.
+            self.mtp_resync_count += 1
+            self.cache.current_seq_len = self.mtp_pending_pos - 1
+            self.mtp_pending_logits = None
+            self.mtp_pending_tokens = []
+            dev_logits, base_state = self.model.forward(
+                token, self.cache,
+                loras = self.active_loras,
+                input_mask = self.input_mask,
+                position_offsets = self.position_offsets,
+                return_last_state = True)
+            self.mtp_state = (token.clone(), base_state[:, -1:, :].clone(), self.cache.current_seq_len - 1)
+            self.mtp_base_logits = dev_logits.float().cpu()
+        elif self.mtp_pending_logits.shape[1] == 0:
             self.mtp_pending_logits = None
         self.total_tokens += 1
 

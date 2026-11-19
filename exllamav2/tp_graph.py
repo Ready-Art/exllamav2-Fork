@@ -47,6 +47,7 @@ Design
 
 from __future__ import annotations
 
+import gc
 import os
 import torch
 
@@ -141,6 +142,12 @@ class TPGraphRunner:
         # work into the graph.
         self.graph = torch.cuda.CUDAGraph()
         torch.cuda.synchronize(dev0)
+        # BUG 100: drop stale Python temporaries BEFORE capture. With the cudaMallocAsync
+        # backend, a pre-capture tensor freed inside the capture region triggers
+        # "freeAsync() was called on an uncaptured allocation" and can invalidate the
+        # capture or corrupt replay; GC timing made this fire non-deterministically.
+        gc.collect()
+        torch.cuda.synchronize(dev0)
         torch.cuda.set_stream(self.capture_stream)
         try:
             self.graph.capture_begin(pool = torch.cuda.graph_pool_handle())
@@ -178,6 +185,23 @@ class TPGraphRunner:
             # stream current again before ending it.
             torch.cuda.set_stream(self.capture_stream)
             self.graph.capture_end()
+        except Exception:
+            # BUG 100: an invalidated capture can leave the stream in capture mode
+            # (capture_end throws before cudaStreamEndCapture runs), so every later
+            # eager kernel would be recorded instead of executed and the host would
+            # hang. Force the stream out of capture mode and reset the cross-device
+            # counter protocol so the eager fallback is always usable.
+            try:
+                self.graph.capture_end()
+            except Exception:
+                pass
+            ext_c.tp_force_end_capture(self.capture_stream.cuda_stream)
+            for _c in (ctx.ext_tp_contexts.values() if ctx.ext_tp_contexts
+                       else [ctx.ext_tp_context]):
+                if _c:
+                    ext_c.tp_reset_counters(_c)
+            self.graph = None
+            raise
         finally:
             for _c in (ctx.ext_tp_contexts.values() if ctx.ext_tp_contexts
                        else [ctx.ext_tp_context]):
