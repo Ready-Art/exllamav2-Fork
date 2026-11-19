@@ -939,6 +939,8 @@ class TPContext:
         # -> mlp[allgather ID] -> mlp[gather RS]; a buffer written by one of those is read
         # only before the next write of the SAME key, two steps later).
         dev = local.device
+        if not local.is_contiguous():
+            local = local.contiguous()
         if len(set(widths)) == 1 and widths[0] == local.shape[1]:
             w = widths[0]
             key = (tag, broadcast_type, rows, w, dtype, dev)
@@ -946,7 +948,13 @@ class TPContext:
             if ent is None:
                 bufs = [torch.empty((rows, world * w), dtype = dtype, device = dev)
                         for _ in range(2)]
-                parts = [[b[:, i * w:(i + 1) * w] for i in range(world)] for b in bufs]
+                # BUG 101: all_gather outputs MUST be contiguous. Column slices of the
+                # assembled buffer are strided views, which torch rejects ("Tensors must
+                # be contiguous"), so gather into standalone per-rank tensors and assemble
+                # with device-local slice copies afterwards. The copies run at HBM speed
+                # (~1 TB/s) vs the PCIe collective (~6 GB/s), so they add negligible cost.
+                parts = [[torch.empty((rows, w), dtype = dtype, device = dev)
+                          for _ in range(world)] for _ in range(2)]
                 ent = [bufs, parts, 0]
                 self._ag_cache[key] = ent
             bufs, parts, i = ent
@@ -958,6 +966,8 @@ class TPContext:
                local.data_ptr() < out.data_ptr() + out.numel() * out.element_size():
                 local = local.clone()
             dist.all_gather(parts[i], local)
+            for r in range(world):
+                out[:, r * w:(r + 1) * w].copy_(parts[i][r])
             return out
 
         # Uneven widths (a geometry where heads do not divide evenly between ranks):
