@@ -2169,14 +2169,24 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                         # captured graph is position-agnostic. A host slice here would bake
                         # past_len into the copy and the graph would replay it forever.
                         # BUG 43.
+                        # BUG 99: sliding layers store K/V in a ring; the write offset must
+                        # be ring-relative (ring_pos, maintained by set_ring_pos), not the
+                        # absolute position, which runs past the ring once window_beg > 0.
+                        _write_pos = (
+                            self.model.tp_context.ring_pos_tp.get(
+                                dev, self.model.tp_context.ring_pos
+                            )
+                            if self.sliding_window else
+                            self.model.tp_context.pos_tp.get(
+                                dev, self.model.tp_context.pos
+                            )
+                        )
                         ext_c.kv_write(
                             k[idx],
                             v[idx],
                             k_cache[idx],
                             v_cache[idx],
-                            self.model.tp_context.pos_tp.get(
-                                dev, self.model.tp_context.pos
-                            ),
+                            _write_pos,
                             batch_size,
                             q_len,
                             k[idx].shape[2],
@@ -2206,8 +2216,17 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                             # can only read that device's memory. `_dev` is a torch.device
                             # here, so normalise it to an int index before the dict lookup.
                             _dev_idx = _dev.index if isinstance(_dev, torch.device) else int(_dev)
-                            _pos = self.model.tp_context.pos_tp.get(
-                                _dev_idx, self.model.tp_context.pos
+                            # BUG 99: ring-relative position for sliding layers so the mask
+                            # bounds line up with ring slots; the absolute position mislabels
+                            # every slot once the ring has shifted.
+                            _pos = (
+                                self.model.tp_context.ring_pos_tp.get(
+                                    _dev_idx, self.model.tp_context.ring_pos
+                                )
+                                if self.sliding_window else
+                                self.model.tp_context.pos_tp.get(
+                                    _dev_idx, self.model.tp_context.pos
+                                )
                             )
                             # Change98: per-query-row causal bound. Query row i sits at
                             # absolute position pos + i and may only see keys <= pos + i.
@@ -2242,11 +2261,48 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                                 mask_override = _graph_mask
                             )
                     else:
-                        cache_a = attn_params.past_len
-                        cache_b = attn_params.past_len + q_len
-                        k_cache[idx][:batch_size, cache_a:cache_b, :, :].copy_(k[idx])
-                        v_cache[idx][:batch_size, cache_a:cache_b, :, :].copy_(v[idx])
-                        if _fi_hd and q_len == 1 and batch_size == 1:
+                        # BUG 99: sliding layers keep K/V in a ring (kv_state_size deep),
+                        # not a full-length buffer. Write at the ring-relative offset
+                        # (past_len - window_beg), mirroring the flash branch's _rel: the
+                        # absolute offset runs past the ring on the second prefill chunk
+                        # (empty-slice copy crash) and corrupts KV from then on. The chunk
+                        # loop's shift protocol guarantees the write fits in [0, ring);
+                        # a negative rel only drops leading rows of the chunk.
+                        _swa_win = self.sliding_window if self.sliding_window else 0
+                        if _swa_win:
+                            _rel = attn_params.past_len - getattr(cache, "window_beg", 0)
+                            _drop = max(0, -_rel)
+                            cache_a = max(0, _rel)
+                        else:
+                            _drop = 0
+                            cache_a = attn_params.past_len
+                        cache_b = cache_a + q_len - _drop
+                        k_cache[idx][:batch_size, cache_a:cache_b, :, :].copy_(k[idx][:, _drop:, :, :])
+                        v_cache[idx][:batch_size, cache_a:cache_b, :, :].copy_(v[idx][:, _drop:, :, :])
+                        if _swa_win:
+                            # Windowed causal mask over the written ring prefix, in ring
+                            # coordinates (same geometry as the graph-mode mask above).
+                            # mask_override makes _attn_torch skip its static last-window
+                            # slice, which would misalign for multi-token chunks.
+                            _ql = q_len - _drop
+                            _dev = k_cache[idx].device
+                            _qi = torch.arange(_ql, device = _dev).view(_ql, 1) + cache_a
+                            _kj = torch.arange(cache_b, device = _dev).view(1, cache_b)
+                            _ok = (_kj <= _qi) & (_kj > _qi - _swa_win)
+                            _swa_mask = torch.where(
+                                _ok, 0.0, -65504.0
+                            ).to(torch.half).view(1, 1, _ql, cache_b)
+                            attn_output = self._attn_torch(
+                                batch_size,
+                                _ql,
+                                q[idx][:, _drop:, :, :],
+                                k_cache[idx][:batch_size, :cache_b, :, :],
+                                v_cache[idx][:batch_size, :cache_b, :, :],
+                                attn_params,
+                                cfg,
+                                mask_override = _swa_mask
+                            )
+                        elif _fi_hd and q_len == 1 and batch_size == 1:
                             # PERF: hd512 single-token decode via FlashInfer single_decode
                             # (~5x faster than the torch GEMV at 16k, gap widens with ctx).
                             attn_output = self._attn_flashinfer_decode(
