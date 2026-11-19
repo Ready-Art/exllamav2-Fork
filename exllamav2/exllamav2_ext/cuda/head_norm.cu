@@ -2,7 +2,9 @@
 #include "util.cuh"
 #include "compat.cuh"
 
-#define MAX_HEAD_DIM 256
+// Gemma-4 has head_dim 512 on its global-attention layers, so the shared-memory partial-sum
+// array must cover 512/32 = 16 warps, not 256/32 = 8.
+#define MAX_HEAD_DIM 512
 #define WARP_SIZE 32
 #define MAX_WARPS (MAX_HEAD_DIM / WARP_SIZE)
 
@@ -27,8 +29,9 @@ __global__ void head_norm_kernel
     int t = threadIdx.x;
     const half* x_ptr = x + num_heads * head_dim * blockIdx.y + head_dim * blockIdx.x;
           half* y_ptr = y + num_heads * head_dim * blockIdx.y + head_dim * blockIdx.x;
-    const half* w_ptr = w + head_dim * blockIdx.x;
-    const half* b_ptr = b + head_dim * blockIdx.x;
+    // `w` is NULL for an unweighted RMSNorm (Gemma-4 `v_norm`): normalize only, no scale.
+    const half* w_ptr = w ? (w + head_dim * blockIdx.x) : NULL;
+    const half* b_ptr = b ? (b + head_dim * blockIdx.x) : NULL;
     const half2* x_ptr2 = (const half2*) x_ptr;
           half2* y_ptr2 = (      half2*) y_ptr;
     const half2* w_ptr2 = (const half2*) w_ptr;
@@ -67,11 +70,20 @@ __global__ void head_norm_kernel
 
         float rsvar = rsqrtf(sum * r_dim + epsilon);
 
-        // Normalize x, scaling by w
+        // Normalize x, scaling by w (skipped when w is NULL)
 
-        half2 w01 = w_ptr2[t];
-        float n0 = itemf[0] * __half2float(__low2half(w01)) * rsvar;
-        float n1 = itemf[1] * __half2float(__high2half(w01)) * rsvar;
+        float n0, n1;
+        if (w_ptr2)
+        {
+            half2 w01 = w_ptr2[t];
+            n0 = itemf[0] * __half2float(__low2half(w01)) * rsvar;
+            n1 = itemf[1] * __half2float(__high2half(w01)) * rsvar;
+        }
+        else
+        {
+            n0 = itemf[0] * rsvar;
+            n1 = itemf[1] * rsvar;
+        }
         half2 nh = __halves2half2(__float2half_rn(n0), __float2half_rn(n1));
         if (b) nh = __hadd2(nh, b_ptr2[t]);  // Optional bias
         y_ptr2[t] = nh;
@@ -129,11 +141,20 @@ __global__ void head_norm_kernel
 
         float rsvar = rsqrtf(sum * r_dim + epsilon);
 
-        // Normalize x, scaling by w
+        // Normalize x, scaling by w (skipped when w is NULL)
 
-        half2 w01 = w_ptr2[t];
-        float n0 = itemf[0] * __half2float(__low2half(w01)) * rsvar;
-        float n1 = itemf[1] * __half2float(__high2half(w01)) * rsvar;
+        float n0, n1;
+        if (w_ptr2)
+        {
+            half2 w01 = w_ptr2[t];
+            n0 = itemf[0] * __half2float(__low2half(w01)) * rsvar;
+            n1 = itemf[1] * __half2float(__high2half(w01)) * rsvar;
+        }
+        else
+        {
+            n0 = itemf[0] * rsvar;
+            n1 = itemf[1] * rsvar;
+        }
         half2 nh = __halves2half2(__float2half_rn(n0), __float2half_rn(n1));
         if (b) nh = __hadd2(nh, b_ptr2[t]);  // Optional bias
         y_ptr2[t] = nh;

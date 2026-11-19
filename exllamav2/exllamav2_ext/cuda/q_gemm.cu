@@ -103,6 +103,20 @@ void gemm_half_q_half_cuda_part
         if (!kernel) return;
 
         // Measurement events
+        //
+        // The measurement path synchronises the host (cudaEventSynchronize below), which is
+        // illegal inside a CUDA graph capture region. Autotuning must have completed during
+        // warmup, before capture begins; if it has not, fall back to the untimed blocksize
+        // rather than trying to measure inside the capture.
+        if (measure)
+        {
+            cudaStreamCaptureStatus _cs = cudaStreamCaptureStatusNone;
+            cudaStreamIsCapturing(stream, &_cs);
+            if (_cs != cudaStreamCaptureStatusNone)
+            {
+                measure = false;
+            }
+        }
 
         if (measure)
         {

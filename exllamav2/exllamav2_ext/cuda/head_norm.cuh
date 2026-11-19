@@ -7,6 +7,8 @@
 #include <cstdio>
 #include "graph.cuh"
 
+// `w` may be NULL, in which case the norm is applied without a scale multiply. This is the
+// unweighted RMSNorm path used by Gemma-4's `v_norm`. `b` must be NULL in that case.
 void head_norm_cuda
 (
     cudaStream_t stream,
