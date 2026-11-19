@@ -1,0 +1,24 @@
+# FlashInfer — HARD requirement (Change98), minimum version 0.7.4. NOT optional.
+#
+# This fork requires FlashInfer >= 0.7.4: it serves head_dim 512 decode on sm86 (RTX 3090)
+# and the graph-safe attention paths. exllamav2/attn_backend.py enforces the version at
+# import time and raises if FlashInfer is missing or too old. EXLLAMA_NO_FLASHINFER no
+# longer bypasses it.
+#
+# The kernel wheels are CUDA-version specific and must match the installed torch build.
+#
+# Install:
+#   pip install 'flashinfer-python>=0.7.4'
+#   flashinfer download-kernels
+#   flashinfer show-config
+#
+# Notes:
+#   * `flashinfer-cubin` is no longer on PyPI. Use `flashinfer download-kernels`, or
+#     `pip install flashinfer-cubin --index-url https://flashinfer.ai/whl`.
+#   * Kernel wheels do NOT auto-upgrade with `flashinfer-python`. Re-run
+#     `flashinfer download-kernels` after every upgrade, or FlashInfer falls back to JIT.
+#   * Verified on 0.7.4/sm86: single_decode_with_kv_cache and the paged decode wrapper
+#     both serve head_dim 512 eagerly (cos 1.0). Neither FI wrapper is CUDA-graph-safe
+#     with DYNAMIC kv_len (paged bakes split/grid scheduling; ragged prefill crashes on
+#     replay) — the drafter graph uses a masked-GEMV path for that case.
+flashinfer-python>=0.7.4

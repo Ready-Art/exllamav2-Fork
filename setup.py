@@ -133,8 +133,17 @@ setup(
         "regex",
         "numpy",
         "rich",
-        "pillow>=9.1.0"
+        "pillow>=9.1.0",
+        # Change98: FlashInfer >= 0.7.4 is a HARD dependency (hd512 decode on sm86,
+        # graph-safe attention). The wheels are CUDA-version specific and must match the
+        # installed torch build; after install/upgrade run: flashinfer download-kernels
+        "flashinfer-python>=0.7.4",
     ],
+    # Kept for backward compatibility with `pip install exllamav2[flashinfer]`; FlashInfer
+    # is now in install_requires (hard dependency), so this extra is a no-op alias.
+    extras_require={
+        "flashinfer": ["flashinfer-python>=0.7.4"],
+    },
     include_package_data=True,
     package_data={
         "": ["py.typed"],

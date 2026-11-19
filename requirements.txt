@@ -12,3 +12,4 @@ numpy~=1.26.4
 tokenizers
 rich
 pillow>=9.1.0
+flashinfer-python>=0.7.4

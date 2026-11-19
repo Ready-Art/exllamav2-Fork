@@ -1,215 +1,210 @@
-# Note
+# ReadyArt ExLlamaV2
 
-**This project is archived for now**. Development continues on [ExLlamaV3](https://github.com/turboderp-org/exllamav3).
+**Tensor-parallel, speculative-decoding ExLlamaV2 for multi-GPU rigs.**
 
-# ExLlamaV2
+ReadyArt ExLlamaV2 is a performance-focused fork of [ExLlamaV2](https://github.com/turboderp/exllamav2)
+that adds **multi-GPU tensor parallelism**, **MTP (multi-token prediction) speculative decoding**,
+and first-class **Gemma-4-31B** support — so a 31B-class model runs fast across several consumer
+GPUs (e.g. 4× RTX 3090) instead of being squeezed onto one card.
 
-ExLlamaV2 is an inference library for running local LLMs on modern consumer GPUs.
+It keeps everything upstream ExLlamaV2 is good at (EXL2 quantization, the dynamic generator with
+batching / prompt caching / K/V dedup, paged attention) and builds on it. Licensed under the same
+MIT license as upstream; all original credit to [turboderp](https://github.com/turboderp) and contributors.
 
-The official and recommended backend server for ExLlamaV2 is [TabbyAPI](https://github.com/theroyallab/tabbyAPI/),
-which provides an OpenAI-compatible API for local or remote inference, with extended features like HF model
-downloading, embedding model support and support for HF Jinja2 chat templates.
+**Run it as an OpenAI-compatible server:** pair this fork with
+**[ReadyArt/TabbyAPI](https://github.com/Ready-Art/TabbyAPI)** (branch `exl2-checkpoint`) — it adds
+SP/MP backend selection, MTP drafting, CUDA-graph/FlashInfer controls and Gemma-4 thinking/tool-call
+handling on top of this fork. See [OpenAI-compatible server (TabbyAPI)](#openai-compatible-server-tabbyapi).
 
-See the [wiki](https://github.com/theroyallab/tabbyAPI/wiki/1.-Getting-Started) for help getting started.
+---
 
+## Release status — alpha/beta proof of concept
 
-## New in v0.1.0+:
+> **This is an early alpha/beta release, intended as a proof of concept.** Performance is **not yet
+> where we want it to be** — multi-GPU decode and MTP throughput still have significant headroom
+> (the tensor-parallel collective path and quantized-GEMM efficiency are the main bottlenecks).
+> Expect rough edges, APIs that may change, and speeds below what the hardware is ultimately capable
+> of. It is shared to demonstrate the approach and invite feedback, not as a finished, tuned product.
 
-- ExLlamaV2 now supports paged attention via [Flash Attention](https://github.com/Dao-AILab/flash-attention) 2.5.7+
-- New generator with dynamic batching, smart prompt caching, K/V cache deduplication and simplified API
+**Model compatibility:** other EXL2 models *should* work, but this fork has only been **built and
+tested on [Gemma-4-31B-IT](https://huggingface.co/ReadyArt/Gemma-4-31B-IT-EXL2-6.0BPW-HB16)**. Other
+architectures are untested here — treat them as experimental and verify correctness/parity yourself.
 
-![alt_text](doc/dynamic_gen.gif)
+**Hardware:** built and tested on **SM86 (Ampere — RTX 3090)** only (see [Requirements](#requirements)).
 
-## Dynamic generator
+---
 
-The dynamic generator supports all inference, sampling and speculative decoding features of the previous two 
-generators, consolidated into one API (with the exception of FP8 cache, though the Q4 cache mode is supported and
-performs better anyway, see [here](doc/qcache_eval.md).)
+## What this fork adds
 
-The generator is explained in detail [here](doc/dynamic.md).
+| Feature | What it gives you |
+|---|---|
+| **Multi-GPU tensor parallelism (TP)** | Shard one model across GPUs. Single-process TP (`load_tp`, `--gpu_split`) for simplicity. |
+| **Multiprocess backend (MP)** | One worker process per GPU (`TPProcessGroup`) so dispatch overlaps across devices — higher decode throughput than single-process TP. |
+| **MTP speculative decoding** | A Gemma-4 *assistant* drafter proposes a window of tokens; the target verifies them in one forward. Works **with TP and MP** (the drafter gathers the target's sharded K/V). |
+| **Gemma-4-31B-IT support** | Text-only. Handles the model's two attention geometries (head_dim 256 sliding / 512 full), `k_eq_v` layers, proportional RoPE and per-layer norms. |
+| **Sliding-window + TP KV cache** | `ExLlamaV2Cache_SWA` / `ExLlamaV2Cache_TP`: ring buffers for sliding layers make long context fit (≈22.5 GB instead of ≈236 GB at 256k for Gemma-4-31B). |
+| **TP CUDA graphs** | Whole-step decode graphs (`tp_graph`) remove per-op launch latency on the tensor-parallel path. |
+| **FlashInfer attention (required)** | FlashInfer **≥ 0.7.4** is a hard dependency. On sm86 (RTX 3090) it serves **head_dim 512** on every path — paged decode (`BatchDecodeWithPagedKVCacheWrapper`, including CUDA-graph mode with a per-step re-plan), single-token decode, and prefill — verified cos 1.0 vs torch. Flash-Attention's paged kernel refuses hd512; FlashInfer does not. |
+| **Multi-GPU quantization** | `convert.py -d 0,1 -crs on` distributes the measurement/quantization passes across GPUs. See [doc/convert.md](doc/convert.md). |
 
-- Single generation:
-  ```python
-  output = generator.generate(prompt = "Hello, my name is", max_new_tokens = 200)
+## Requirements
+
+- **Built and tested on SM86 (Ampere — NVIDIA RTX 3090).** This fork is developed and validated
+  on the Ampere `sm_86` architecture (4× RTX 3090); other architectures may work but are untested.
+  The bundled kernel build targets `TORCH_CUDA_ARCH_LIST="8.6"`.
+- CUDA Toolkit and a CUDA build of [PyTorch](https://pytorch.org/get-started/locally/).
+- **FlashInfer ≥ 0.7.4** (hard requirement — importing the library raises if it is missing or older):
+  ```sh
+  pip install "flashinfer-python>=0.7.4"
+  flashinfer download-kernels      # kernel wheels are CUDA/torch-version specific
   ```
-- Batched generation:
-    ```python
-    outputs = generator.generate(
-        prompt = [
-            "Hello, my name is",
-            "Once upon a time,",
-            "Large language models are",
-        ], 
-        max_new_tokens = 200
-    )
-    ```
-- Streamed generation with `asyncio`:
-    ```python
-    job = ExLlamaV2DynamicJobAsync(
-        generator,
-        input_ids = tokenizer.encode("You can lead a horse to water"),
-        banned_strings = ["make it drink"],
-        gen_settings = ExLlamaV2Sampler.Settings.greedy(),
-        max_new_tokens = 200
-    )  
-    async for result in job:
-        text = result.get("text", "")
-        print(text, end = "")       
-    ``` 
-See the full, updated examples [here](https://github.com/turboderp/exllamav2/tree/master/examples).
+  Re-run `flashinfer download-kernels` after every FlashInfer upgrade.
 
-
-## Performance
-
-Some quick tests to compare performance with ExLlama V1. There may be more performance optimizations in the future,
-and speeds will vary across GPUs, with slow CPUs still being a potential bottleneck:
-
-| Model      | Mode         | Size  | grpsz | act | 3090Ti  | 4090        |
-|------------|--------------|-------|-------|-----|---------|-------------|
-| Llama      | GPTQ         | 7B    | 128   | no  | 181 t/s | **205** t/s |
-| Llama      | GPTQ         | 13B   | 128   | no  | 110 t/s | **114** t/s |
-| Llama      | GPTQ         | 33B   | 128   | yes | 44 t/s  | **48** t/s  |
-| OpenLlama  | GPTQ         | 3B    | 128   | yes | 259 t/s | **296** t/s |
-| CodeLlama  | EXL2 4.0 bpw | 34B   | -     | -   | 44 t/s  | **50** t/s  |
-| Llama2     | EXL2 3.0 bpw | 7B    | -     | -   | 217 t/s | **257** t/s |
-| Llama2     | EXL2 4.0 bpw | 7B    | -     | -   | 185 t/s | **211** t/s |
-| Llama2     | EXL2 5.0 bpw | 7B    | -     | -   | 164 t/s | **179** t/s |
-| Llama2     | EXL2 2.5 bpw | 70B   | -     | -   | 33 t/s  | **38** t/s  |
-| TinyLlama  | EXL2 3.0 bpw | 1.1B  | -     | -   | 656 t/s | **770** t/s |
-| TinyLlama  | EXL2 4.0 bpw | 1.1B  | -     | -   | 602 t/s | **700** t/s |
-
-
-## How to
-
-To install from the repo you'll need the CUDA Toolkit and either gcc on Linux or (Build Tools for) Visual Studio
-on Windows). Also make sure you have an appropriate version of [PyTorch](https://pytorch.org/get-started/locally/), then run:
+## Install
 
 ```sh
-git clone https://github.com/turboderp/exllamav2
-cd exllamav2
+git clone https://github.com/Ready-Art/Exllamav2
+cd Exllamav2
 pip install -r requirements.txt
 pip install .
 
+# single-GPU sanity check
 python test_inference.py -m <path_to_model> -p "Once upon a time,"
-# Append the '--gpu_split auto' flag for multi-GPU inference
+
+# multi-GPU inference (tensor parallel)
+python test_inference.py -m <path_to_model> -p "Once upon a time," --gpu_split auto
 ```
 
-A simple console chatbot is included. Run it with:
+## Multi-GPU inference
+
+**Single-process tensor parallelism** — the simplest way to spread a model over GPUs:
+
+```python
+from exllamav2 import ExLlamaV2, ExLlamaV2Config, ExLlamaV2Tokenizer
+from exllamav2.cache import ExLlamaV2Cache_TP, ExLlamaV2Cache_SWA
+
+config = ExLlamaV2Config(); config.model_dir = "<model>"; config.prepare()
+model = ExLlamaV2(config)
+model.load_tp([20, 20, 20, 20],                       # VRAM (GiB) per GPU
+              expect_cache_tokens=config.max_seq_len,
+              expect_cache_base=ExLlamaV2Cache_SWA)    # SWA ring cache for Gemma-4
+cache = ExLlamaV2Cache_TP(model, base=ExLlamaV2Cache_SWA, max_seq_len=config.max_seq_len)
+```
+
+**Multiprocess backend (MP)** — one worker per GPU for higher decode throughput:
+
+```python
+from exllamav2.tp_mp import TPProcessGroup
+pg = TPProcessGroup("<model>", [20.0]*4, max_seq_len, max_seq_len, "ExLlamaV2Cache_SWA")
+pg.start()
+logits = pg.forward(input_ids, 0, n_prompt, 1, True)   # prefill
+# ... decode with pg.forward(...) / pg.forward_state(...)
+pg.close()
+```
+
+**MTP speculative decoding** — through the streaming generator (single-process TP) or the MP driver:
+
+```python
+from exllamav2.generator import ExLlamaV2StreamingGenerator
+from exllamav2.mtp_drafter import Gemma4AssistantDrafter
+
+drafter = Gemma4AssistantDrafter(model, "<gemma-4-assistant-drafter-dir>",
+                                 device=0, num_draft_tokens=6)
+gen = ExLlamaV2StreamingGenerator(model, cache, tokenizer,
+                                  mtp_drafter=drafter, num_speculative_tokens=6)
+gen.begin_stream(input_ids, settings, token_healing=True)
+```
+
+For the MP backend use `MTPMPDriver` (`exllamav2/mtp_mp.py`); runnable benchmarks and examples
+are in [`mtp/`](mtp/). Every emitted token is sampled from the **target's** verified logits, so
+greedy MTP output matches plain autoregressive generation.
+
+## Gemma-4-31B-IT
+
+Pre-quantized EXL2 weights ready to run with this fork (6.0 bpw, fp16 head):
+**[ReadyArt/Gemma-4-31B-IT-EXL2-6.0BPW-HB16](https://huggingface.co/ReadyArt/Gemma-4-31B-IT-EXL2-6.0BPW-HB16)** on Hugging Face.
+
+`Gemma4ForConditionalGeneration` is supported for **text only** (vision tensors are skipped; passing
+an image raises a clear error). The model mixes two attention geometries, which is why several
+internals are per-layer:
+
+| | sliding layers (50) | full layers (10) |
+|---|---|---|
+| `head_dim` | 256 | 512 |
+| kv heads | 16 | 4 |
+| RoPE | default, theta 10000 | proportional, 0.25, theta 1e6 |
+| `v_proj` | present | absent (`attention_k_eq_v`: V is K) |
+| KV cache | ring buffer, 1280 tokens | full `max_seq_len` |
+
+Both geometries run on FlashInfer on sm86: the hd512 full layers use the paged decode wrapper
+(including CUDA-graph mode) and FlashInfer prefill; the sliding layers use its windowed kernels.
+
+Use the `gemma4` prompt format:
+```
+<bos><|turn>user\n{prompt}<turn|>\n<|turn>model\n
+```
+
+**MTP speculative decoding IS supported for Gemma-4 on both TP and MP** — the assistant drafter
+cross-attends to the target's K/V, which the TP/MP cache layers gather onto the drafter device
+(`gather_target` / `gather_kv_mtp`). On structured prompts MTP gives roughly **1.3–2×** decode
+speedup over plain autoregressive generation (acceptance-dependent).
+
+## OpenAI-compatible server (TabbyAPI)
+
+**[ReadyArt/TabbyAPI](https://github.com/Ready-Art/TabbyAPI)** (branch `exl2-checkpoint`) integrates
+this fork into [TabbyAPI](https://github.com/theroyallab/tabbyAPI), so Gemma-4-31B-IT runs behind an
+OpenAI-compatible API with:
+
+- `tensor_parallel_backend: sp` (single-process TP) or `mp` (one worker per GPU),
+- MTP drafting via `draft_model.draft_mode: mtp` + the
+  [gemma-4-31B-it-assistant](https://huggingface.co/google/gemma-4-31B-it-assistant) drafter
+  (greedy requests on MP; full sampler on SP),
+- TP CUDA graphs (`tp_graphs`) and FlashInfer controls,
+- Gemma-4 **thinking** (thought-channel `reasoning_content`) and **tool calls** (`gemma4` tool
+  format), plus `reasoning_effort` on chat completions.
+
+See the TabbyAPI repo's `docs/11.-ReadyArt-ExLlamaV2-Fork.md` for configuration and limitations.
+
+## Conversion & quantization (multi-GPU)
+
+Quantize to EXL2 with `convert.py`; the measurement and quantization passes can be spread across
+GPUs with `-d` (device list) and `-crs on` (shard calibration rows, one module replica per device):
 
 ```sh
-python examples/chat.py -m <path_to_model> -mode llama -gs auto
+python convert.py -i <hf_fp16_model> -o <work_dir> -cf <out_dir> \
+    -b 6.0 -hb 16 -d 0,1 -crs on
 ```
 
+See **[doc/convert.md](doc/convert.md)** for all arguments, the multi-GPU process, hardware
+requirements, and how to run the converted model tensor-parallel.
 
-The `-mode` argument chooses the prompt format to use. `raw` will produce a simple chatlog-style chat that works with base 
-models and various other finetunes. Run with `-modes` for a list of all available prompt formats. You can also provide
-a custom system prompt with `-sp`. 
+## Performance (this fork)
 
+> Early proof-of-concept numbers — **below the target**, not a tuned result (see
+> [Release status](#release-status--alphabeta-proof-of-concept)). Shared for transparency.
 
-## Integration and APIs
+Measured on 4× RTX 3090 (sm86, PCIe), Gemma-4-31B EXL2 6.0 bpw, greedy:
 
-- [TabbyAPI](https://github.com/theroyallab/tabbyAPI/) is a FastAPI-based server that provides an OpenAI-style web API
-compatible with [SillyTavern](https://sillytavernai.com/) and other frontends.  
+| Mode | 4k context | counting prompt |
+|---|---:|---:|
+| Plain decode (MP) | ~39 tok/s | ~40 tok/s |
+| **MTP (MP)** | **~40 tok/s** | **~53 tok/s (≈1.35×)** |
 
-- [ExUI](https://github.com/turboderp/exui) is a simple, standalone single-user web UI that serves an ExLlamaV2 instance
-directly with chat and notebook modes.
+MTP acceptance ≈ 2.7 tokens/round on mixed prose, ≈ 3.9 on structured prompts, up to 5–6 on
+arithmetic. Speedups scale with acceptance; long-context (32k/64k) MTP also matches or beats plain
+decode. Numbers vary with prompt, context length and hardware. **Short-context caveat:** at ~512
+tokens of context, MP MTP greedy currently runs *slower* than plain MP decode (~27 vs ~37 tok/s
+measured through TabbyAPI) — the per-round fixed costs (worker-pipe K/V gather/rewind round trips
+and the torch hd512 verify-window attention) dominate when there is little context to amortize
+them over. Reducing those round costs is the main MTP optimization target.
 
-- [text-generation-webui](https://github.com/oobabooga/text-generation-webui) supports ExLlamaV2 through the **exllamav2**
-and **exllamav2_HF** loaders.
+## Upstream features
 
-- [lollms-webui](https://github.com/ParisNeo/lollms-webui) supports ExLlamaV2 through the exllamav2 binding.
+The dynamic generator (batching, smart prompt caching, K/V dedup, simplified API), sampling filters,
+Q4 cache, and the rest of upstream ExLlamaV2 are retained. See [doc/dynamic.md](doc/dynamic.md) and
+the [examples/](examples/) directory. Upstream docs: [ExLlamaV2 wiki](https://github.com/turboderp/exllamav2/wiki).
 
-## Installation
+## License
 
-### Method 1: Install from source
-
-To install the current dev version, clone the repo and run the setup script:
-
-```sh
-git clone https://github.com/turboderp/exllamav2
-cd exllamav2
-pip install -r requirements.txt
-pip install .
-```
-
-By default this will also compile and install the Torch C++ extension (`exllamav2_ext`) that the library relies on. 
-You can skip this step by setting the `EXLLAMA_NOCOMPILE` environment variable:
-
-```sh
-EXLLAMA_NOCOMPILE= pip install .
-```
-
-This will install the "JIT version" of the package, i.e. it will install the Python components without building the
-C++ extension in the process. Instead, the extension will be built the first time the library is used, then cached in 
-`~/.cache/torch_extensions` for subsequent use.
-
-### Method 2: Install from release (with prebuilt extension)
-
-Releases are available [here](https://github.com/turboderp/exllamav2/releases), with prebuilt wheels that contain the extension binaries. Make sure to grab
-the right version, matching your platform, Python version (`cp`) and CUDA version. Crucially, you must also match
-the prebuilt wheel with your PyTorch version, since the Torch C++ extension ABI breaks with every new version of 
-PyTorch.
-
-Either download an appropriate wheel or install directly from the appropriate URL:
-
-```sh
-pip install https://github.com/turboderp/exllamav2/releases/download/v0.0.12/exllamav2-0.0.12+cu121-cp311-cp311-linux_x86_64.whl
-```
-
-The `py3-none-any.whl` version is the JIT version which will build the extension on first launch. The `.tar.gz` file
-can also be installed this way, and it will build the extension while installing.
-
-### Method 3: Install from PyPI
-
-A PyPI package is available as well. This is the same as the JIT version (see above). It can be installed with:
-
-```sh
-pip install exllamav2
-```
-
-
-## EXL2 quantization
-
-ExLlamaV2 supports the same 4-bit GPTQ models as V1, but also a new "EXL2" format. EXL2 is based on the same
-optimization method as GPTQ and supports 2, 3, 4, 5, 6 and 8-bit quantization. The format allows for mixing quantization
-levels within a model to achieve any average bitrate between 2 and 8 bits per weight.
-
-Moreover, it's possible to apply multiple quantization levels to each linear layer, producing something akin to sparse 
-quantization wherein more important weights (columns) are quantized with more bits. The same remapping trick that lets
-ExLlama work efficiently with act-order models allows this mixing of formats to happen with little to no impact on
-performance.
-
-Parameter selection is done automatically by quantizing each matrix multiple times, measuring the quantization 
-error (with respect to the chosen calibration data) for each of a number of possible settings, per layer. Finally, a
-combination is chosen that minimizes the maximum quantization error over the entire model while meeting a target
-average bitrate.
-
-In my tests, this scheme allows Llama2 70B to run on a single 24 GB GPU with a 2048-token context, producing coherent 
-and mostly stable output with 2.55 bits per weight. 13B models run at 2.65 bits within 8 GB of VRAM, although currently
-none of them uses GQA which effectively limits the context size to 2048. In either case it's unlikely that the model
-will fit alongside a desktop environment. For now.
-
-[![chat_screenshot](doc/llama2_70b_chat_thumb.png)](doc/llama2_70b_chat.png)
-[![chat_screenshot](doc/codellama_13b_instruct_thumb.png)](doc/codellama_13b_instruct.png)
-
-### Conversion
-
-A script is provided to quantize models. Converting large models can be somewhat slow, so be warned. The conversion
-script and its options are explained in [detail here](doc/convert.md)
-
-### Evaluation
-
-A number of evaluaion scripts are provided. See [here](doc/eval.md) for details.
-
-### Community
-
-A test community is provided at https://discord.gg/NSFwVuCjRq 
-Quanting service free of charge is provided at #bot test. The computation is generiously provided by the Bloke powered by Lambda labs. 
-
-### HuggingFace repos
-
-- I've uploaded a few EXL2-quantized models to Hugging Face to play around with, [here](https://huggingface.co/turboderp).
-
-- [LoneStriker](https://huggingface.co/LoneStriker) provides a large number of EXL2 models on Hugging Face. 
-
-- [bartowski](https://huggingface.co/bartowski) has some more EXL2 models on HF.
+MIT, as upstream ExLlamaV2. See [LICENSE](LICENSE). This fork is not affiliated with the original
+ExLlamaV2 authors; all original credit belongs to them.
