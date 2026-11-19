@@ -12,7 +12,7 @@ batching / prompt caching / K/V dedup, paged attention) and builds on it. Licens
 MIT license as upstream; all original credit to [turboderp](https://github.com/turboderp) and contributors.
 
 **Run it as an OpenAI-compatible server:** pair this fork with
-**[ReadyArt/TabbyAPI](https://github.com/Ready-Art/TabbyAPI)** (branch `exl2-checkpoint`) — it adds
+**[ReadyArt/tabbyAPI-Fork](https://github.com/Ready-Art/tabbyAPI-Fork)** (branch `ReadyArt`) — it adds
 SP/MP backend selection, MTP drafting, CUDA-graph/FlashInfer controls and Gemma-4 thinking/tool-call
 handling on top of this fork. See [OpenAI-compatible server (TabbyAPI)](#openai-compatible-server-tabbyapi).
 
@@ -52,21 +52,46 @@ architectures are untested here — treat them as experimental and verify correc
 - **Built and tested on SM86 (Ampere — NVIDIA RTX 3090).** This fork is developed and validated
   on the Ampere `sm_86` architecture (4× RTX 3090); other architectures may work but are untested.
   The bundled kernel build targets `TORCH_CUDA_ARCH_LIST="8.6"`.
-- CUDA Toolkit and a CUDA build of [PyTorch](https://pytorch.org/get-started/locally/).
+- **Python 3.12** and a CUDA build of [PyTorch](https://pytorch.org/get-started/locally/).
+  Tested combination: **Python 3.12.15, torch 2.15.0+cu132**, CUDA toolkit 13.x with `nvcc` on
+  `PATH` (built with nvcc 13.5 against cu132 torch — a minor-version mismatch is only a warning).
 - **FlashInfer ≥ 0.7.4** (hard requirement — importing the library raises if it is missing or older):
   ```sh
   pip install "flashinfer-python>=0.7.4"
   flashinfer download-kernels      # kernel wheels are CUDA/torch-version specific
   ```
   Re-run `flashinfer download-kernels` after every FlashInfer upgrade.
+- **Flash-Attention 2 — required (for now) even with FlashInfer.** The tensor-parallel and
+  dynamic-generator paths still call flash-attn kernels directly, so `flash_attn` must be installed
+  alongside FlashInfer. Prebuilt wheel for the tested stack (Python 3.12 / torch 2.15 / CUDA 13.2):
+  ```sh
+  pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v1.5.0/flash_attn-2.8.3+cu132torch2.15-cp312-cp312-linux_x86_64.whl"
+  ```
+  The wheel must match your Python/torch/CUDA combination — for other builds pick a wheel from the
+  [mjun0812 prebuilt-wheels releases](https://github.com/mjun0812/flash-attention-prebuild-wheels/releases).
 
 ## Install
 
+Verified on Ubuntu 26.10, 4× RTX 3090 (sm86), Python 3.12.15, torch 2.15.0+cu132, CUDA toolkit 13.5,
+FlashInfer 0.7.4, flash-attn 2.8.3. Install torch **before** building the fork: `setup.py` precompiles
+the CUDA extension against the installed torch, and `--no-build-isolation` makes the build use it.
+
 ```sh
-git clone https://github.com/Ready-Art/Exllamav2
-cd Exllamav2
+# Python 3.12 environment + CUDA 13.2 torch (tested combination)
+python3.12 -m venv venv && source venv/bin/activate
+pip install torch==2.15.0+cu132 --index-url https://download.pytorch.org/whl/cu132
+
+# Fork + CUDA extension (nvcc must be on PATH; "8.6" = RTX 3090)
+git clone https://github.com/Ready-Art/exllamav2-Fork
+cd exllamav2-Fork
 pip install -r requirements.txt
-pip install .
+TORCH_CUDA_ARCH_LIST="8.6" pip install . --no-build-isolation
+
+# FlashInfer kernels (hard requirement; re-run after every FlashInfer upgrade)
+flashinfer download-kernels
+
+# Flash-Attention 2 — required for now even with FlashInfer (see Requirements)
+pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v1.5.0/flash_attn-2.8.3+cu132torch2.15-cp312-cp312-linux_x86_64.whl"
 
 # single-GPU sanity check
 python test_inference.py -m <path_to_model> -p "Once upon a time,"
@@ -74,6 +99,10 @@ python test_inference.py -m <path_to_model> -p "Once upon a time,"
 # multi-GPU inference (tensor parallel)
 python test_inference.py -m <path_to_model> -p "Once upon a time," --gpu_split auto
 ```
+
+For other torch/CUDA versions, install the matching torch build from the
+[PyTorch wheel index](https://download.pytorch.org/whl/) and a matching flash-attn wheel
+(see [Requirements](#requirements)); the extension compiles against whatever torch is installed.
 
 ## Multi-GPU inference
 
@@ -151,7 +180,7 @@ speedup over plain autoregressive generation (acceptance-dependent).
 
 ## OpenAI-compatible server (TabbyAPI)
 
-**[ReadyArt/TabbyAPI](https://github.com/Ready-Art/TabbyAPI)** (branch `exl2-checkpoint`) integrates
+**[ReadyArt/tabbyAPI-Fork](https://github.com/Ready-Art/tabbyAPI-Fork)** (branch `ReadyArt`) integrates
 this fork into [TabbyAPI](https://github.com/theroyallab/tabbyAPI), so Gemma-4-31B-IT runs behind an
 OpenAI-compatible API with:
 

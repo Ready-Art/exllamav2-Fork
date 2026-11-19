@@ -237,6 +237,9 @@ separate from the multi-GPU quantization above):
 Requirements for the TP/MP path:
 - **FlashInfer ≥ 0.7.4** is mandatory (`pip install "flashinfer-python>=0.7.4"` then
   `flashinfer download-kernels`). It provides head_dim 512 decode on sm86 (RTX 3090).
+- **Flash-Attention 2** is also required for now, even with FlashInfer — the TP and
+  dynamic-generator paths still call flash-attn kernels directly. See the
+  [README](../README.md#requirements) for the prebuilt wheel matching your torch/CUDA build.
 - For Gemma-4, use the **SWA ring cache** (`ExLlamaV2Cache_SWA` base) so sliding-layer K/V stays
   bounded at long context; the TP cache wrapper is `ExLlamaV2Cache_TP`.
 - TP CUDA graphs are on by default (`EXL2_TP_GRAPHS=1`); set `EXL2_TP_GRAPHS=0` to disable for debugging.  
