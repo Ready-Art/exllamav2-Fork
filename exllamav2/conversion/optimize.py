@@ -24,8 +24,11 @@ def optimize(job, save_fn, model):
     anneal_samples = 80
     anneal_stages = 3
 
+    # `layers_root` is relative to lm_prefix (Gemma-4 uses "layers", not "model.layers").
+    # PLAN.md §2.1.
+    layers_root = getattr(cfg.arch.lm, "layers_root", "model.layers")
     first_q_layer = 0
-    while not model.modules[first_q_layer].key.startswith(cfg.arch.lm_prefix + "model.layers"):
+    while not model.modules[first_q_layer].key.startswith(cfg.arch.lm_prefix + layers_root):
         first_q_layer += 1
 
     # max_step_size = 2
@@ -33,11 +36,16 @@ def optimize(job, save_fn, model):
     # bias_layers = 2
     # bias_iter = 0
 
-    key = cfg.arch.lm_prefix + "model.layers.0"
+    key = cfg.arch.lm_prefix + layers_root + ".0"
     key_q = key + km["attn_q"]
     key_k = key + km["attn_k"]
     key_v = key + km["attn_v"]
     key_o = key + km["attn_o"]
+
+    # attention_k_eq_v: the full-attention layers have no v_proj at all (Gemma-4).
+    # Layer 0 is a sliding layer, so v_proj exists there, but guard anyway so a
+    # checkpoint whose first layer is a full layer does not crash here.
+    has_v_proj = key_v in model.modules_dict
 
     if not cfg.arch.lm.is_moe:
         if has_gate: key_g = key + mlp_key_gate
@@ -53,14 +61,14 @@ def optimize(job, save_fn, model):
     num_experts = cfg.num_experts if cfg.num_experts is not None else 1
     shape_q = model.modules_dict[key_q].matrix_shape()
     shape_k = model.modules_dict[key_k].matrix_shape()
-    shape_v = model.modules_dict[key_v].matrix_shape()
+    shape_v = model.modules_dict[key_v].matrix_shape() if has_v_proj else None
     shape_o = model.modules_dict[key_o].matrix_shape()
     shape_g = model.modules_dict[key_g].matrix_shape() if has_gate else None
     shape_u = model.modules_dict[key_u].matrix_shape()
     shape_d = model.modules_dict[key_d].matrix_shape()
     numel_q = shape_q[0] * shape_q[1]
     numel_k = shape_k[0] * shape_k[1]
-    numel_v = shape_v[0] * shape_v[1]
+    numel_v = shape_v[0] * shape_v[1] if has_v_proj else 0
     numel_o = shape_o[0] * shape_o[1]
     numel_g = shape_g[0] * shape_g[1] * num_experts if has_gate else 0
     numel_u = shape_u[0] * shape_u[1] * num_experts
@@ -71,7 +79,14 @@ def optimize(job, save_fn, model):
     # Combined size of hidden layers
 
     num_layers = cfg.num_hidden_layers
-    num_modules = num_layers * 2
+
+    # Modules per layer. Normally attn + mlp = 2, but Gemma-4 inserts an
+    # ExLlamaV2LayerScalar after each MLP, making it 3. Counting 2 would slice
+    # the module list short and silently drop the last layers' weights from the
+    # bitrate budget, producing a quant that misses its target bpw.
+    # PLAN.md §2.6.
+    modules_per_layer = 3 if getattr(cfg.arch.lm, "layer_scalar", False) else 2
+    num_modules = num_layers * modules_per_layer
     numel = sum(m.numel() for m in model.modules[first_q_layer : num_modules + first_q_layer])
 
     target_bpw = job["bits"]
@@ -85,11 +100,11 @@ def optimize(job, save_fn, model):
 
     for i in range(num_layers):
         if cfg.arch.lm.parallel_decoder_blocks:
-            m1 = measurement[cfg.arch.lm_prefix + "model.layers." + str(i) + ".parallel_decoder"]["attn"]
-            m2 = measurement[cfg.arch.lm_prefix + "model.layers." + str(i) + ".parallel_decoder"]["mlp"]
+            m1 = measurement[cfg.arch.lm_prefix + layers_root + "." + str(i) + ".parallel_decoder"]["attn"]
+            m2 = measurement[cfg.arch.lm_prefix + layers_root + "." + str(i) + ".parallel_decoder"]["mlp"]
         else:
-            m1 = measurement[cfg.arch.lm_prefix + "model.layers." + str(i) + ".self_attn"]
-            m2 = measurement[cfg.arch.lm_prefix + "model.layers." + str(i) + "." + mlp_mode]
+            m1 = measurement[cfg.arch.lm_prefix + layers_root + "." + str(i) + ".self_attn"]
+            m2 = measurement[cfg.arch.lm_prefix + layers_root + "." + str(i) + "." + mlp_mode]
         for m in [m1, m2]:
             slot = []
             param = []
@@ -170,12 +185,25 @@ def optimize(job, save_fn, model):
     job["strategy"] = {}
     for layer_ in range(num_layers):
 
-        k1 = cfg.arch.lm_prefix + "model.layers." + str(layer_) + ".self_attn"
-        k2 = cfg.arch.lm_prefix + "model.layers." + str(layer_) + "." + mlp_mode
+        k1 = cfg.arch.lm_prefix + layers_root + "." + str(layer_) + ".self_attn"
+        k2 = cfg.arch.lm_prefix + layers_root + "." + str(layer_) + "." + mlp_mode
         p1 = params[layer_ * 2][solution_idx[layer_ * 2]]
         p2 = params[layer_ * 2 + 1][solution_idx[layer_ * 2 + 1]]
 
-        for (k, p, n) in zip((k1, k2), (p1, p2), (numel_attn, numel_mlp)):
+        # Per-layer numel. Gemma-4's full-attention layers have a different geometry
+        # (head_dim 512, 4 kv heads) from the sliding layers (256, 16), so a single
+        # numel_attn taken from layer 0 would print the wrong bpw for 10 of 60 layers.
+        # PLAN.md §2.2.
+        if cfg.arch.lm.parallel_decoder_blocks:
+            n1 = sum(m.numel() for m in model.modules_dict[k1].submodules)
+            n2 = sum(m.numel() for m in model.modules_dict[k2].submodules)
+        else:
+            attn_mod = model.modules_dict.get(k1)
+            mlp_mod = model.modules_dict.get(k2)
+            n1 = attn_mod.numel() if attn_mod is not None else numel_attn
+            n2 = mlp_mod.numel() if mlp_mod is not None else numel_mlp
+
+        for (k, p, n) in zip((k1, k2), (p1, p2), (n1, n2)):
             job["strategy"][k] = p
             bpw = p["total_bits"] / n
             err = 1 - p["accuracy"]

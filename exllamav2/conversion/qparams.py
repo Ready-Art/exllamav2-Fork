@@ -343,7 +343,9 @@ qparams_headoptions = \
     5: QParams(128, [6, 5], [0.15, 0.85], 4),
     6: QParams(128, [8, 6], [0.15, 0.85], 4),
     8: QParams(128, [8], [1.0], 4),
-    # 16: None
+    # 16 means "do not quantize the head": leave the fp16 lm_head in place. The None value is the
+    # signal for that, handled by an early return in quantize.quant_lm_head. PLAN.md §2.7.
+    16: None
 }
 
 def get_qparams_reduced(options, ignore_gate = False):

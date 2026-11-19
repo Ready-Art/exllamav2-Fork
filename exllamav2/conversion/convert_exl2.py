@@ -22,7 +22,7 @@ parser.add_argument("-b", "--bits", type = float, default = 4.125, help = "Targe
 parser.add_argument("-ss", "--shard_size", type = float, help = "Max shard size in MB (default: 8192)", default = 8192)
 parser.add_argument("-rs", "--rope_scale", type = float, help = "RoPE scaling factor")
 parser.add_argument("-ra", "--rope_alpha", type = float, help = "RoPE alpha value (NTK)")
-parser.add_argument("-hb", "--head_bits", type = int, default = 6, help = "Target bits per weight (head layer)")
+parser.add_argument("-hb", "--head_bits", type = int, default = 6, help = "Target bits per weight (head layer). Use 16 to leave the head unquantized (fp16)")
 parser.add_argument("-om", "--output_measurement", type = str, help = "Only perform measurement pass, then save measurement to the specified file")
 parser.add_argument("-m", "--measurement", type = str, help = "Reuse previous measurement")
 parser.add_argument("-r", "--dataset_rows", type = int, default = 100, help = "Number of rows to apply from dataset")
@@ -32,6 +32,23 @@ parser.add_argument("-ml", "--measurement_length", type = int, default = 2048, h
 parser.add_argument("-so", "--status_output", action = "store_true", help = "Include machine-parseable status updates in console output")
 parser.add_argument("-hsol", "--hidden_state_offload_layers", type = int, default = 0, help = "Number of hidden/target states to keep in VRAM. Speed-up but increases VRAM usage")
 parser.add_argument("-fst", "--fast_safetensors", action = "store_true", help = "Deprecated (does nothing)")
+parser.add_argument("-d", "--devices", type = str, default = None,
+                    help = "Comma-separated CUDA device indices to use for quantization, e.g. '0,1'. "
+                           "Default: all visible devices. The first entry is the primary and owns every Hessian "
+                           "inversion. Tensors are never split; independent tensors are distributed across devices. "
+                           "quant-plan.md §6.4")
+parser.add_argument("-dr", "--device_ratios", type = str, default = None,
+                    help = "Comma-separated relative throughput weights, one per device in -d, e.g. '1,2' for two "
+                           "Ampere cards where the second is twice as fast. Default: learned from measurement, seeded "
+                           "by architecture prior. quant-plan.md §6.7")
+parser.add_argument("-crs", "--calib_row_shards", type = str, default = "off", choices = ["on", "off"],
+                    help = "Shard calibration rows across -d devices, one module replica per device. "
+                           "Off by default: it needs VRAM for a replica on each device, and a device that "
+                           "cannot hold one is dropped. quant-plan.md §6.5")
+parser.add_argument("-ps", "--pinned_staging", type = str, default = "on", choices = ["on", "off"],
+                    help = "Stage weights to the host through pinned memory on a side stream instead of a "
+                           "synchronous pageable copy. Single-GPU win; produces bit-identical output. "
+                           "quant-plan.md §6.8")
 
 args = parser.parse_args()
 
@@ -57,6 +74,7 @@ if args.length > 2048 or args.measurement_length > 2048:
 
 if not args.head_bits in qparams_headoptions:
     print(f" ## Error: {args.head_bits} is not a supported option for head layer bitrate")
+    print(f" ##        Supported options: {sorted(qparams_headoptions.keys())} (16 = unquantized fp16 head)")
     sys.exit()
 
 if args.output_measurement is not None and args.compile_full is not None:
@@ -104,6 +122,36 @@ if output_measurement is not None:
     if os.path.isdir(output_measurement):
         output_measurement = os.path.join(output_measurement, "measurement.json")
 
+# Device list and ratios. Parsed here so a bad value fails before any work starts.
+
+_devices = None
+if args.devices is not None:
+    try:
+        _devices = [int(x) for x in args.devices.replace(" ", "").split(",") if x != ""]
+    except ValueError:
+        print(f" ## Error: --devices expects comma-separated integers, got '{args.devices}'")
+        sys.exit()
+    if not _devices:
+        print(f" ## Error: --devices was empty")
+        sys.exit()
+
+_device_ratios = None
+if args.device_ratios is not None:
+    try:
+        _device_ratios = [float(x) for x in args.device_ratios.replace(" ", "").split(",") if x != ""]
+    except ValueError:
+        print(f" ## Error: --device_ratios expects comma-separated numbers, got '{args.device_ratios}'")
+        sys.exit()
+    if _devices is None:
+        print(f" ## Error: --device_ratios requires --devices")
+        sys.exit()
+    if len(_device_ratios) != len(_devices):
+        print(f" ## Error: --device_ratios has {len(_device_ratios)} entries but --devices has {len(_devices)}")
+        sys.exit()
+    if any(r <= 0 for r in _device_ratios):
+        print(f" ## Error: --device_ratios entries must be positive")
+        sys.exit()
+
 job = {"in_dir": args.in_dir,
        "out_dir": args.out_dir,
        "cal_dataset": args.cal_dataset,
@@ -118,6 +166,10 @@ job = {"in_dir": args.in_dir,
        "rope_scale": args.rope_scale,
        "rope_alpha": args.rope_alpha,
        "output_measurement": output_measurement,
+       "devices": _devices,
+       "device_ratios": _device_ratios,
+       "pinned_staging": args.pinned_staging == "on",
+       "calib_row_shards": args.calib_row_shards == "on",
        "progress": "begin"}
 
 if args.measurement is not None:
@@ -169,6 +221,20 @@ else:
 
 if job['rope_scale']: print(f" -- RoPE scale: {job['rope_scale']:.2f}")
 if job['rope_alpha']: print(f" -- RoPE alpha: {job['rope_alpha']:.2f}")
+
+# Seed the learned device split from an explicit ratio if one was given, so the very first tensor is already
+# balanced. Without -dr the split starts from the architecture prior and refines from measurement.
+
+if job.get("device_ratios") and job.get("devices"):
+    from exllamav2.conversion.devices import auto_split
+    for kind in ["attn", "mlp", "moe"]:
+        for dev, r in zip(job["devices"], job["device_ratios"]):
+            auto_split.speeds.setdefault(kind, {})[dev] = r
+    print(f" -- Device ratios (fixed): {job['device_ratios']}")
+elif job.get("devices") and len(job["devices"]) > 1:
+    from exllamav2.conversion.devices import arch_prior_speed
+    priors = [arch_prior_speed(d) for d in job["devices"]]
+    print(f" -- Device ratios (architecture prior): {priors}")
 
 # Make sure subfolders exist
 

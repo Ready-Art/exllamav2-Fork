@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import math
 from exllamav2.ext import exllamav2_ext as ext_c, none_tensor
 from exllamav2.util import list_live_tensors
+from exllamav2.conversion.stager import WeightStager
 import sys
 
 class AdaptiveQuantizer:
@@ -113,6 +114,21 @@ class AdaptiveGPTQ:
     quant_device: int = 0
     hessian_device: int = 0
 
+    # Device the packed/scaled outputs are gathered onto. Defaults to 0 to preserve historical behaviour,
+    # but the multi-GPU scheduler sets it to the worker's device so a quantized tensor is never bounced
+    # across the bus just to be written to disk. quant-plan.md §6.4 (M2).
+    output_device: int = 0
+
+    # Device the *dequantized* weight is written back onto. This is NOT the worker device: multi-GPU quantization
+    # spreads the work but leaves the model's device map untouched, so the reconstructed weight must land wherever
+    # the owning module lives or the post-quantization forward pass in quantize.py() will matmul a cuda:N weight
+    # against a cuda:M activation. ``None`` falls back to ``output_device`` (single-GPU behaviour).
+    target_device: int | None = None
+
+    # Optional WeightStager for pinned, overlapped weight upload. quant-plan.md §6.8 (M5).
+    stager: WeightStager | None = None
+    stager_key: int = 0
+
 
     def __init__(self,
                  layer: nn.Linear):
@@ -141,6 +157,26 @@ class AdaptiveGPTQ:
 
         self.quant_device = 0
         self.hessian_device = 0
+        self.output_device = 0
+        self.target_device = None
+        self.stager = None
+        self.stager_key = 0
+
+
+    def out_dev(self) -> torch.device:
+        """Device that packed/scaled outputs are gathered onto. quant-plan.md §6.4 (M2)."""
+        return torch.device(self.output_device)
+
+
+    def apply_dev(self) -> torch.device:
+        """
+        Device the dequantized weight is written back onto.
+
+        This is the owning module's device, not the worker device. The multi-GPU scheduler only spreads the
+        quantization *work*; the model's device map is untouched, so a weight left on the worker device makes the
+        post-quantization forward pass fail with "mat2 is on cuda:1, different from other tensors on cuda:0".
+        """
+        return torch.device(self.target_device if self.target_device is not None else self.output_device)
 
 
     def drop_buffers(self):
@@ -218,26 +254,34 @@ class AdaptiveGPTQ:
             # self.hessian += inputs.matmul(inputs.T)
 
             if self.hessian is None:
-                self.hessian = torch.zeros((self.rows, self.rows), device=self.device, dtype=torch.float)
+                # Accumulate on the Hessian device, which the multi-GPU scheduler sets to the primary.
+                # Defaults to 0, so single-GPU behaviour is unchanged. quant-plan.md §6.4.
+                self.hessian = torch.zeros((self.rows, self.rows), device = torch.device(self.hessian_device),
+                                           dtype = torch.float)
 
             self.num_batches += 1
-            inputs = inputs.view((-1, inputs.shape[-1])).float().to("cuda:0")
+            inputs = inputs.view((-1, inputs.shape[-1])).float().to(self.hessian.device)
             self.hessian.addmm_(inputs.T, inputs)
 
 
-    def prepare(self, no_h_inv = False):
+    def stage_weights(self, stager: WeightStager | None = None, key: int = 0):
+        """
+        Load the layer's weights into ``self.weights`` as a contiguous fp32 host tensor of shape
+        ``(in_features, out_features)``, then apply the activation-order permutation.
+
+        Split out of ``prepare()`` so that the multi-GPU scheduler can run the Hessian half once per distinct
+        ``H`` on the primary device and the weight half independently per tensor. quant-plan.md §6.4 (M2).
+
+        When ``stager`` is supplied the device-to-host copy is issued through pinned memory on a side stream
+        (quant-plan.md §6.8, M5). The result is bit-identical either way; only the wall-clock cost differs.
+        """
 
         with torch.inference_mode():
 
-            if self.hessian is None or self.num_batches == 0:
-                self.hessian = torch.eye(self.rows, device = self.device, dtype = torch.float)
+            if stager is not None:
+                self.weights = stager.get(key, self.layer.weight.data)
             else:
-                self.hessian /= self.num_batches
-            diagonal = torch.diag(self.hessian)
-
-            # Prepare weights
-
-            self.weights = self.layer.weight.data.cpu().T.clone().float().contiguous()
+                self.weights = self.layer.weight.data.cpu().T.clone().float().contiguous()
 
             # Zero weights that have no impact. Disabling this since it feels a little drastic based on just the calibration
             # data. It likely never triggers, anyway.
@@ -248,17 +292,42 @@ class AdaptiveGPTQ:
 
             # Activation order
 
+            if self.perm_cpu is not None:
+                self.weights = self.weights[self.perm_cpu, :]
+
+
+    def prepare_hessian(self, no_h_inv = False):
+        """
+        Normalize ``H``, pick the activation order, damp, and invert. Sets ``self.perm``, ``self.perm_cpu``
+        and ``self.hessian_inv``, and drops ``self.hessian``.
+
+        **This mutates the Hessian in place** (``hessian[d, d] += damp``) and then releases the reference, so it
+        must be called exactly once per distinct ``H``. q/k/v share one ``hessian_inv`` via ``reuse_h``, so calling
+        this concurrently on three threads would race. quant-plan.md §6.4 / R11.
+        """
+
+        with torch.inference_mode():
+
+            if self.hessian is None or self.num_batches == 0:
+                self.hessian = torch.eye(self.rows, device = self.device, dtype = torch.float)
+            else:
+                self.hessian /= self.num_batches
+            diagonal = torch.diag(self.hessian)
+
+            # Activation order
+
             self.perm = torch.argsort(diagonal, descending = True)
             self.perm_cpu = self.perm.cpu()
-            self.weights = self.weights[self.perm_cpu, :]
 
             if self.hessian.numel() > 6e8:
                 hessian_cpu = self.hessian.cpu()
                 self.hessian = None
                 hessian = hessian_cpu[self.perm_cpu][:, self.perm_cpu]
-                hessian = hessian.to("cuda:0")
+                hessian = hessian.to(torch.device(self.hessian_device))
             else:
-                hessian = self.hessian[self.perm][:, self.perm]
+                # perm lives on the layer's device; the Hessian may not. Index on the Hessian's device.
+                perm = self.perm.to(self.hessian.device)
+                hessian = self.hessian[perm][:, perm]
                 self.hessian = None
 
             # In case numerical errors have caused some asymmetry in H, assume it's close to symmetrical and force it.
@@ -280,7 +349,10 @@ class AdaptiveGPTQ:
 
                 try:
 
-                    d = torch.arange(self.rows, device = self.device)
+                    # Index on the Hessian's device, not the layer's. These differ once the multi-GPU
+                    # scheduler assigns a Hessian device other than the layer's own device; the old code
+                    # only worked because both were cuda:0. quant-plan.md §6.4.
+                    d = torch.arange(self.rows, device = hessian.device)
                     hessian[d, d] += damp
 
                     current_device = self.hessian_device
@@ -338,19 +410,41 @@ class AdaptiveGPTQ:
             self.hessian = None
 
 
-    def reuse_h(self, other):
+    def prepare(self, no_h_inv = False, stager: WeightStager | None = None, key: int = 0):
+        """
+        Full preparation: Hessian inversion followed by weight staging. This is the historical entry point and
+        behaves exactly as before when called with no arguments.
+        """
 
         with torch.inference_mode():
+            self.prepare_hessian(no_h_inv)
+            self.stage_weights(stager, key)
 
-            # Prepare weights
 
-            self.weights = self.layer.weight.data.cpu().T.clone().float().contiguous()
+    def reuse_h_hessian(self, other):
+        """
+        Adopt ``other``'s inverted Hessian and activation order, without touching weights.
 
+        Split out of ``reuse_h()`` so the multi-GPU scheduler can do all Hessian work serially on the primary
+        device and all weight work in parallel worker threads. quant-plan.md §6.4 (M2).
+        """
+
+        with torch.inference_mode():
             self.hessian_inv = other.hessian_inv
             self.hessian = None
             self.perm = other.perm
             self.perm_cpu = other.perm_cpu
-            self.weights = self.weights[self.perm_cpu, :]
+
+
+    def reuse_h(self, other, stager: WeightStager | None = None, key: int = 0):
+
+        with torch.inference_mode():
+
+            self.reuse_h_hessian(other)
+
+            # Prepare weights
+
+            self.stage_weights(stager, key)
 
 
     def quantize_rtn_inplace(self, keep_qweight = False, apply = False):
@@ -421,14 +515,14 @@ class AdaptiveGPTQ:
 
             # Create g_idx to store inverse activation order
 
-            self.invperm = torch.argsort(self.perm).to("cuda:0")
+            self.invperm = torch.argsort(self.perm).to(self.out_dev())
 
             # Store scales
 
-            self.scale = torch.stack(scale, dim = 0).to("cuda:0")
-            self.qscale = torch.stack(qscale, dim = 0).to("cuda:0")
-            self.qscale_max = qscale_max.to(torch.float16).to("cuda:0")
-            self.qgroups = torch.tensor(qgroups, dtype = torch.short).to("cuda:0")
+            self.scale = torch.stack(scale, dim = 0).to(self.out_dev())
+            self.qscale = torch.stack(qscale, dim = 0).to(self.out_dev())
+            self.qscale_max = qscale_max.to(torch.float16).to(self.out_dev())
+            self.qgroups = torch.tensor(qgroups, dtype = torch.short).to(self.out_dev())
 
             # I love Python
 
@@ -542,16 +636,16 @@ class AdaptiveGPTQ:
             # self.g_idx = torch.tensor(group_idx_list, dtype = torch.int32, device = self.device)
             # self.g_idx = torch.tensor(group_idx_list, dtype = torch.int32)
 
-            self.quant = self.quant.to("cuda:0")
-            self.invperm = torch.argsort(self.perm).to("cuda:0")
+            self.quant = self.quant.to(self.out_dev())
+            self.invperm = torch.argsort(self.perm).to(self.out_dev())
             # self.g_idx = self.g_idx[self.invperm]
 
             # Store scales
 
-            self.scale = torch.stack(scale, dim = 0).to("cuda:0")
-            self.qscale = torch.stack(qscale, dim = 0).to("cuda:0")
-            self.qscale_max = qscale_max.to(torch.float16).to("cuda:0")
-            self.qgroups = torch.tensor(qgroups, dtype = torch.short).to("cuda:0")
+            self.scale = torch.stack(scale, dim = 0).to(self.out_dev())
+            self.qscale = torch.stack(qscale, dim = 0).to(self.out_dev())
+            self.qscale_max = qscale_max.to(torch.float16).to(self.out_dev())
+            self.qgroups = torch.tensor(qgroups, dtype = torch.short).to(self.out_dev())
 
             # I love Python
 
@@ -593,7 +687,7 @@ class AdaptiveGPTQ:
         gc.collect()
         torch.cuda.empty_cache()
 
-        q = q.to(torch.device(self.quant_device))
+        q = q.to(self.apply_dev())
         self.layer.weight.data = q
 
 
@@ -607,7 +701,7 @@ class AdaptiveGPTQ:
 
     def pack(self, key, qparams):
 
-        self.qgroups = self.qgroups.to("cuda:0")
+        self.qgroups = self.qgroups.to(self.out_dev())
         # self.qscale_max = self.qscale_max.to("cude:0")
 
         assert qparams.scale_bits in [4]
@@ -632,7 +726,7 @@ class AdaptiveGPTQ:
             qst = self.qscale
             qwt = self.qweight
 
-        qst_packed = torch.zeros((qst.shape[0], qst.shape[1] * qparams.scale_bits // 32), dtype = torch.int32, device = self.device)
+        qst_packed = torch.zeros((qst.shape[0], qst.shape[1] * qparams.scale_bits // 32), dtype = torch.int32, device = self.out_dev())
         if qparams.scale_bits == 4: ext_c.pack_rows_4(qst, qst_packed)
         output[key + ".q_scale"] = qst_packed
 

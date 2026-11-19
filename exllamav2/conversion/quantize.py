@@ -13,6 +13,7 @@ from exllamav2.model import \
 
 from safetensors import safe_open
 from safetensors.torch import save_file
+from exllamav2.layer_scalar import ExLlamaV2LayerScalar
 from exllamav2.conversion.qparams import QParams, qparams_headoptions, qparams_attn, qparams_mlp, get_qparams_reduced
 from exllamav2.conversion.adaptivegptq import AdaptiveGPTQ
 import torch
@@ -21,6 +22,9 @@ import os, time, math, json
 import torch.nn.functional as F
 import gc
 from exllamav2.conversion.bot_status import print_stage
+from exllamav2.conversion.devices import resolve_devices
+from exllamav2.conversion.schedule import quantize_tensor_set
+from exllamav2.conversion.stager import WeightStager, free_stage_bufs
 from exllamav2.ext import exllamav2_ext as ext_c, none_tensor
 
 def list_live_tensors():
@@ -52,10 +56,43 @@ def quant_linear(job: dict,
                  lq: AdaptiveGPTQ or None,
                  qparams: dict,
                  drop = False,
-                 rtn = False):
+                 rtn = False,
+                 device: int = 0,
+                 stager = None,
+                 stager_key: int = 0):
+    """
+    Quantize one linear end to end: stage weights, run the GPTQ recursion, pack, save, and verify.
+
+    ``device`` is the CUDA index this tensor is quantized on. It is set on the quantizer as both the compute
+    device and the output device, so nothing is bounced back to device 0 just to be written out.
+    quant-plan.md §6.4 (M2).
+
+    ``stager`` / ``stager_key`` optionally route the device-to-host weight copy through pinned memory on a side
+    stream. quant-plan.md §6.8 (M5).
+    """
 
     qp = QParams.from_dict(qparams)
     print(f" -- Linear: {source.key} -> {qp.get_desc()}, {qp.bpw(source.linear.weight.T.shape):.2f} bpw")
+
+    # Pin this tensor to its assigned device. quant_device is the compute device, output_device the gather
+    # target for the packed tensors. Both default to 0, which reproduces the single-GPU behaviour exactly.
+
+    lq.quant_device = device
+    lq.output_device = device
+
+    # The dequantized weight is a live model tensor, not a file-bound one, so it has to land back on the device
+    # that owns the module. Multi-GPU quantization spreads the work but leaves the model's device map untouched,
+    # so `source.device_idx` and `device` are the same only on a single-GPU box. Getting this wrong makes the
+    # post-quantization forward pass matmul a cuda:N weight against a cuda:M activation. Stage K bug 8.
+
+    src_idx = getattr(source, "device_idx", None)
+    lq.target_device = src_idx if isinstance(src_idx, int) and src_idx >= 0 else device
+
+    # Stage weights (M5). This is the only difference from the old inline .cpu().T.clone().float() path,
+    # and it produces a bit-identical tensor.
+
+    if stager is not None:
+        lq.stage_weights(stager, stager_key)
 
     # Quantize
 
@@ -95,8 +132,11 @@ def quant_linear(job: dict,
 
     # Sanity test to ensure reconstructed matrix matches unpacked matrix
 
-    quant_w = source.linear.weight.T
+    # Compare on the reconstruction's device: the weight now lives on the owning module's device, which differs
+    # from the worker device under multi-GPU. `.to()` also makes this a copy rather than a view of the live weight,
+    # which the in-place `sub_` below would otherwise mutate. Stage K bug 8.
     recons_w = recons_linear.get_weight_tensor_dq()
+    quant_w = source.linear.weight.T.to(recons_w.device)
 
     try:
         if quant_w.numel() <= 1e9:
@@ -129,92 +169,174 @@ def quant_linear(job: dict,
 
     # Apply reconstructed matrix to source layer
 
-    source.linear.weight.data = recons_w.T.to("cuda:0")
+    source.linear.weight.data = recons_w.T.to(lq.apply_dev())
 
 
-def quant_attn(job, module, hidden_states, target_states, quantizers, attn_params, strat):
+def _quant_group(job, tasks, devices, kind, stager):
+    """
+    Quantize a set of independent (linear, quantizer, qparams) tasks across ``devices``.
 
-    quantizers["q_proj"].prepare()
-    quantizers["k_proj"].reuse_h(quantizers["q_proj"])
-    quantizers["v_proj"].reuse_h(quantizers["q_proj"])
-    quantizers["o_proj"].prepare()
+    Each task is one whole tensor. Nothing is split: see schedule.py for why. With a single device this is a plain
+    serial loop and the output is identical to the pre-multi-GPU code.
+    """
 
-    quant_linear(job, module.q_proj, quantizers["q_proj"], strat["q_proj"])
-    quant_linear(job, module.k_proj, quantizers["k_proj"], strat["k_proj"])
-    del quantizers[f"k_proj"]
-    quant_linear(job, module.v_proj, quantizers["v_proj"], strat["v_proj"])
-    del quantizers[f"v_proj"]
-    quant_linear(job, module.o_proj, quantizers["o_proj"], strat["o_proj"])
-    del quantizers[f"o_proj"]
+    def run_one(task, device):
+        source, lq, qparams, key = task
+        quant_linear(job, source, lq, qparams, device = device, stager = stager, stager_key = key)
+
+    def size_fn(task):
+        return task[0].linear.weight.numel()
+
+    quantize_tensor_set(tasks, devices, kind, run_one, size_fn)
+
+
+def quant_attn(job, module, hidden_states, target_states, quantizers, attn_params, strat, devices = None, stager = None):
+    """
+    Quantize the attention projections of one module.
+
+    Phase 1 (serial, primary device): every Hessian inversion. ``prepare_hessian()`` mutates ``H`` in place and
+    q/k/v share one ``hessian_inv`` via ``reuse_h``, so this half must not run concurrently. quant-plan.md §6.4 / R11.
+
+    Phase 2 (parallel, one device per tensor): the GPTQ recursion and packing, which are independent per tensor.
+    """
+
+    devices = devices or [0]
+    primary = devices[0]
+
+    # --- Phase 1: Hessians, serial, on the primary device ---
+
+    quantizers["q_proj"].hessian_device = primary
+    quantizers["o_proj"].hessian_device = primary
+
+    quantizers["q_proj"].prepare_hessian()
+    # v_proj is None for attention_k_eq_v layers (Gemma-4 full attention): V is K,
+    # so there is no separate matrix to quantize. PLAN.md §2.5.
+    has_v = "v_proj" in quantizers
+    quantizers["k_proj"].reuse_h_hessian(quantizers["q_proj"])
+    if has_v:
+        quantizers["v_proj"].reuse_h_hessian(quantizers["q_proj"])
+    quantizers["o_proj"].prepare_hessian()
+
+    # --- Phase 2: weights + recursion + packing, parallel ---
+
+    tasks = [
+        (module.q_proj, quantizers["q_proj"], strat["q_proj"], 0),
+        (module.k_proj, quantizers["k_proj"], strat["k_proj"], 1),
+    ]
+    if has_v:
+        tasks.append((module.v_proj, quantizers["v_proj"], strat["v_proj"], 2))
+    tasks.append((module.o_proj, quantizers["o_proj"], strat["o_proj"], 3))
+
+    _quant_group(job, tasks, devices, "attn", stager)
+
+    for k in ["q_proj", "k_proj", "v_proj", "o_proj"]:
+        if k in quantizers: del quantizers[k]
 
     gc.collect()
     torch.cuda.empty_cache()
 
 
-def quant_mlp(job, module, hidden_states, target_states, quantizers, attn_params, strat, reuse_h_up_proj = None):
+def quant_mlp(job, module, hidden_states, target_states, quantizers, attn_params, strat, reuse_h_up_proj = None,
+              devices = None, stager = None):
 
+    devices = devices or [0]
+    primary = devices[0]
     has_mlp = module.model.config.arch.lm.mlp_gate
 
+    # --- Phase 1: Hessians, serial ---
+
+    quantizers["up_proj"].hessian_device = primary
+    quantizers["down_proj"].hessian_device = primary
+
     if reuse_h_up_proj is not None:
-        quantizers["up_proj"].reuse_h(quantizers[reuse_h_up_proj])
+        quantizers["up_proj"].reuse_h_hessian(quantizers[reuse_h_up_proj])
         del quantizers[reuse_h_up_proj]
     else:
-        quantizers["up_proj"].prepare()
+        quantizers["up_proj"].prepare_hessian()
 
     if has_mlp:
-        quantizers["gate_proj"].reuse_h(quantizers["up_proj"])
-        quant_linear(job, module.gate_proj, quantizers["gate_proj"], strat["gate_proj"])
-        del quantizers[f"gate_proj"]
+        quantizers["gate_proj"].reuse_h_hessian(quantizers["up_proj"])
+
+    quantizers["down_proj"].prepare_hessian()
+
+    # --- Phase 2: weights + recursion + packing, parallel ---
+
+    tasks = []
+    if has_mlp:
+        tasks.append((module.gate_proj, quantizers["gate_proj"], strat["gate_proj"], 0))
+    tasks.append((module.up_proj, quantizers["up_proj"], strat["up_proj"], 1 if has_mlp else 0))
+    tasks.append((module.down_proj, quantizers["down_proj"], strat["down_proj"], 2 if has_mlp else 1))
+
+    _quant_group(job, tasks, devices, "mlp", stager)
+
+    for k in ["gate_proj", "up_proj", "down_proj"]:
+        if k in quantizers: del quantizers[k]
 
     gc.collect()
     torch.cuda.empty_cache()
 
-    quant_linear(job, module.up_proj, quantizers["up_proj"], strat["up_proj"])
-    del quantizers[f"up_proj"]
 
-    gc.collect()
-    torch.cuda.empty_cache()
+def quant_moe_mlp(job, module, hidden_states, target_states, quantizers, attn_params, strat, devices = None,
+                  stager = None):
 
-    quantizers["down_proj"].prepare()
-
-    quant_linear(job, module.down_proj, quantizers["down_proj"], strat["down_proj"])
-    del quantizers[f"down_proj"]
-
-
-def quant_moe_mlp(job, module, hidden_states, target_states, quantizers, attn_params, strat):
-
+    devices = devices or [0]
+    primary = devices[0]
     num_experts = module.model.config.num_experts
 
-    quantizers["w1.0"].prepare()
-    for i in range(num_experts):
-        if i > 0: quantizers[f"w1.{i}"].reuse_h(quantizers["w1.0"])
-        quantizers[f"w2.{i}"].prepare()
-        quantizers[f"w3.{i}"].reuse_h(quantizers["w1.0"])
+    # --- Phase 1: Hessians, serial ---
 
     for i in range(num_experts):
-        quant_linear(job, module.w1[i], quantizers[f"w1.{i}"], strat["w1"])
-        del quantizers[f"w1.{i}"]
-        quant_linear(job, module.w3[i], quantizers[f"w3.{i}"], strat["w3"])
-        del quantizers[f"w3.{i}"]
-        quant_linear(job, module.w2[i], quantizers[f"w2.{i}"], strat["w2"])
-        del quantizers[f"w2.{i}"]
+        quantizers[f"w1.{i}"].hessian_device = primary
+        quantizers[f"w2.{i}"].hessian_device = primary
+        quantizers[f"w3.{i}"].hessian_device = primary
+
+    quantizers["w1.0"].prepare_hessian()
+    for i in range(num_experts):
+        if i > 0: quantizers[f"w1.{i}"].reuse_h_hessian(quantizers["w1.0"])
+        quantizers[f"w2.{i}"].prepare_hessian()
+        quantizers[f"w3.{i}"].reuse_h_hessian(quantizers["w1.0"])
+
+    # --- Phase 2: weights + recursion + packing, parallel ---
+
+    tasks = []
+    key = 0
+    for i in range(num_experts):
+        tasks.append((module.w1[i], quantizers[f"w1.{i}"], strat["w1"], key)); key += 1
+        tasks.append((module.w3[i], quantizers[f"w3.{i}"], strat["w3"], key)); key += 1
+        tasks.append((module.w2[i], quantizers[f"w2.{i}"], strat["w2"], key)); key += 1
+
+    _quant_group(job, tasks, devices, "moe", stager)
+
+    for i in range(num_experts):
+        for k in [f"w1.{i}", f"w2.{i}", f"w3.{i}"]:
+            if k in quantizers: del quantizers[k]
 
 
-def quant_lm_head(job, module, hidden_states, quantizers, attn_params, rtn = False):
+def quant_lm_head(job, module, hidden_states, quantizers, attn_params, rtn = False, device = 0, stager = None):
+
+    # head_bits == 16 means "do not quantize the head": leave the fp16 lm_head in place.
+    # qparams_headoptions[16] is None, so calling .get_dict() on it would raise AttributeError.
+    # PLAN.md §2.7 step 2.
+    if job["head_bits"] == 16:
+        return
 
     qp = qparams_headoptions[job["head_bits"]]
     q = quantizers["lm_head"]
 
-    q.prepare(no_h_inv = rtn)
-    quant_linear(job, module, q, qp.get_dict(), drop = True, rtn = rtn)
+    q.hessian_device = device
+    q.prepare_hessian(no_h_inv = rtn)
+    quant_linear(job, module, q, qp.get_dict(), drop = True, rtn = rtn, device = device, stager = stager)
 
 
-def quant_parallel_decoder(job, module, hidden_states, target_states, quantizers, attn_params, strat_attn, strat_mlp):
+def quant_parallel_decoder(job, module, hidden_states, target_states, quantizers, attn_params, strat_attn, strat_mlp,
+                           devices = None, stager = None):
 
     print(f" -- Sublayer: {module.key}.self_attn")
-    quant_attn(job, module.attn, hidden_states, target_states, quantizers, attn_params, strat_attn)
+    quant_attn(job, module.attn, hidden_states, target_states, quantizers, attn_params, strat_attn,
+               devices = devices, stager = stager)
     print(f" -- Sublayer: {module.key}.mlp")
-    quant_mlp(job, module.mlp, hidden_states, target_states, quantizers, attn_params, strat_mlp, "q_proj")
+    quant_mlp(job, module.mlp, hidden_states, target_states, quantizers, attn_params, strat_mlp, "q_proj",
+              devices = devices, stager = stager)
 
 
 # def testc(module, states, target_states, norm, layers):
@@ -262,6 +384,24 @@ def quant(job, save_fn, model):
     states_filename = os.path.join(job["out_dir"], "hidden_states.safetensors")
     strategy = job["strategy"]
 
+    # Multi-GPU setup. quant-plan.md §6.
+    #
+    # ``devices`` is the ordered list of CUDA indices this job may use; the first entry is the primary and
+    # owns every Hessian inversion. With the default (no -d flag deflates to [0]) this is a single-element
+    # list and every code path below degenerates to the historical serial behaviour.
+
+    devices = resolve_devices(job.get("devices"))
+    if not devices:
+        devices = [0]
+    primary = devices[0]
+    if len(devices) > 1:
+        print(f" -- Parallel quantization across devices: {devices}")
+
+    # Pinned weight staging (M5). Single-GPU win: it replaces the synchronous pageable
+    # .cpu().T.clone().float().contiguous() with a pinned D2H copy on a side stream.
+
+    stager = WeightStager(primary) if job.get("pinned_staging", True) else None
+
     # Quantize
 
     if not "q_last_module_idx" in job:
@@ -295,6 +435,14 @@ def quant(job, save_fn, model):
 
         module.load()
 
+        # Device this module's forward passes run on. The model's device map is unchanged by multi-GPU
+        # quantization: the module still lives where the loader put it, and only the quantizer work is spread.
+        # quant-plan.md §6.4.
+        if isinstance(module.device_idx, int) and module.device_idx >= 0:
+            module_dev = torch.device(module.device_idx)
+        else:
+            module_dev = torch.device(primary)
+
         print(f" -- Layer: {module.key} ({module.name})")
 
         # Create quantizers
@@ -306,7 +454,10 @@ def quant(job, save_fn, model):
             # if index > 1: testc(module, hidden_states, hidden_i_states, module.input_layernorm, [module.q_proj, module.k_proj, module.v_proj])
             quantizers["q_proj"] = AdaptiveGPTQ(module.q_proj.linear)
             quantizers["k_proj"] = AdaptiveGPTQ(module.k_proj.linear)
-            quantizers["v_proj"] = AdaptiveGPTQ(module.v_proj.linear)
+            # v_proj is None for attention_k_eq_v layers (Gemma-4 full attention).
+            # PLAN.md §2.5 / §2.7.
+            if module.v_proj is not None:
+                quantizers["v_proj"] = AdaptiveGPTQ(module.v_proj.linear)
             quantizers["o_proj"] = AdaptiveGPTQ(module.o_proj.linear)
 
         elif isinstance(module, ExLlamaV2MLP):
@@ -332,6 +483,10 @@ def quant(job, save_fn, model):
         elif isinstance(module, ExLlamaV2RMSNorm) or isinstance(module, ExLlamaV2LayerNorm):
             mode = "norm"
 
+        elif isinstance(module, ExLlamaV2LayerScalar):
+            # 1-element pass-through tensor, never quantized. PLAN.md §2.7.
+            mode = "layer_scalar"
+
         elif isinstance(module, ExLlamaV2PosEmbedding):
             mode = "pos_emb"
 
@@ -352,6 +507,13 @@ def quant(job, save_fn, model):
         attn_params = ExLlamaV2Attention.Params(1, hidden_states[0].shape[1], 0, None, None) \
             if mode in ["self_attn", "parallel_decoder"] else None
 
+        # layer_scalar is a 1-element pass-through tensor: no calibration, no forward pass, no
+        # Hessian. Leave the hidden states untouched and let compile.py copy the tensor through.
+        if mode == "layer_scalar":
+            module.unload()
+            torch.cuda.empty_cache()
+            continue
+
         target_states = []
 
         if mode == "block_sparse_moe":
@@ -359,7 +521,7 @@ def quant(job, save_fn, model):
 
         for i in range(len(hidden_states)):
 
-            x = hidden_states[i].to("cuda:0")
+            x = hidden_states[i].to(module_dev)
             outputs = module.forward(x, cache, attn_params, intermediates = True)
 
             # Hessians
@@ -407,26 +569,31 @@ def quant(job, save_fn, model):
 
         if mode == "self_attn":
             strat = strategy[module.key + "." + mode]
-            quant_attn(job, module, hidden_states, target_states, quantizers, attn_params, strat)
+            quant_attn(job, module, hidden_states, target_states, quantizers, attn_params, strat,
+                       devices = devices, stager = stager)
 
         if mode == "mlp":
             strat = strategy[module.key + "." + mode]
-            quant_mlp(job, module, hidden_states, target_states, quantizers, attn_params, strat)
+            quant_mlp(job, module, hidden_states, target_states, quantizers, attn_params, strat,
+                      devices = devices, stager = stager)
 
         if mode == "block_sparse_moe":
             strat = strategy[module.key + "." + mode]
-            quant_moe_mlp(job, module, hidden_states, target_states, quantizers, attn_params, strat)
+            quant_moe_mlp(job, module, hidden_states, target_states, quantizers, attn_params, strat,
+                          devices = devices, stager = stager)
 
         if mode == "linear":
             model.drop_device_context()
             gc.collect()  # shruge
             torch.cuda.empty_cache()
-            quant_lm_head(job, module, hidden_states, quantizers, attn_params, rtn)
+            quant_lm_head(job, module, hidden_states, quantizers, attn_params, rtn,
+                          device = primary, stager = stager)
 
         if mode == "parallel_decoder":
             strat_attn = strategy[module.key + ".self_attn"]
             strat_mlp = strategy[module.key + ".mlp"]
-            quant_parallel_decoder(job, module, hidden_states, target_states, quantizers, attn_params, strat_attn, strat_mlp)
+            quant_parallel_decoder(job, module, hidden_states, target_states, quantizers, attn_params, strat_attn, strat_mlp,
+                                   devices = devices, stager = stager)
 
         torch.cuda.synchronize()
         quantizers.clear()
@@ -438,9 +605,10 @@ def quant(job, save_fn, model):
         if mode == "linear":
             with safe_open(job["cal_filename"], framework = "pt", device = "cpu") as f:
                 cal_ids = f.get_tensor("input_ids")
-            module.linear.weight.data = module.linear.weight.data.to("cuda:0")
+            module.linear.weight.data = module.linear.weight.data.to(module_dev)
 
-        rfn_sum = torch.tensor(0.0).cuda()
+        # Accumulate on the device the forward pass runs on, not on whatever `.cuda()` resolves to in this thread.
+        rfn_sum = torch.tensor(0.0, device = module_dev)
         rfn_count = 0
         logprob_sum = 0.0
         logprob_count = 0
@@ -450,13 +618,13 @@ def quant(job, save_fn, model):
 
             if mode != "linear":
 
-                x = hidden_states[i].to("cuda:0")
+                x = hidden_states[i].to(module_dev)
                 output = module.forward(x, cache, attn_params)
                 x = None
                 q_states.append(output.to("cpu"))
 
                 output = output[0].float()
-                output_ref = target_states[i].to("cuda:0")
+                output_ref = target_states[i].to(module_dev)
                 output_ref = output_ref[0].float()
 
                 rfn_sum += torch.linalg.norm(output - output_ref, 'fro') / torch.linalg.norm(output_ref, 'fro')
@@ -467,7 +635,7 @@ def quant(job, save_fn, model):
 
             elif i < job["measurement_rows"]:
 
-                x = hidden_states[i].to("cuda:0")
+                x = hidden_states[i].to(module_dev)
                 output = module.forward(x, cache, attn_params)
                 if module.padding > 0: output = output[:, :, :-module.padding]
 
@@ -477,7 +645,7 @@ def quant(job, save_fn, model):
 
                 logits = output[:, :-1, :]
                 logits = logits.float() + 1e-10
-                target_ids = cal_ids[i:i+1, 1:].to("cuda:0")
+                target_ids = cal_ids[i:i+1, 1:].to(module_dev)
 
                 log_probs = F.log_softmax(logits, dim = -1)
                 token_log_probs = log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
@@ -541,3 +709,8 @@ def quant(job, save_fn, model):
             last_snapshot_time = time.time()
 
     print_stage(job, "Quantizing", len(model.modules), len(model.modules))
+
+    # Release the pinned staging arena. It is process-global and can be hundreds of MB on a large model.
+
+    if stager is not None: stager.drain()
+    free_stage_bufs()

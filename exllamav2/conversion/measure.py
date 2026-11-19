@@ -11,6 +11,7 @@ from exllamav2.model import \
     ExLlamaV2ParallelDecoder
 )
 
+from exllamav2.layer_scalar import ExLlamaV2LayerScalar
 from safetensors import safe_open
 from safetensors.torch import save_file
 from exllamav2.conversion.qparams import QParams, qparams_headoptions, qparams_attn, qparams_mlp, get_qparams_reduced
@@ -21,6 +22,7 @@ import os, time, math, json
 import torch.nn.functional as F
 import gc
 from exllamav2.conversion.bot_status import print_stage
+from exllamav2.conversion.devices import resolve_devices
 
 # graceful exiting
 import signal
@@ -146,19 +148,37 @@ def measure_attn(module, hidden_states, target_states, quantizers, cache, attn_p
     qjobs, qmaps = get_qparams_reduced(qparams_attn)
     results = []
 
+    # attention_k_eq_v: the full-attention layers have no v_proj at all (Gemma-4),
+    # because V is K. Skip the v_proj measurement and let `v` track `k`.
+    # PLAN.md §2.5.
+    has_v = module.v_proj is not None
+
     quantizers["q_proj"].prepare()
     quantizers["k_proj"].reuse_h(quantizers["q_proj"])
-    quantizers["v_proj"].reuse_h(quantizers["q_proj"])
+    if has_v:
+        quantizers["v_proj"].reuse_h(quantizers["q_proj"])
     quantizers["o_proj"].prepare()
 
     options_q, bits_q = test_quant(module.q_proj, quantizers["q_proj"], qjobs[0])
     options_k, bits_k = test_quant(module.k_proj, quantizers["k_proj"], qjobs[1])
-    options_v, bits_v = test_quant(module.v_proj, quantizers["v_proj"], qjobs[2])
+    if has_v:
+        options_v, bits_v = test_quant(module.v_proj, quantizers["v_proj"], qjobs[2])
+    else:
+        # V is K, so it shares K's options and bit cost exactly.
+        #
+        # NOTE: `bits_v` must be indexed with the *v* index from qmaps, not the k index. The two
+        # lists are built independently by get_qparams_reduced (one per module position), so they
+        # are not guaranteed to be the same length. Aliasing them here made `bits_v[v]` raise
+        # IndexError on the first k-eq-v layer whenever the v list was shorter than the k list.
+        # The v index is valid for the k list because both are derived from the same qparams
+        # ordering, so index the k list with v.
+        options_v, bits_v = options_k, bits_k
     options_o, bits_o = test_quant(module.o_proj, quantizers["o_proj"], qjobs[3])
 
     total_numel = module.q_proj.numel()
     total_numel += module.k_proj.numel()
-    total_numel += module.v_proj.numel()
+    if has_v:
+        total_numel += module.v_proj.numel()
     total_numel += module.o_proj.numel()
 
     max_accuracy = 0.0
@@ -167,13 +187,16 @@ def measure_attn(module, hidden_states, target_states, quantizers, cache, attn_p
 
         if q != q_: module.q_proj.linear.weight = nn.Parameter(options_q[q].weight.cuda())
         if k != k_: module.k_proj.linear.weight = nn.Parameter(options_k[k].weight.cuda())
-        if v != v_: module.v_proj.linear.weight = nn.Parameter(options_v[v].weight.cuda())
+        if has_v and v != v_: module.v_proj.linear.weight = nn.Parameter(options_v[v].weight.cuda())
         if o != o_: module.o_proj.linear.weight = nn.Parameter(options_o[o].weight.cuda())
         (q_, k_, v_, o_) = (q, k, v, o)
 
         total_bits = bits_q[q]
         total_bits += bits_k[k]
-        total_bits += bits_v[v]
+        # For k-eq-v layers V *is* K, so its bit cost is exactly K's. Use the k index here:
+        # the v index is only meaningful for the v option list, which does not exist on these
+        # layers and is not guaranteed to be the same length as the k list.
+        total_bits += bits_v[v] if has_v else bits_k[k]
         total_bits += bits_o[o]
         total_bpw = total_bits / total_numel
 
@@ -188,8 +211,11 @@ def measure_attn(module, hidden_states, target_states, quantizers, cache, attn_p
               "total_bits": total_bits,
               "q_proj": qjobs[0][q].get_dict(),
               "k_proj": qjobs[1][k].get_dict(),
-              "v_proj": qjobs[2][v].get_dict(),
               "o_proj": qjobs[3][o].get_dict() }
+        # No v_proj entry for attention_k_eq_v layers: V is K, so it inherits K's
+        # strategy. PLAN.md §2.5.
+        if has_v:
+            r["v_proj"] = qjobs[2][v].get_dict()
         results.append(r)
 
     if max_accuracy < 0.1:
@@ -365,7 +391,8 @@ def measure_moe_mlp(module, hidden_states, target_states, quantizers, cache, att
     return results
 
 
-def measure_parallel_decoder(module, hidden_states, target_states_attn, target_states_mlp, quantizers, cache, attn_params):
+def measure_parallel_decoder(module, hidden_states, target_states_attn, target_states_mlp, quantizers, cache, attn_params,
+                             primary_device = "cuda:0"):
 
     for i in range(len(hidden_states)):
         hidden_states[i] = hidden_states[i].cpu()
@@ -381,7 +408,7 @@ def measure_parallel_decoder(module, hidden_states, target_states_attn, target_s
     results_mlp = measure_mlp(module.mlp, hidden_states, target_states_mlp, quantizers, cache, attn_params, "q_proj")
 
     for i in range(len(hidden_states)):
-        hidden_states[i] = hidden_states[i].to("cuda:0")
+        hidden_states[i] = hidden_states[i].to(primary_device)
 
     r = { "attn": results_attn,
           "mlp": results_mlp }
@@ -405,6 +432,17 @@ def print_status_box(*content_lines):
     for line in content_lines:
         print(format_line(line, box_width))
     print('-' * box_width)
+
+def _clone_quantizers(quantizers):
+    """Fresh AdaptiveGPTQ accumulators for a replica shard, one per key."""
+    from exllamav2.conversion.adaptivegptq import AdaptiveGPTQ
+    out = {}
+    for k, q in quantizers.items():
+        nq = AdaptiveGPTQ(q.layer)
+        nq.hessian_device = q.hessian_device
+        out[k] = nq
+    return out
+
 
 @torch.inference_mode()
 def measure_quant(job, save_fn, model, hidden_state_offload_layers):
@@ -441,11 +479,18 @@ def measure_quant(job, save_fn, model, hidden_state_offload_layers):
     last_module_idx = job["last_module_idx"]  # resume tracking steps where it stopped previously
     remaining_steps = total_modules - last_module_idx  
 
+    # Devices this pass may use. The first is the primary and owns the module load; the rest are
+    # only used when calibration row sharding is enabled. quant-plan.md §6.5 (M3).
+    devices = resolve_devices(job.get("devices"))
+    if not devices: devices = [0]
+    primary_device = torch.device(devices[0])
+    primary_device_str = f"cuda:{devices[0]}"
+
     hidden_states = []
     with safe_open(states_filename, framework = "pt", device = "cpu") as f:
         for i, k in enumerate(sorted(f.keys())):
             t = f.get_tensor(k)
-            hidden_states.append(t.to("cuda:0") if i < hidden_state_offload_layers else t)
+            hidden_states.append(t.to(primary_device) if i < hidden_state_offload_layers else t)
 
     index = job["last_module_idx"]
     while True:
@@ -486,7 +531,10 @@ def measure_quant(job, save_fn, model, hidden_state_offload_layers):
             mode = "self_attn"
             quantizers["q_proj"] = AdaptiveGPTQ(module.q_proj.linear)
             quantizers["k_proj"] = AdaptiveGPTQ(module.k_proj.linear)
-            quantizers["v_proj"] = AdaptiveGPTQ(module.v_proj.linear)
+            # v_proj is None for attention_k_eq_v layers (Gemma-4 full attention).
+            # PLAN.md §2.5.
+            if module.v_proj is not None:
+                quantizers["v_proj"] = AdaptiveGPTQ(module.v_proj.linear)
             quantizers["o_proj"] = AdaptiveGPTQ(module.o_proj.linear)
 
         elif isinstance(module, ExLlamaV2MLP):
@@ -521,10 +569,22 @@ def measure_quant(job, save_fn, model, hidden_state_offload_layers):
         elif isinstance(module, ExLlamaV2RMSNorm) or isinstance(module, ExLlamaV2LayerNorm):
             mode = "norm"
 
+        elif isinstance(module, ExLlamaV2LayerScalar):
+            # 1-element pass-through tensor: no calibration, no Hessian.
+            # PLAN.md §2.6.
+            mode = "layer_scalar"
+
         elif isinstance(module, ExLlamaV2PosEmbedding):
             mode = "pos_emb"
 
         # Reference forward pass
+
+        # layer_scalar has no forward pass to run: it is a 1-element multiplier that
+        # compile.py copies through. Skip it entirely rather than trying to measure it.
+        if mode == "layer_scalar":
+            module.unload()
+            torch.cuda.empty_cache()
+            continue
 
         cache = None
         attn_params = ExLlamaV2Attention.Params(1, hidden_states[0].shape[1], 0, None, None) \
@@ -534,84 +594,176 @@ def measure_quant(job, save_fn, model, hidden_state_offload_layers):
         target_states_attn = []
         target_states_mlp = []
 
-        if mode == "block_sparse_moe":
-            uncalibrated_experts = [0 for _ in range(model.config.num_experts)]
+        uncalibrated_experts = [0 for _ in range(model.config.num_experts)] if mode == "block_sparse_moe" else None
 
-        for i in range(len(hidden_states)):
+        # The calibration row loop, factored out so it can be sharded across devices.
+        # ``active`` is the module to forward through: the loaded module for the primary
+        # shard, a replica for a secondary one. Returns (quantizers, target_states,
+        # target_states_attn, target_states_mlp) for exactly the given rows.
+        def run_rows(device_idx, active, rows):
 
-            x = hidden_states[i].to("cuda:0")
-            if torch.isnan(x).any():
-                print(" ## Measurement/inference error (2)")
-                os._exit(1)
-            if torch.isinf(x).any():
-                print(" ## Measurement/inference error (3)")
-                os._exit(1)
+            dev = torch.device(device_idx)
+            dev_str = f"cuda:{device_idx}"
 
-            outputs = module.forward(x, cache, attn_params, intermediates = True)
-            target_device = "cuda:0" if i < hidden_state_offload_layers else "cpu"
+            # ``active is None`` means "the primary shard, which is the module already loaded".
+            # shard_calibration_rows() passes None for the primary because it does not hold a
+            # reference to the module; without this the primary shard would get *cloned*
+            # quantizers and its Hessian contributions would never reach the real ones.
+            if active is None:
+                active = module
 
-            for k, v in outputs.items():
-                num_inf = torch.isinf(v).sum()
-                num_nan = torch.isnan(v).sum()
-                p_inf = num_inf / v.numel()
-                p_nan = num_nan / v.numel()
+            qz = quantizers if active is module else _clone_quantizers(quantizers)
+            ap = attn_params
+            ts, ts_attn, ts_mlp = [], [], []
+            ue_count = [0 for _ in range(model.config.num_experts)] if mode == "block_sparse_moe" else None
 
-                if num_nan:
-                    print(f" ## Measurement/inference error (2): {k}")
-                    print(f" ## NaN elements in output states row {i}: {num_nan} / {v.numel()} = {p_nan*100:.2f}%")
+            for i in rows:
+
+                x = hidden_states[i].to(dev)
+                if torch.isnan(x).any():
+                    print(" ## Measurement/inference error (2)")
                     os._exit(1)
-                if num_inf:
-                    if p_inf < 0.005:
-                        print(f" !! Measurement/inference warning (3): {k}")
-                        print(f" !! inf elements in output states row {i}: {num_inf} / {v.numel()} = {p_inf*100:.2f}%")
-                        print(f" !! clamping state")
-                        v.clamp_(-65504, 65504)
-                    else:
-                        print(f" ## Measurement/inference error (3): {k}")
-                        print(f" ## inf elements in output states row {i}: {num_inf} / {v.numel()} = {p_inf*100:.2f}%")
-                        print(f" ## Number of inf elements above threshold, aborting")
+                if torch.isinf(x).any():
+                    print(" ## Measurement/inference error (3)")
+                    os._exit(1)
+
+                outputs = active.forward(x, cache, attn_params, intermediates = True)
+                target_device = dev_str if i < hidden_state_offload_layers else "cpu"
+
+                for k, v in outputs.items():
+                    num_inf = torch.isinf(v).sum()
+                    num_nan = torch.isnan(v).sum()
+                    p_inf = num_inf / v.numel()
+                    p_nan = num_nan / v.numel()
+
+                    if num_nan:
+                        print(f" ## Measurement/inference error (2): {k}")
+                        print(f" ## NaN elements in output states row {i}: {num_nan} / {v.numel()} = {p_nan*100:.2f}%")
                         os._exit(1)
+                    if num_inf:
+                        if p_inf < 0.005:
+                            print(f" !! Measurement/inference warning (3): {k}")
+                            print(f" !! inf elements in output states row {i}: {num_inf} / {v.numel()} = {p_inf*100:.2f}%")
+                            print(f" !! clamping state")
+                            v.clamp_(-65504, 65504)
+                        else:
+                            print(f" ## Measurement/inference error (3): {k}")
+                            print(f" ## inf elements in output states row {i}: {num_inf} / {v.numel()} = {p_inf*100:.2f}%")
+                            print(f" ## Number of inf elements above threshold, aborting")
+                            os._exit(1)
 
-            # Hessians
+                # Hessians
 
-            if mode == "self_attn":
-                quantizers["q_proj"].add_batch(outputs["post_norm"])  # Reuse H for K and V
-                quantizers["o_proj"].add_batch(outputs["attn_output"])
-                target_states.append(outputs["hidden_states"].to(target_device))
+                if mode == "self_attn":
+                    qz["q_proj"].add_batch(outputs["post_norm"])  # Reuse H for K and V
+                    qz["o_proj"].add_batch(outputs["attn_output"])
+                    ts.append(outputs["hidden_states"].to(target_device))
 
-            if mode == "mlp":
-                quantizers["up_proj"].add_batch(outputs["post_norm"])  # Reuse H for gate_proj
-                quantizers["down_proj"].add_batch(outputs["pre_down"])
-                target_states.append(outputs["hidden_states"].to(target_device))
+                if mode == "mlp":
+                    qz["up_proj"].add_batch(outputs["post_norm"])  # Reuse H for gate_proj
+                    qz["down_proj"].add_batch(outputs["pre_down"])
+                    ts.append(outputs["hidden_states"].to(target_device))
 
-            if mode == "block_sparse_moe":
-                for j in range(model.config.num_experts):
-                    if f"pre_down.{j}" in outputs:
-                        if j == 0: quantizers[f"w1.{j}"].add_batch(outputs["post_norm"])
-                        quantizers[f"w2.{j}"].add_batch(outputs[f"pre_down.{j}"])
-                        if outputs[f"pre_down.{j}"].shape[0] < outputs["post_norm"].shape[0] / 10:
-                            uncalibrated_experts[j] += 1
-                    else:
-                        uncalibrated_experts[j] += 1
-                target_states.append(outputs["hidden_states"].to(target_device))
+                if mode == "block_sparse_moe":
+                    for j in range(model.config.num_experts):
+                        if f"pre_down.{j}" in outputs:
+                            if j == 0: qz[f"w1.{j}"].add_batch(outputs["post_norm"])
+                            qz[f"w2.{j}"].add_batch(outputs[f"pre_down.{j}"])
+                            if outputs[f"pre_down.{j}"].shape[0] < outputs["post_norm"].shape[0] / 10:
+                                ue_count[j] += 1
+                        else:
+                            ue_count[j] += 1
+                    ts.append(outputs["hidden_states"].to(target_device))
 
-            if mode == "parallel_decoder":
-                quantizers["q_proj"].add_batch(outputs["post_norm"])  # Reuse H for K, V, up_proj and gate_proj
-                quantizers["o_proj"].add_batch(outputs["attn_output"])
-                quantizers["down_proj"].add_batch(outputs["pre_down"])
-                hidden_states[i] = outputs["post_norm"]
-                target_states_attn.append(outputs["hidden_states_attn"].to(target_device))
-                target_states_mlp.append(outputs["hidden_states_mlp"].to(target_device))
-                target_states.append(outputs["hidden_states"].to(target_device))
+                if mode == "parallel_decoder":
+                    qz["q_proj"].add_batch(outputs["post_norm"])  # Reuse H for K, V, up_proj and gate_proj
+                    qz["o_proj"].add_batch(outputs["attn_output"])
+                    qz["down_proj"].add_batch(outputs["pre_down"])
+                    hidden_states[i] = outputs["post_norm"]
+                    ts_attn.append(outputs["hidden_states_attn"].to(target_device))
+                    ts_mlp.append(outputs["hidden_states_mlp"].to(target_device))
+                    ts.append(outputs["hidden_states"].to(target_device))
 
-            if mode == "pos_emb":
-                target_states.append(outputs["hidden_states"].to(target_device))
+                if mode == "pos_emb":
+                    ts.append(outputs["hidden_states"].to(target_device))
+
+            # NOTE: this return must be at the function body level, NOT inside the row loop.
+            # It was indented into the loop by the reindent that fixed the dedent bug, which
+            # made run_rows() return after the first row. shard_calibration_rows() then saw a
+            # 1-element target_states list and raised
+            #   IndexError: list index out of range
+            # at ordered[r] = ts_primary[i].
+            return qz, ts, ts_attn, ts_mlp, ue_count
+
+        # Row sharding (M3). Off by default: it needs one module replica per device, and a
+        # device that cannot hold one is dropped rather than allowed to OOM.
+        # quant-plan.md §6.5.
+        # NOTE: parallel_decoder is deliberately excluded. shard_calibration_rows() returns
+        # only (quantizers, target_states, ue_count) — it does not produce the
+        # hidden_states_attn / hidden_states_mlp split states that
+        # measure_parallel_decoder() requires, so sharding that mode would feed it None.
+        # Gemma-4 does not use parallel_decoder_blocks, but the guard is here so a future
+        # architecture that does cannot silently get a None target.
+        if job.get("calib_row_shards") and len(devices) > 1 and mode in ("self_attn", "mlp"):
+            from exllamav2.conversion.calib import (
+                shard_calibration_rows, ensure_device_contexts, module_replica_bytes, build_module_replica
+            )
+            ensure_device_contexts(model, devices)
+            need = module_replica_bytes(module)
+            replicas = []
+            for d in devices[1:]:
+                # Refuse to start a replica that cannot fit rather than letting it OOM mid-pass:
+                # an OOM here loses the whole calibration pass, not just one row.
+                free_b, _ = torch.cuda.mem_get_info(d)
+                if need and free_b < need * 1.10:
+                    print(f" !! No calibration replica on cuda:{d}: needs {need / 2**30:.1f} GiB, "
+                          f"{free_b / 2**30:.1f} GiB free")
+                    continue
+                try:
+                    # build_module_replica passes sliding_window / rope_index / MLP geometry
+                    # through. type(module)(model, key, layer_idx) does NOT: it silently gives a
+                    # sliding layer a full-attention replica reading the global rope table.
+                    r = build_module_replica(module, d)
+                    replicas.append(r)
+                except Exception as e:
+                    print(f" !! No calibration replica on cuda:{d}: {str(e).splitlines()[0][:120]}")
+            # The sharded path returns 3 values, not 5: it does not produce the
+            # attn/mlp split states. Bind them so the parallel_decoder call below cannot
+            # hit a NameError.
+            target_states_attn = None
+            target_states_mlp = None
+            try:
+                if replicas:
+                    quantizers, target_states, ue_count = shard_calibration_rows(
+                        hidden_states, replicas, devices, None, run_rows
+                    )
+                else:
+                    quantizers, target_states, _, _, ue_count = run_rows(
+                        devices[0], module, list(range(len(hidden_states)))
+                    )
+            finally:
+                # Free every replica before the next module loads. Without this each layer
+                # leaves a full copy of itself resident on the secondary device and the pass
+                # OOMs a few layers in.
+                for r in replicas:
+                    try:
+                        r.unload()
+                    except Exception:
+                        pass
+                del replicas
+                gc.collect()
+                for d in devices[1:]:
+                    with torch.cuda.device(d):
+                        torch.cuda.empty_cache()
+        else:
+            quantizers, target_states, target_states_attn, target_states_mlp, ue_count = \
+                run_rows(devices[0], module, list(range(len(hidden_states))))
 
         # For MoE layers, warn if any layer received less than 10% of a calibration batch
 
         if mode == "block_sparse_moe":
             for j in range(model.config.num_experts):
-                ue = uncalibrated_experts[j]
+                ue = ue_count[j]
                 if ue > len(hidden_states) * 0.20:
                     print(f" !! Warning: w2.{j} has less than 10% calibration for {ue}/{len(hidden_states)} rows")
 
@@ -629,7 +781,8 @@ def measure_quant(job, save_fn, model, hidden_state_offload_layers):
             m = measure_moe_mlp(module, hidden_states, target_states, quantizers, cache, attn_params)
 
         if mode == "parallel_decoder":
-            m = measure_parallel_decoder(module, hidden_states, target_states_attn, target_states_mlp, quantizers, cache, attn_params)
+            m = measure_parallel_decoder(module, hidden_states, target_states_attn, target_states_mlp, quantizers, cache, attn_params,
+                                         primary_device = primary_device_str)
             target_states_attn = None
             target_states_mlp = None
 

@@ -10,6 +10,7 @@ from exllamav2.model import \
     ExLlamaV2RMSNorm,
     ExLlamaV2LayerNorm
 )
+from exllamav2.layer_scalar import ExLlamaV2LayerScalar
 
 from exllamav2.version import __version__
 
@@ -38,6 +39,16 @@ def get_f_module(job, module):
     mod_dict = {}
     module.load()
     w = module.get_weight()
+
+    # Unweighted head norms (Gemma-4 `v_norm`) have no tensor to save at all.
+    if w is None:
+        return None
+
+    # Layer scalars are stored under their own name, not `<key>.weight`.
+    if isinstance(module, ExLlamaV2LayerScalar):
+        mod_dict[module.key] = w
+        return mod_dict
+
     if isinstance(w, tuple):
         mod_dict[module.key + ".weight"] = w[0]
         mod_dict[module.key + ".bias"] = w[1]
@@ -96,11 +107,16 @@ def compile_model(job, save_fn, model):
                 if d: out_dict.update(d); current_size += _dsize(d)
                 d = get_q_module(job, module.q_proj); out_dict.update(d); current_size += _dsize(d)
                 d = get_q_module(job, module.k_proj); out_dict.update(d); current_size += _dsize(d)
-                d = get_q_module(job, module.v_proj); out_dict.update(d); current_size += _dsize(d)
+                # v_proj is None for attention_k_eq_v layers (Gemma-4 full attention). PLAN.md §2.5.
+                if module.v_proj is not None:
+                    d = get_q_module(job, module.v_proj); out_dict.update(d); current_size += _dsize(d)
                 d = get_q_module(job, module.o_proj); out_dict.update(d); current_size += _dsize(d)
                 d = get_f_module(job, module.q_norm)
                 if d: out_dict.update(d); current_size += _dsize(d)
                 d = get_f_module(job, module.k_norm)
+                if d: out_dict.update(d); current_size += _dsize(d)
+                # Unweighted v_norm has no tensor; get_f_module returns None for it.
+                d = get_f_module(job, module.v_norm)
                 if d: out_dict.update(d); current_size += _dsize(d)
 
             if isinstance(module, ExLlamaV2MLP):
@@ -144,10 +160,21 @@ def compile_model(job, save_fn, model):
 
                 d = get_f_module(job, module); out_dict.update(d); current_size += _dsize(d)
 
+            if isinstance(module, ExLlamaV2LayerScalar):
+
+                # 1-element pass-through tensor, never quantized. PLAN.md §2.7.
+                d = get_f_module(job, module); out_dict.update(d); current_size += _dsize(d)
+
             if isinstance(module, ExLlamaV2Linear):
 
                 assert module.key == cfg.arch.lm_prefix + "lm_head"
-                d = get_q_module(job, module); out_dict.update(d); current_size += _dsize(d)
+                if job["head_bits"] == 16:
+                    # Head left unquantized: copy the fp16 tensor through instead of reading a
+                    # quantized shard that was never written. PLAN.md §2.7 step 3.
+                    d = get_f_module(job, module)
+                else:
+                    d = get_q_module(job, module)
+                out_dict.update(d); current_size += _dsize(d)
 
             index += 1
 
