@@ -69,6 +69,7 @@ setup_kwargs = (
                     "exllamav2/exllamav2_ext/cuda/layer_norm.cu",
                     "exllamav2/exllamav2_ext/cuda/rope.cu",
                     "exllamav2/exllamav2_ext/cuda/cache.cu",
+                    "exllamav2/exllamav2_ext/cuda/kv_write.cu",
                     "exllamav2/exllamav2_ext/cuda/util.cu",
                     "exllamav2/exllamav2_ext/cuda/softcap.cu",
                     "exllamav2/exllamav2_ext/cuda/tp.cu",
