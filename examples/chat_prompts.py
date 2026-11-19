@@ -30,6 +30,35 @@ class PromptFormat:
     def print_extra_newline(self):
         return False
 
+    #
+    # Reasoning / thinking support.
+    #
+    # Models that emit a separate reasoning channel delimit it with a pair of markers. exllamav3
+    # exposes this as `thinktag()` (see examples/chat_templates.py) and uses it to (a) enable
+    # reasoning by injecting the opener into the system turn approach and (b) split the model output
+    # into reasoning vs. answer for display.
+    #
+    # exllamav2's PromptFormat had no notion of this at all, so a reasoning model's chain of
+    # thought was printed inline as if it were the answer. The default is (None, None) so every
+    # existing format is unaffected.
+
+    def thinktag(self):
+        """
+        Return ``(open_tag, close_tag)`` for the reasoning channel, or ``(None, None)`` if the
+        format has no separate reasoning channel.
+        """
+        return None, None
+
+    def inject_thinktag(self):
+        """
+        Whether the opener must be injected into the prompt to turn reasoning on.
+
+        Some models (Gemma-4) only reason when ``<|think|>`` is present in the system turn; others
+        (Qwen-style) reason unless a closed `` think</think>`` pair is supplied. Formats that need
+        the explicit opener override this to return True.
+        """
+        return False
+
 
 class PromptFormat_raw(PromptFormat):
 
@@ -550,6 +579,88 @@ class PromptFormat_gemma(PromptFormat):
         return True
 
 
+class PromptFormat_gemma4(PromptFormat):
+    """
+    Gemma-4 chat format.
+
+    From ``exllamav3/architecture/gemma4.py:468`` ``default_chat_prompt``:
+
+        <bos><|turn>user\n{prompt}<turn|>\n<|turn>model\n
+
+    with an optional system turn prefix:
+
+        <bos><|turn>system\n{system_prompt}<turn|>\n
+
+    Note the delimiters differ from Gemma-2/3: ``<|turn>`` / ``<turn|>`` instead of
+    ``<start_of_turn>`` / ``<end_of_turn>``. PLAN.md §2.8.
+
+    Reasoning and tool calls
+    -----------------------
+    Gemma-4 supports both, and both are driven by special tokens declared in the checkpoint's
+    ``tokenizer_config.json``:
+
+    * reasoning is a separate channel, opened with ``<|channel>thought\\n`` and closed with
+      ``<channel|>``. It is only emitted when ``<|think|>`` appears in the system turn, which is
+      why ``inject_thinktag()`` returns True here.
+    * tool calls are emitted as ``<|tool_call>call:name{args}<tool_call|>``, and tool results are
+      fed back inside ``<|tool_response>...<tool_response|>``.
+
+    ``stop_conditions`` deliberately stops on ``<channel|>`` as well: without it the model runs
+    straight from its reasoning into the answer with no chance opportinity for the caller to render
+    the two separately.
+    """
+    description = "Gemma 4"
+
+    def __init__(self):
+        super().__init__()
+        pass
+
+    def default_system_prompt(self):
+        return ""
+
+    def thinktag(self):
+        # Matches exllamav3 examples/chat_templates.py:400 PromptFormat_gemma4.thinktag()
+        return "<|channel>thought\n", "<channel|>"
+
+    def inject_thinktag(self):
+        # Gemma-4 only reasons when <|think|> is present in the system turn.
+        return True
+
+    def first_prompt(self, sysprompt, think = False):
+        p = "<bos>"
+        if sysprompt or think:
+            p += "<|turn>system\n"
+            if think:
+                p += "<|think|>\n"
+            p += sysprompt + "<turn|>\n"
+        p += \
+            """<|turn>user\n""" + \
+            """<|user_prompt|><turn|>\n""" + \
+            """<|turn>model\n"""
+        return p
+
+    def subs_prompt(self):
+        return \
+            """<turn|>\n""" + \
+            """<bos><|turn>user\n""" + \
+            """<|user_prompt|><turn|>\n""" + \
+            """<|turn>model\n"""
+
+    def stop_conditions(self, tokenizer):
+        return \
+            [tokenizer.eos_token_id,
+             tokenizer.single_id("<turn|>"),
+             tokenizer.single_id("<|turn>"),
+             tokenizer.single_id("<channel|>"),
+             ]
+
+    def encoding_options(self):
+        return False, False, True
+
+    def print_extra_newline(self):
+        return True
+
+
 class PromptFormat_granite(PromptFormat):
     description = "Granite (code)"
 
@@ -733,6 +844,7 @@ prompt_formats = \
     "openchat": PromptFormat_openchat,
     "nous": PromptFormat_nous,
     "gemma": PromptFormat_gemma,
+    "gemma4": PromptFormat_gemma4,
     "cohere": PromptFormat_cohere,
     "phi3": PromptFormat_phi3,
     "granite": PromptFormat_granite,

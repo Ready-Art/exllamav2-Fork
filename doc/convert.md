@@ -161,4 +161,82 @@ about 16 GB of RAM and about 8 GB of VRAM.
 
 The deciding factor for the memory requirement is the *width* of the model rather than the depth, so 120B models that
 have the same hidden size as 70B models have the same hardware requirements. Mixtral 8x7B has much wider feed-forward
-layers so requires about 20 GB of VRAM.  
+layers so requires about 20 GB of VRAM.
+
+---
+
+## Multi-GPU quantization (ReadyArt fork)
+
+This fork can spread the conversion/quantization passes across several GPUs. Two mechanisms:
+
+1. **Device distribution (`-d`)** — independent tensors are placed on different devices during the
+   measurement and quantization passes. Tensors are *never split*; whole tensors are distributed.
+2. **Calibration-row sharding (`-crs on`)** — the calibration batch is split across devices, with one
+   module replica per device, so the (otherwise single-device) measurement pass runs in parallel.
+
+### Arguments
+
+- **-d / --devices *list***: Comma-separated CUDA device indices to use, e.g. `0,1`. Default: all
+  visible devices. **The first entry is the primary** and owns every Hessian inversion; the remaining
+  devices take independent tensors. Example: `-d 0,1` uses GPUs 0 and 1, with GPU 0 primary.
+
+- **-dr / --device_ratios *list***: Comma-separated relative throughput weights, one per device in
+  `-d`, e.g. `1,2` if the second card is about twice as fast. Default: learned from the measurement
+  pass (seeded by an architecture prior). Use this to balance work across heterogeneous GPUs.
+
+- **-crs / --calib_row_shards *on|off***: Shard calibration rows across the `-d` devices, one module
+  replica per device. **Off by default**: it needs enough VRAM for a replica on *each* device, and any
+  device that cannot hold one is dropped from the shard. Turn it on (`-crs on`) when each GPU has
+  headroom — it parallelizes the measurement pass, which is otherwise single-device and leaves the
+  other GPUs idle for the first half of the run.
+
+- **-ps / --pinned_staging *on|off***: Stage weights to the host through pinned memory on a side stream
+  instead of a synchronous pageable copy (default `on`). A single-GPU win; produces bit-identical output.
+
+- **-hb / --head_bits *int***: Bits for the `lm_head` (output) layer. Use **`16`** to leave the head
+  unquantized (fp16) — recommended for Gemma-4 (large 262k vocabulary). Default 6.
+
+### Example: Gemma-4-31B on two GPUs
+
+```sh
+python convert.py \
+    -i /mnt/models/gemma-4-31B-it \
+    -o /mnt/models/gemma-4-31b-exl2-6.0bpw-hb16 \
+    -cf /mnt/models/gemma-4-31b-exl2-6.0bpw-hb16 \
+    -b 6.0 -hb 16 \
+    -d 0,1 -crs on \
+    -l 2048 -r 100
+```
+
+A ready-made wrapper for this exact job is in [`scripts/remote_convert_2gpu_hb16.sh`](../scripts/remote_convert_2gpu_hb16.sh).
+
+Notes:
+- Without `-crs on`, the measurement pass is single-device (the primary); `-d` still distributes the
+  quantization of independent tensors. With `-crs on`, both passes use all listed devices.
+- The primary device (first in `-d`) does every Hessian inversion, so give it the most VRAM headroom.
+- Multi-GPU quantization changes *where* work runs, not the result: output is equivalent to the
+  single-device path for the same bitrate/calibration.
+
+## Running the converted model on multiple GPUs
+
+After conversion, run the EXL2 model tensor-parallel across GPUs (this is an **inference** feature,
+separate from the multi-GPU quantization above):
+
+- **Single-process TP** — `test_inference.py --gpu_split auto`, or in code:
+  ```python
+  model.load_tp([20, 20, 20, 20],                    # VRAM (GiB) per GPU
+                expect_cache_tokens=max_seq_len,
+                expect_cache_base=ExLlamaV2Cache_SWA)
+  cache = ExLlamaV2Cache_TP(model, base=ExLlamaV2Cache_SWA, max_seq_len=max_seq_len)
+  ```
+- **Multiprocess backend (MP)** — `exllamav2.tp_mp.TPProcessGroup` runs one worker process per GPU for
+  higher decode throughput. See the [README](../README.md) and [`mtp/`](../mtp/) benchmarks.
+- **MTP speculative decoding** works on both TP and MP via the Gemma-4 assistant drafter
+  (`ExLlamaV2StreamingGenerator(..., mtp_drafter=...)` or `MTPMPDriver`).
+
+Requirements for the TP/MP path:
+- **FlashInfer ≥ 0.7.4** is mandatory (`pip install "flashinfer-python>=0.7.4"` then
+  `flashinfer download-kernels`). It provides head_dim 512 decode on sm86 (RTX 3090).
+- For Gemma-4, use the **SWA ring cache** (`ExLlamaV2Cache_SWA` base) so sliding-layer K/V stays
+  bounded at long context; the TP cache wrapper is `ExLlamaV2Cache_TP`.
+- TP CUDA graphs are on by default (`EXL2_TP_GRAPHS=1`); set `EXL2_TP_GRAPHS=0` to disable for debugging.  
