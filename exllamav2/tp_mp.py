@@ -262,17 +262,25 @@ def _worker_kv_slice(ctx, layer_idx, start, end):
 
 
 def _clone_swa_ring(cache):
-    """Device-side copy of every SWA layer's ring (the ring-depth buffers)."""
+    """Device-side copy of every SWA layer's ring (the ring-depth buffers).
+
+    inference_mode: the cache buffers are inference tensors (allocated under
+    inference_mode at load); these helpers run OUTSIDE model.forward's
+    @torch.inference_mode() scope (prompt-cache decision block), where inplace
+    ops on inference tensors raise. Nesting the mode is reentrant-safe."""
     ring = cache.kv_state_size
-    return {l: (cache.key_states[l].detach().clone(), cache.value_states[l].detach().clone())
-            for l in range(len(cache.key_states))
-            if cache.key_states[l].shape[1] == ring}
+    with torch.inference_mode():
+        return {l: (cache.key_states[l].detach().clone(),
+                    cache.value_states[l].detach().clone())
+                for l in range(len(cache.key_states))
+                if cache.key_states[l].shape[1] == ring}
 
 
 def _restore_swa_ring(cache, backup, seq, wb):
-    for l, (k, v) in backup.items():
-        cache.key_states[l].copy_(k)
-        cache.value_states[l].copy_(v)
+    with torch.inference_mode():
+        for l, (k, v) in backup.items():
+            cache.key_states[l].copy_(k)
+            cache.value_states[l].copy_(v)
     cache.current_seq_len = seq
     cache.window_beg = wb
 
