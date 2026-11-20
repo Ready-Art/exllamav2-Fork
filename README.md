@@ -34,6 +34,34 @@ architectures are untested here — treat them as experimental and verify correc
 
 ---
 
+## Development focus & testing environment
+
+> **The majority of the development effort has gone into the MP + CUDA graphs + MTP path** —
+> multiprocess tensor parallelism (one worker per GPU), whole-step TP CUDA graphs, and Gemma-4
+> MTP speculative decoding. This includes a custom **PCIe P2P collective kernel** that replaces
+> NCCL for the small decode/verify all-gathers and all-reduces, which is where most of the
+> recent performance work has landed.
+
+- **Tested hardware:** **4× RTX 3090 (sm86) on a PCI switch with P2P enabled**
+  (`NCCL_P2P_LEVEL=PXB`), no NVLink. The P2P collective path and the performance numbers in this
+  README are validated on exactly this topology.
+- **Other configurations work, but they are not the priority.** Single-process TP (`sp`), the
+  `native` paged backend, non-MTP decoding, other GPU architectures, and other model families are
+  functional, but they receive far less optimization effort and **will not match the performance
+  of the MP + CUDA graphs + MTP path** on the tested rig. Treat them as secondary paths.
+- Only **Gemma-4-31B-IT** has been built and tested end-to-end (see [Release status](#release-status--alphabeta-proof-of-concept)).
+
+## Feedback & contributions
+
+- **Want a change?** Open a [GitHub issue](https://github.com/Ready-Art/exllamav2-Fork/issues) —
+  bug reports, feature requests, and performance observations are all welcome. Describe what you
+  want to see changed and, for perf reports, your hardware/topology and the numbers you measured.
+- **Pull requests are welcome.** If you'd like to contribute code, open a
+  [PR](https://github.com/Ready-Art/exllamav2-Fork/pulls) against the `ReadyArt` branch with a clear
+  description of what you're changing and why.
+
+---
+
 ## What this fork adds
 
 | Feature | What it gives you |
@@ -50,7 +78,8 @@ architectures are untested here — treat them as experimental and verify correc
 ## Requirements
 
 - **Built and tested on SM86 (Ampere — NVIDIA RTX 3090).** This fork is developed and validated
-  on the Ampere `sm_86` architecture (4× RTX 3090); other architectures may work but are untested.
+  on the Ampere `sm_86` architecture — **4× RTX 3090 on a PCI switch with P2P enabled**
+  (`NCCL_P2P_LEVEL=PXB`), no NVLink. Other architectures may work but are untested.
   The bundled kernel build targets `TORCH_CUDA_ARCH_LIST="8.6"`.
 - **Python 3.12** and a CUDA build of [PyTorch](https://pytorch.org/get-started/locally/).
   Tested combination: **Python 3.12.15, torch 2.15.0+cu132**, CUDA toolkit 13.x with `nvcc` on
@@ -155,12 +184,14 @@ gen.begin_stream(input_ids, settings, token_healing=True)
 ```
 
 For the MP backend use `MTPMPDriver` (`exllamav2/mtp_mp.py`); runnable benchmarks and examples
-are in [`mtp/`](mtp/). Every emitted token is sampled from the **target's** verified logits.
-Under sampling, a token that deviates from the cached draft/bonus token triggers a
-rewind-and-recommit of the cache (BUG 100 fix), so the K/V cache can never desync from the
-emitted text and the output distribution stays exactly target-autoregressive. Greedy MTP
-matches plain autoregressive generation except for rare fp16 near-tie flips between the
-verify-window and single-token decode attention kernels on long prose.
+are in [`mtp/`](mtp/). Every emitted token is sampled from the **target's** verified logits, so
+the output distribution stays exactly target-autoregressive on both backends. On **SP**, a sampled
+token that deviates from the cached draft/bonus token triggers a rewind-and-recommit of the cache
+(BUG 100 fix) so the K/V can never desync from the emitted text. On **MP**, sampling uses
+**probabilistic speculative acceptance** (BUG 105) — accepted drafts are kept with the correct
+target probability and deviating tokens are resampled from the target's residual distribution,
+avoiding the SP recommit cost. Greedy MTP matches plain autoregressive generation except for rare
+fp16 near-tie flips between the verify-window and single-token decode attention kernels on long prose.
 
 ## Gemma-4-31B-IT
 
@@ -201,7 +232,7 @@ OpenAI-compatible API with:
 - `tensor_parallel_backend: sp` (single-process TP) or `mp` (one worker per GPU),
 - MTP drafting via `draft_model.draft_mode: mtp` + the
   [gemma-4-31B-it-assistant](https://huggingface.co/google/gemma-4-31B-it-assistant) drafter
-  (greedy requests on MP; full sampler on SP),
+  (full sampler on both SP and MP),
 - TP CUDA graphs (`tp_graphs`) and FlashInfer controls,
 - Gemma-4 **thinking** (thought-channel `reasoning_content`) and **tool calls** (`gemma4` tool
   format), plus `reasoning_effort` on chat completions.
@@ -226,12 +257,19 @@ requirements, and how to run the converted model tensor-parallel.
 > Early proof-of-concept numbers — **below the target**, not a tuned result (see
 > [Release status](#release-status--alphabeta-proof-of-concept)). Shared for transparency.
 
-Measured on 4× RTX 3090 (sm86, PCIe), Gemma-4-31B EXL2 6.0 bpw, greedy:
+Measured on **4× RTX 3090 (sm86) on a PCI switch with P2P enabled** (`NCCL_P2P_LEVEL=PXB`),
+Gemma-4-31B EXL2 6.0 bpw, greedy:
 
 | Mode | 4k context | counting prompt |
 |---|---:|---:|
 | Plain decode (MP) | ~39 tok/s | ~40 tok/s |
 | **MTP (MP)** | **~40 tok/s** | **~53 tok/s (≈1.35×)** |
+
+The MP decode/verify path now uses a custom **in-graph PCIe P2P collective kernel** for the small
+all-gathers/all-reduces (replacing NCCL's per-op latency on this no-NVLink topology). Recent
+long-context measurements on the same rig: **plain decode ~28.9 tok/s at 122k context**, **MTP
+~55 tok/s at ~1.3k context**, and a **64k-token prefill in ~97 s** (`EXL2_TP_O_RS=1`, the default).
+These are still proof-of-concept numbers with headroom remaining (see Release status).
 
 MTP acceptance ≈ 2.7 tokens/round on mixed prose, ≈ 3.9 on structured prompts, up to 5–6 on
 arithmetic. Speedups scale with acceptance; long-context (32k/64k) MTP also matches or beats plain
@@ -241,12 +279,14 @@ measured through TabbyAPI) — the per-round fixed costs (worker-pipe K/V gather
 and the torch hd512 verify-window attention) dominate when there is little context to amortize
 them over. Reducing those round costs is the main MTP optimization target.
 
-**Sampling caveat:** the numbers above are greedy. Under sampling (e.g. temperature 1.0), every
-deviation from the drafted tokens costs a rewind + recommit forward (the BUG 100 correctness
+**Sampling caveat:** the numbers above are greedy. On **SP**, under sampling (e.g. temperature 1.0)
+every deviation from the drafted tokens costs a rewind + recommit forward (the BUG 100 correctness
 fix), so MTP throughput drops toward — or below — plain decode at short context (~12 vs ~19 tok/s
-SP measured at temp 1.0 / top_p 0.92). MTP's speedup is concentrated in greedy / low-temperature
-/ structured generation where acceptance is high; probabilistic speculative acceptance to recover
-sampling throughput is future work.
+SP measured at temp 1.0 / top_p 0.92). On **MP**, sampling now uses **probabilistic speculative
+acceptance** (BUG 105), which keeps accepted drafts at the correct target probability and resamples
+deviations from the target's residual distribution — recovering sampling throughput without the SP
+recommit cost. MTP's speedup is still largest on greedy / low-temperature / structured generation
+where acceptance is high.
 
 ## Upstream features
 
