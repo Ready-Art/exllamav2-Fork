@@ -43,6 +43,7 @@ architectures are untested here — treat them as experimental and verify correc
 | **MTP speculative decoding** | A Gemma-4 *assistant* drafter proposes a window of tokens; the target verifies them in one forward. Works **with TP and MP**, greedy **and sampled** (probabilistic speculative acceptance — the output distribution is exactly target-autoregressive at any temperature). The MP driver eliminates the separate bonus-token forward: the bonus becomes row 0 of the next verify window, so a round costs **one** target forward. |
 | **Sequence-parallel residual (MP)** | The residual stream lives as a per-rank hidden shard (`EXL2_TP_SEQPAR`, default on): sharded post-norms with a tiny cross-rank RMS-stat all-reduce, column-parallel output projections whose shard *is* the next residual shard. Cuts collective volume vs replicated-residual TP — the win is prefill and long context. |
 | **Long-prompt prefill** | head_dim-512 prefill runs on the **cuDNN fused engine** (probed at load, automatic FlashInfer-fa2 fallback) with persistent per-geometry wrappers — one plan per chunk instead of one per layer. Sliding layers use FlashInfer's windowed kernel. Long prompts no longer crawl (the old fa2 hd512 prefill kernel scaled linearly with context at a fraction of tensor-core peak). |
+| **Prompt caching (MP MTP)** | Chat continuations never re-prefill the conversation: append-only K/V reuse for extending prompts, plus an exact **SWA-ring snapshot/restore** at each prompt boundary (`TPProcessGroup.snapshot_prompt_ring` / `restore_prompt_ring`) for clients that re-render history differently (e.g. strip thought channels). From the second reply on, only the last rendered turn + the new message is prefilled — a constant tail at any conversation length. One ~262 MB/GPU ring backup (Gemma-4, 4-way split). |
 | **Gemma-4-31B-IT support** | Text-only. Handles the model's two attention geometries (head_dim 256 sliding / 512 full), `k_eq_v` layers, proportional RoPE and per-layer norms. |
 | **Sliding-window + TP KV cache** | `ExLlamaV2Cache_SWA` / `ExLlamaV2Cache_TP`: ring buffers for sliding layers make long context fit (≈22.5 GB instead of ≈236 GB at 256k for Gemma-4-31B). |
 | **TP CUDA graphs** | Whole-step decode graphs (`tp_graph`) remove per-op launch latency on the tensor-parallel path. |
@@ -173,6 +174,18 @@ the verify CUDA graph). The drafter seeds from the last committed token's state.
 forward per round instead of two. `EXL2_MTP_BONUS_ELIM=0` restores the legacy two-forward
 protocol.
 
+**Prompt caching across requests (MP):** the K/V cache survives between jobs. Prompts that
+strictly extend the cached sequence prefill only the new suffix (a few-token mid-round tail
+is trimmed with a distributed rewind — safe because the SWA ring still holds every retained
+position). When a client re-renders the generated history differently — e.g. stripping the
+thought channel from assistant turns — the divergence lands at the previous prompt's end;
+`TPProcessGroup.restore_prompt_ring()` copies back an exact SWA-ring snapshot taken at that
+boundary and rewinds all ranks, so only the re-rendered tail is prefilled. The snapshot is
+refreshed at every prompt boundary (~262 MB/GPU for Gemma-4 on 4 GPUs), making the per-reply
+prefill a constant size regardless of conversation length. Edited prompts that diverge
+earlier fall back to a full reset + re-prefill. See the TabbyAPI fork docs for the API-level
+behavior and log markers.
+
 ## Gemma-4-31B-IT
 
 Pre-quantized EXL2 weights ready to run with this fork (6.0 bpw, fp16 head):
@@ -244,9 +257,13 @@ Measured on 4× RTX 3090 (sm86, PCIe), Gemma-4-31B EXL2 6.0 bpw:
 | Mode | Context | Throughput |
 |---|---|---:|
 | **MTP (MP), temp 1.0 / top_p 0.92, window 3** | ~1.3k | **~40 tok/s** |
+| **MTP (MP), temp 1.0, window 3** | **~75k** | **~40 tok/s** |
 | MTP (MP), greedy | 4k | ~40 tok/s |
 | MTP (MP), greedy, counting prompt | 4k | ~53 tok/s (≈1.35× plain) |
 | Plain decode (MP), greedy | 4k | ~39 tok/s |
+
+Prompt processing measures ~650 tok/s on a 75k prompt (cuDNN hd512 prefill);
+with the prompt cache, every reply after the first prefills only the new turn.
 
 Sampled MTP is practical: probabilistic speculative acceptance (no resync forwards) plus the
 bonus-forward-eliminated round protocol bring temperature-1.0 generation to ~40 tok/s at ~1.3k
