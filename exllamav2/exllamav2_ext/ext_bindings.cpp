@@ -21,6 +21,7 @@
 #include "ext_rope.h"
 #include "ext_element.h"
 #include "ext_tp.h"
+#include "ext_prefill.h"
 
 #include "cuda/cache.cuh"
 
@@ -59,6 +60,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("make_q_matrix", &make_q_matrix, "make_q_matrix");
     m.def("make_q_matrix_split", &make_q_matrix_split, "make_q_matrix_split");
     m.def("free_q_matrix", &free_q_matrix, "free_q_matrix");
+    m.def("prefill_hd512", &prefill_hd512, "prefill_hd512");
     m.def("reconstruct", &reconstruct, "reconstruct");
     m.def("gemm_half_q_half", &gemm_half_q_half, "gemm_half_q_half");
     m.def("gemm_half_q_half_tp", &gemm_half_q_half_tp, "gemm_half_q_half_tp");

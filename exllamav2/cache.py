@@ -382,7 +382,15 @@ class ExLlamaV2Cache_SWA(ExLlamaV2Cache):
 
         overp = cfg.sliding_window_overp
         if overp is None:
-            overp = 2 * page_size
+            # The ring must hold the sliding window PLUS a full prefill chunk: the chunk
+            # loop shifts the ring so the new chunk fits, and after the shift the retained
+            # prefix is ring - chunk. With overp < chunk that prefix is shorter than the
+            # window, silently truncating SWA attention for the first (window - prefix)
+            # rows of every chunk (chunk_size == ring was the worst case: NO prefix at
+            # all). Default overp = max_input_len keeps the full window for every row at
+            # the configured chunk size; model.forward additionally caps the chunk at
+            # ring - window + 1 so an explicit small overp can never truncate.
+            overp = max(2 * page_size, cfg.max_input_len)
         self.sliding_window_overp = overp
 
         # Ring size, rounded up to a whole number of pages. This is required: the shift must move a

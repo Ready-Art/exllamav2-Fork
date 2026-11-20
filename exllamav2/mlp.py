@@ -497,6 +497,19 @@ class ExLlamaV2MLP(ExLlamaV2Module):
             # output.clamp_(min = -65504.0, max = 65504.0)
             outputs.append(output)
 
+        if ctx.seqpar and getattr(self, "_down_rs_row", False):
+            # Row-parallel down_proj: this rank's activation shard IS its input slice, so
+            # the GEMM runs locally (no intermediate allgather -- that moved 4x the bytes
+            # of the reduce-scatter which replaces it). The full-hidden partial sums are
+            # reduce-scattered on the RS split straight into the residual shard.
+            partial = self.down_proj.forward(outputs[0], loras = loras)
+            out_shard = ctx.reduce_scatter_hidden(partial)
+            if self.post_layernorm is not None:
+                out_shard = self.post_layernorm.forward_tp_sharded(out_shard)
+            if self.has_residual:
+                out_shard = out_shard + residual
+            return out_shard.view(batch_size, q_len, out_shard.shape[-1])
+
         outputs = self.model.tp_context.allgather(1, outputs, BROADCAST_ID, BROADCAST_ID)
 
         down = self.down_proj.forward_tp(outputs, output_split = True)
@@ -719,7 +732,23 @@ class ExLlamaV2MLP(ExLlamaV2Module):
                 self.post_layernorm.tp_load_rank(rank, BROADCAST_RS)
 
         # down_proj first: it yields the permutation that gate/up must be remapped with.
-        down_perm = self.down_proj.tp_load_rank(rank, BROADCAST_RS, unmap = True)
+        #
+        # Seqpar: ROW-parallel on the ID split. gate/up's output shard (rows, inter/world)
+        # is exactly this rank's down_proj input slice -- the unmap remap bakes down's
+        # q_perm into gate/up's outputs, so the row GEMM needs no permutation (BUG 113
+        # does not apply here). forward_tp_old then reduce-scatters the full-hidden
+        # partial to the residual shard instead of allgathering the full intermediate
+        # (4x the bytes). OPT-IN (EXL2_TP_DOWN_RS=1): default OFF while the row-shard
+        # path is under suspicion for the long-context repetition salad (debug5.txt /
+        # bugfix.md -- both runs had it ON by default; the confirmed-good f0a27e8 state
+        # used column-parallel + allgather). Default OFF restores that verified layout;
+        # =1 re-enables the reduce-scatter win for A/B once correctness is re-confirmed.
+        self._down_rs_row = False
+        if self.model.tp_context.seqpar and os.environ.get("EXL2_TP_DOWN_RS", "0") != "0":
+            down_perm = self.down_proj.tp_load_rank_row(rank, BROADCAST_ID, BROADCAST_RS)
+            self._down_rs_row = True
+        else:
+            down_perm = self.down_proj.tp_load_rank(rank, BROADCAST_RS, unmap = True)
 
         if self.gate_proj is not None:
             self.gate_proj.tp_load_rank(rank, BROADCAST_ID, output_map = down_perm)

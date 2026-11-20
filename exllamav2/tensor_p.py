@@ -19,6 +19,42 @@ BROADCAST_RS = 3
 BROADCAST_Q = 4
 
 
+# Prefill cost attribution (EXL2_PREFILL_TRACE): CUDA-event pairs recorded around the
+# large rank-mode collectives, drained once per chunk by model.forward's trace print.
+# Events are only queued (no host sync here); the drain synchronizes once at the chunk
+# boundary, which the chunk loop already pays implicitly. Gated to eager multi-row
+# forwards so graph capture/replay never sees an event alloc.
+_PREFILL_TRACE = os.environ.get("EXL2_PREFILL_TRACE", "1") != "0"
+_coll_events: list = []
+
+
+class _CollTimer:
+    def __init__(self, on: bool):
+        self.on = on
+
+    def __enter__(self):
+        if self.on:
+            self.s = torch.cuda.Event(enable_timing = True)
+            self.e = torch.cuda.Event(enable_timing = True)
+            self.s.record()
+        return self
+
+    def __exit__(self, *exc):
+        if self.on:
+            self.e.record()
+            _coll_events.append((self.s, self.e))
+        return False
+
+
+def prefill_trace_coll_ms() -> float:
+    if not _coll_events:
+        return 0.0
+    torch.cuda.synchronize()
+    ms = sum(s.elapsed_time(e) for s, e in _coll_events)
+    _coll_events.clear()
+    return ms
+
+
 def tp_reuse_buffers(cache: dict, specs: list, key_rows: bool = False):
     """
     Return reusable output buffers for a TP module.
@@ -231,47 +267,54 @@ class TPContext:
         if depth % page != 0 or kv_len < 1 or kv_len > depth:
             return False
 
+        # BUG 114: EVERYTHING that touches the fixed metadata buffers -- creation,
+        # the per-step scalar writes, and plan() (which reads them back to host) --
+        # must run on the SAME stream. The old code created/wrote them on the caller's
+        # (legacy default) stream and planned on the non-blocking TP stream: the legacy
+        # default stream does not synchronize with non-blocking streams, so plan's D2H
+        # readback raced the init/metadata H2D writes and read uninitialized memory
+        # (garbage indptr -> scheduler asserts / graph-mode row-count errors, debug30.txt).
         entry = self.fi_decode.get(key)
-        if entry is None:
-            workspace = attn_backend.FlashInferPaged._get_workspace(torch.device("cuda", dev))
-            npages = depth // page
-            # BUG 103 (proper fix): use FlashInfer's native CUDA-graph mode. In non-graph
-            # mode plan() reallocates internal metadata/split-KV buffers as kv_len changes,
-            # staling the addresses a captured graph run() holds (variable-onset garbage at
-            # long context). use_cuda_graph=True freezes those buffers: plan() copies the
-            # dynamic indptr/indices/last_page_len into the fixed buffers below instead of
-            # reallocating, and split-KV intermediates stay in the fixed workspace. This
-            # keeps split-KV parallelism (full hd512 decode speed) AND graph-safe addresses.
-            # backend="fa2" is explicit: under cuda graphs "auto" resolves to cuDNN, which
-            # is not the verified hd512/sm86 path. batch=1 / q_len=1 are fixed for decode.
-            indices = torch.arange(npages, dtype = torch.int32, device = dev)
-            indptr = torch.zeros(2, dtype = torch.int32, device = dev)
-            last_page_len = torch.zeros(1, dtype = torch.int32, device = dev)
-            entry = {
-                "wrapper": flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-                    workspace, "NHD",
-                    use_cuda_graph = True,
-                    backend = "fa2",
-                    paged_kv_indptr_buffer = indptr,
-                    paged_kv_indices_buffer = indices,
-                    paged_kv_last_page_len_buffer = last_page_len,
-                ),
-                "npages": npages,
-                "indices": indices,
-                "indptr": indptr,
-                "last_page_len": last_page_len,
-            }
-            self.fi_decode[key] = entry
-
-        pages_valid = (kv_len + page - 1) // page
-        entry["indptr"][1] = pages_valid
-        entry["last_page_len"][0] = kv_len - (pages_valid - 1) * page
-
         prev_dev = torch.cuda.current_device()
         prev_stream = torch.cuda.current_stream(dev)
         torch.cuda.set_device(dev)
         torch.cuda.set_stream(self.streams_dev[dev])
         try:
+            if entry is None:
+                workspace = attn_backend.FlashInferPaged._get_workspace(torch.device("cuda", dev))
+                npages = depth // page
+                # BUG 103 (proper fix): use FlashInfer's native CUDA-graph mode. In non-graph
+                # mode plan() reallocates internal metadata/split-KV buffers as kv_len changes,
+                # staling the addresses a captured graph run() holds (variable-onset garbage at
+                # long context). use_cuda_graph=True freezes those buffers: plan() copies the
+                # dynamic indptr/indices/last_page_len into the fixed buffers below instead of
+                # reallocating, and split-KV intermediates stay in the fixed workspace. This
+                # keeps split-KV parallelism (full hd512 decode speed) AND graph-safe addresses.
+                # backend="fa2" is explicit: under cuda graphs "auto" resolves to cuDNN, which
+                # is not the verified hd512/sm86 path. batch=1 / q_len=1 are fixed for decode.
+                indices = torch.arange(npages, dtype = torch.int32, device = dev)
+                indptr = torch.zeros(2, dtype = torch.int32, device = dev)
+                last_page_len = torch.zeros(1, dtype = torch.int32, device = dev)
+                entry = {
+                    "wrapper": flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+                        workspace, "NHD",
+                        use_cuda_graph = True,
+                        backend = "fa2",
+                        paged_kv_indptr_buffer = indptr,
+                        paged_kv_indices_buffer = indices,
+                        paged_kv_last_page_len_buffer = last_page_len,
+                    ),
+                    "npages": npages,
+                    "indices": indices,
+                    "indptr": indptr,
+                    "last_page_len": last_page_len,
+                }
+                self.fi_decode[key] = entry
+
+            pages_valid = (kv_len + page - 1) // page
+            entry["indptr"][1] = pages_valid
+            entry["last_page_len"][0] = kv_len - (pages_valid - 1) * page
+
             entry["wrapper"].plan(
                 indptr = entry["indptr"],
                 indices = entry["indices"],
@@ -333,45 +376,50 @@ class TPContext:
         if depth % page != 0 or kv_len < 1 or kv_len > depth or q_len < 1:
             return False
 
+        # BUG 114: same-stream contract as fi_decode_plan -- buffer creation, the
+        # per-step scalar writes and plan()'s host readback all run on the TP stream.
+        # Creating/writing on the caller's legacy default stream while planning on the
+        # non-blocking TP stream let plan read uninitialized indptr memory (debug30.txt:
+        # garbage qo_indptr/kv_indptr, "rows ... cannot exceed ... initialization 3").
         entry = self.fi_prefill.get(key)
-        if entry is None:
-            workspace = attn_backend.FlashInferPaged._get_workspace(torch.device("cuda", dev))
-            npages = depth // page
-            # use_cuda_graph=True + backend="fa2": plan() refreshes the FA2 scheduling
-            # metadata in fixed buffers (the BUG 103 decode fix), so a captured run()
-            # replays correctly as kv_len grows. "auto" would resolve to cuDNN under
-            # graphs, which is not the verified hd512/sm86 path. batch=1, q_len fixed.
-            qo_indptr = torch.tensor([0, q_len], dtype = torch.int32, device = dev)
-            indices = torch.arange(npages, dtype = torch.int32, device = dev)
-            indptr = torch.zeros(2, dtype = torch.int32, device = dev)
-            last_page_len = torch.zeros(1, dtype = torch.int32, device = dev)
-            entry = {
-                "wrapper": flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-                    workspace, "NHD",
-                    use_cuda_graph = True,
-                    backend = "fa2",
-                    qo_indptr_buf = qo_indptr,
-                    paged_kv_indptr_buf = indptr,
-                    paged_kv_indices_buf = indices,
-                    paged_kv_last_page_len_buf = last_page_len,
-                ),
-                "npages": npages,
-                "qo_indptr": qo_indptr,
-                "indices": indices,
-                "indptr": indptr,
-                "last_page_len": last_page_len,
-            }
-            self.fi_prefill[key] = entry
-
-        pages_valid = (kv_len + page - 1) // page
-        entry["indptr"][1] = pages_valid
-        entry["last_page_len"][0] = kv_len - (pages_valid - 1) * page
-
         prev_dev = torch.cuda.current_device()
         prev_stream = torch.cuda.current_stream(dev)
         torch.cuda.set_device(dev)
         torch.cuda.set_stream(self.streams_dev[dev])
         try:
+            if entry is None:
+                workspace = attn_backend.FlashInferPaged._get_workspace(torch.device("cuda", dev))
+                npages = depth // page
+                # use_cuda_graph=True + backend="fa2": plan() refreshes the FA2 scheduling
+                # metadata in fixed buffers (the BUG 103 decode fix), so a captured run()
+                # replays correctly as kv_len grows. "auto" would resolve to cuDNN under
+                # graphs, which is not the verified hd512/sm86 path. batch=1, q_len fixed.
+                qo_indptr = torch.tensor([0, q_len], dtype = torch.int32, device = dev)
+                indices = torch.arange(npages, dtype = torch.int32, device = dev)
+                indptr = torch.zeros(2, dtype = torch.int32, device = dev)
+                last_page_len = torch.zeros(1, dtype = torch.int32, device = dev)
+                entry = {
+                    "wrapper": flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                        workspace, "NHD",
+                        use_cuda_graph = True,
+                        backend = "fa2",
+                        qo_indptr_buf = qo_indptr,
+                        paged_kv_indptr_buf = indptr,
+                        paged_kv_indices_buf = indices,
+                        paged_kv_last_page_len_buf = last_page_len,
+                    ),
+                    "npages": npages,
+                    "qo_indptr": qo_indptr,
+                    "indices": indices,
+                    "indptr": indptr,
+                    "last_page_len": last_page_len,
+                }
+                self.fi_prefill[key] = entry
+
+            pages_valid = (kv_len + page - 1) // page
+            entry["indptr"][1] = pages_valid
+            entry["last_page_len"][0] = kv_len - (pages_valid - 1) * page
+
             entry["wrapper"].plan(
                 qo_indptr = entry["qo_indptr"],
                 paged_kv_indptr = entry["indptr"],
@@ -478,7 +526,9 @@ class TPContext:
         _page = 128
         _overp = getattr(cfg, "sliding_window_overp", None)
         if _overp is None:
-            _overp = 2 * _page
+            # Keep in sync with ExLlamaV2Cache_SWA: the ring must hold the sliding window
+            # PLUS a full prefill chunk, or the chunk loop's shift drops the window prefix.
+            _overp = max(2 * _page, cfg.max_input_len)
         _ring = (((_sw + _overp) + _page - 1) // _page) * _page if _sw else 0
 
         kv_elements = 0
@@ -1136,7 +1186,8 @@ class TPContext:
             if local.data_ptr() >= out.data_ptr() and \
                local.data_ptr() < out.data_ptr() + out.numel() * out.element_size():
                 local = local.clone()
-            dist.all_gather(parts[i], local)
+            with _CollTimer(_PREFILL_TRACE and rows > 32 and not self.graph_mode):
+                dist.all_gather(parts[i], local)
             for r in range(world):
                 out[:, r * w:(r + 1) * w].copy_(parts[i][r])
             return out
@@ -1154,7 +1205,8 @@ class TPContext:
             padded, parts = ent
         padded.zero_()
         padded[:, :local.shape[1]] = local
-        dist.all_gather(parts, padded)
+        with _CollTimer(_PREFILL_TRACE and rows > 32 and not self.graph_mode):
+            dist.all_gather(parts, padded)
         trimmed = [parts[d][:, :widths[d]] for d in range(world) if widths[d] > 0]
         return torch.cat(trimmed, dim = 1)
 
@@ -1189,6 +1241,48 @@ class TPContext:
             x2 = x2.contiguous()
         full = self._gather_nccl(x2, BROADCAST_RS, 1, tag = 2)
         return full.view(*shape[:-1], full.shape[-1])
+
+    def reduce_scatter_hidden(self, partial: torch.Tensor) -> torch.Tensor:
+        """
+        Sequence-parallel row-parallel reduction: sum full-width partial outputs across
+        ranks and return this rank's residual (RS) shard.
+
+        ``partial`` is (rows, hidden_size) -- the partial sum a row-parallel projection
+        (down_proj / o_proj) produced from this rank's input shard. The RS split partitions
+        the hidden dim, so the reduce-scatter runs on the TRANSPOSED (hidden, rows) view:
+        reduce_scatter_tensor splits dim 0, which must be the hidden dim. The two transpose
+        copies move rows*hidden*2 bytes at HBM speed (~0.02 ms at prefill shapes), against
+        the PCIe collective they enable.
+
+        Volume: (world-1)/world * rows*hidden*2 per rank -- 4x less than allgathering the
+        intermediate activations (width 4*hidden) that the column-parallel down_proj needs.
+
+        Uneven RS splits (gpu_split-derived ranges are not always equal) fall back to
+        all_reduce + local slice: still less volume than the intermediate allgather, and
+        always aligned with get_split_full(BROADCAST_RS).
+
+        Graph-capturable: NCCL reduce_scatter/all_reduce are the same primitives the
+        captured decode already uses; the transpose copies allocate from the graph pool.
+        """
+        import torch.distributed as dist
+        assert self.rank is not None, "reduce_scatter_hidden requires rank-local (MP) mode"
+        if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() == 1:
+            return partial
+        rows, h = partial.shape
+        split = self.get_split_full(BROADCAST_RS)
+        widths = [b - a for _, a, b in split]
+        world = dist.get_world_size()
+        _trace = _PREFILL_TRACE and rows > 32 and not self.graph_mode
+        if len(widths) == world and len(set(widths)) == 1 and h == world * widths[0]:
+            pt = partial.t().contiguous()
+            out = torch.empty((widths[0], rows), dtype = partial.dtype, device = partial.device)
+            with _CollTimer(_trace):
+                dist.reduce_scatter_tensor(out, pt)
+            return out.t().contiguous()
+        with _CollTimer(_trace):
+            dist.all_reduce(partial, op = dist.ReduceOp.SUM)
+        _, a, b = self.get_split(BROADCAST_RS)[0]
+        return partial[:, a:b].contiguous()
 
     def gather_dev(
         self,

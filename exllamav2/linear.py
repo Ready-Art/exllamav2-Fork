@@ -378,6 +378,16 @@ class ExLlamaV2Linear(ExLlamaV2Module):
             if self.prescale != 1:
                 hidden_states_out.mul_(self.prescale)
 
+            if getattr(self, "_tp_vocab_parallel", False):
+                # Vocab-parallel head: allgather the logits shards into the full vocab.
+                # ~0.5 MB per token at fp16 -- negligible next to the per-layer collectives.
+                # Symmetric on every rank and graph-capturable (same _gather_nccl contract
+                # as the Q/ID/residual gathers the captured decode already uses).
+                _ctx = self.model.tp_context
+                _shape = hidden_states_out.shape
+                _full = _ctx._gather_nccl(hidden_states_out.view(-1, _shape[-1]), BROADCAST_VC, 1, tag = 3)
+                hidden_states_out = _full.view(_shape[:-1] + (_full.shape[-1],))
+
         # Evaluate LoRAs
 
         if loras is not None:
@@ -1035,6 +1045,71 @@ class ExLlamaV2Linear(ExLlamaV2Module):
             self.device_idx = pinned
             return
         self.device_idx = idx
+
+    def tp_load_rank_vocab(self, rank: int):
+        """
+        Vocab-parallel lm_head: load ONLY this rank's vocab rows (unquantized fp16).
+
+        The replicated hb16 head is ~2.7 GB on the master alone -- the single largest
+        rank-0-only tensor, and the reason the master OOMs while workers have gigabytes
+        free (debug2.txt / debug5.txt era). Sharding the vocab dim puts ~0.67 GB on every
+        rank instead; forward() allgathers the logits shards (0.5 MB per token at fp16 --
+        negligible next to the per-layer collectives). The allgather lives in forward(),
+        so BOTH the eager forward_chunk and the captured graph step get it for free, and
+        every rank's graph captures the same symmetric collective.
+
+        Mirrors load()'s unquantized branch (transpose check / normalize / padding) on the
+        full CPU tensor, then slices rows [a, b) of the VC split. Padding rows stay at the
+        full-vocab tail (last rank); forward_chunk masks them on the gathered logits.
+        lm_head LoRAs are incompatible with a vocab shard (they emit full-vocab deltas).
+        """
+        assert self.q_handle is None and self.linear is None, \
+            "tp_load_rank_vocab must run before the layer is loaded"
+        cfg = self.model.config
+        ctx = self.model.tp_context
+        split = ctx.get_split(BROADCAST_VC)
+        assert len(split) == 1, f"rank {rank} owns no vocab slice of {self.key}"
+        _, a, b = split[0]
+
+        # device_idx does not exist yet on an unloaded module (it is created by the
+        # load paths); load_weight(cpu = True) reads to host regardless.
+        self.device_idx = -1
+        w = self.load_weight(cpu = True)
+
+        if isinstance(w, dict):
+            raise NotImplementedError(
+                self.key + ": EXL2_TP_VOCAB_HEAD requires an unquantized (fp16) lm_head; "
+                "set EXL2_TP_VOCAB_HEAD=0 for quantized heads")
+        has_bias = isinstance(w, tuple)
+        if has_bias:
+            ww, wb = w
+        else:
+            ww, wb = w, None
+        if self.maybe_transpose and \
+            ww.data.shape[0] == self.in_features and ww.data.shape[1] == self.out_features and \
+            self.in_features != self.out_features:
+            ww = nn.Parameter(ww.data.T)
+        if self.normalize_unq:
+            ww = self.normalize(ww)
+        if self.padding > 0:
+            ww = nn.Parameter(F.pad(ww.data, (0, 0, 0, self.padding)).contiguous())
+            if has_bias:
+                wb = nn.Parameter(F.pad(wb.data, (0, 0, 0, self.padding)).contiguous())
+
+        self.device_idx = rank
+        self.linear = nn.Linear(self.in_features, b - a, has_bias, device = "meta", dtype = torch.float16)
+        self.linear.weight = nn.Parameter(safe_move_tensor(ww.data[a:b].contiguous(), rank), requires_grad = False)
+        if has_bias:
+            self.linear.bias = nn.Parameter(safe_move_tensor(wb.data[a:b].contiguous(), rank), requires_grad = False)
+        del w, ww, wb
+
+        self._tp_vocab_parallel = True
+        self.broadcast_type = None
+        self.broadcast_type_out = None
+        self.out_features_tp = []
+        self.in_features_tp = []
+        self.is_tp = False
+        self._tp_replicated_dev = rank
 
     def tp_load_rank_replicated(self, rank: int):
         """

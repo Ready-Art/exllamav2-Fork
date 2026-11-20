@@ -30,6 +30,10 @@ handling on top of this fork. See [OpenAI-compatible server (TabbyAPI)](#openai-
 tested on [Gemma-4-31B-IT](https://huggingface.co/ReadyArt/Gemma-4-31B-IT-EXL2-6.0BPW-HB16)**. Other
 architectures are untested here — treat them as experimental and verify correctness/parity yourself.
 
+**Platform:** built and tested on **Linux only** (Ubuntu 26.10). Windows and macOS are **untested**
+and may not work — the multiprocess TP backend, CUDA-graph capture and the pinned-host-memory paths
+have only been validated on Linux.
+
 **Hardware:** built and tested on **SM86 (Ampere — RTX 3090)** only (see [Requirements](#requirements)).
 
 ---
@@ -42,16 +46,22 @@ architectures are untested here — treat them as experimental and verify correc
 | **Multiprocess backend (MP)** | One worker process per GPU (`TPProcessGroup`) so dispatch overlaps across devices — higher decode throughput than single-process TP. |
 | **MTP speculative decoding** | A Gemma-4 *assistant* drafter proposes a window of tokens; the target verifies them in one forward. Works **with TP and MP**, greedy **and sampled** (probabilistic speculative acceptance — the output distribution is exactly target-autoregressive at any temperature). The MP driver eliminates the separate bonus-token forward: the bonus becomes row 0 of the next verify window, so a round costs **one** target forward. |
 | **Sequence-parallel residual (MP)** | The residual stream lives as a per-rank hidden shard (`EXL2_TP_SEQPAR`, default on): sharded post-norms with a tiny cross-rank RMS-stat all-reduce, column-parallel output projections whose shard *is* the next residual shard. Cuts collective volume vs replicated-residual TP — the win is prefill and long context. |
-| **Long-prompt prefill** | head_dim-512 prefill runs on the **cuDNN fused engine** (probed at load, automatic FlashInfer-fa2 fallback) with persistent per-geometry wrappers — one plan per chunk instead of one per layer. Sliding layers use FlashInfer's windowed kernel. Long prompts no longer crawl (the old fa2 hd512 prefill kernel scaled linearly with context at a fraction of tensor-core peak). |
-| **Prompt caching (MP MTP)** | Chat continuations never re-prefill the conversation: append-only K/V reuse for extending prompts, plus an exact **SWA-ring snapshot/restore** at each prompt boundary (`TPProcessGroup.snapshot_prompt_ring` / `restore_prompt_ring`) for clients that re-render history differently (e.g. strip thought channels). From the second reply on, only the last rendered turn + the new message is prefilled — a constant tail at any conversation length. One ~262 MB/GPU ring backup (Gemma-4, 4-way split). |
+| **Long-prompt prefill** | head_dim-512 prefill runs on **FlashInfer's fa2 ragged kernel first** — a load-time shape sweep measured it at 32-43 TFLOPS from q256/kv4k to q2048/kv75k on sm86 — with persistent per-geometry wrappers (one plan per chunk, not per layer) and cuDNN/single-prefill as automatic fallbacks. Sliding layers use FlashInfer's windowed kernel. (An earlier build preferred cuDNN whenever its tiny-shape probe passed; on sm86 that engine is ~4× slower than fa2 ragged at depth — the dispatch now reflects the measured truth.) |
+| **Vocab-parallel head + embedding (MP)** | The fp16 `lm_head` and the embedding table are sharded along the vocab dim across ranks (¼ each) instead of replicated on the master; logits shards are all-gathered (~0.5 MB/token) and embedding lookups SUM-reduced. Removes ~4 GB of replicated vocab tables per rank — the fix that lets a 160k cache + MTP drafter + shadows fit on 24 GB cards. `EXL2_TP_VOCAB_HEAD` / `EXL2_TP_VOCAB_EMBED` (default on). |
+| **Prompt caching (MP MTP)** | Chat continuations never re-prefill the conversation: append-only K/V reuse for extending prompts, plus an exact **SWA-ring snapshot/restore** at each prompt boundary (`TPProcessGroup.snapshot_prompt_ring` / `restore_prompt_ring`) for clients that re-render history differently (e.g. strip thought channels). From the second reply on, only the last rendered turn + the new message is prefilled — a constant tail at any conversation length. The ring backup lives in **pinned host RAM** (zero GPU cost; ~30 ms D2H/H2D per snapshot/restore). |
 | **Gemma-4-31B-IT support** | Text-only. Handles the model's two attention geometries (head_dim 256 sliding / 512 full), `k_eq_v` layers, proportional RoPE and per-layer norms. |
-| **Sliding-window + TP KV cache** | `ExLlamaV2Cache_SWA` / `ExLlamaV2Cache_TP`: ring buffers for sliding layers make long context fit (≈22.5 GB instead of ≈236 GB at 256k for Gemma-4-31B). |
+| **Sliding-window + TP KV cache** | `ExLlamaV2Cache_SWA` / `ExLlamaV2Cache_TP`: ring buffers for sliding layers make long context fit (≈22.5 GB instead of ≈236 GB at 256k for Gemma-4-31B). The ring is sized **window + prefill chunk** so every chunk row keeps its full sliding window (a correctness invariant — an earlier build silently truncated the window prefix when chunk ≥ ring), and decode-time fill stays inside the graph-verified envelope. |
+| **Optional o_proj reduce-scatter (MP)** | `EXL2_TP_O_RS=1` gives the hd512 full layers an fp16 logical-order row shard so eager prefill runs o_proj on the rank's own attention output — no Q allgather, a reduce-scatter instead (~440 MB/rank). `=2` extends it to sliding layers (experimental, ~1.5 GB/rank). Decode and graphed verify keep the quantized path. |
 | **TP CUDA graphs** | Whole-step decode graphs (`tp_graph`) remove per-op launch latency on the tensor-parallel path. |
 | **FlashInfer attention (required)** | FlashInfer **≥ 0.7.4** is a hard dependency. On sm86 (RTX 3090) it serves **head_dim 512** on every path — paged decode (`BatchDecodeWithPagedKVCacheWrapper`, including CUDA-graph mode with a per-step re-plan), single-token decode, and prefill — verified cos 1.0 vs torch. Flash-Attention's paged kernel refuses hd512; FlashInfer does not. |
 | **Multi-GPU quantization** | `convert.py -d 0,1 -crs on` distributes the measurement/quantization passes across GPUs. See [doc/convert.md](doc/convert.md). |
 
 ## Requirements
 
+- **Linux only (tested).** All development and validation happens on Linux (Ubuntu 26.10).
+  **Windows and macOS are untested** and are not expected to work out of the box — the
+  multiprocess TP backend (spawn + pipes), CUDA-graph capture and pinned-host-memory paths
+  are Linux-validated only.
 - **Built and tested on SM86 (Ampere — NVIDIA RTX 3090).** This fork is developed and validated
   on the Ampere `sm_86` architecture (4× RTX 3090); other architectures may work but are untested.
   The bundled kernel build targets `TORCH_CUDA_ARCH_LIST="8.6"`.
@@ -201,12 +211,13 @@ internals are per-layer:
 | kv heads | 16 | 4 |
 | RoPE | default, theta 10000 | proportional, 0.25, theta 1e6 |
 | `v_proj` | present | absent (`attention_k_eq_v`: V is K) |
-| KV cache | ring buffer, 1280 tokens | full `max_seq_len` |
+| KV cache | ring buffer, window + chunk (e.g. 3072 at chunk 2048) | full `max_seq_len` |
 
 Both geometries run on FlashInfer on sm86: the hd512 full layers use the paged decode wrapper
 (including CUDA-graph mode), a single-pass paged-prefill kernel for the graphed MTP verify
-window, and the cuDNN fused engine for eager prefill; the sliding layers use its windowed
-kernels. Client disconnects abort long prefills at the next chunk boundary on every rank.
+window, and the fa2 ragged kernel for eager prefill (cuDNN fallback); the sliding layers use
+its windowed kernels — graphed SWA verify stays on the verified per-row windowed decode
+wrappers. Client disconnects abort long prefills at the next chunk boundary on every rank.
 
 Use the `gemma4` prompt format:
 ```
@@ -256,14 +267,16 @@ Measured on 4× RTX 3090 (sm86, PCIe), Gemma-4-31B EXL2 6.0 bpw:
 
 | Mode | Context | Throughput |
 |---|---|---:|
-| **MTP (MP), temp 1.0 / top_p 0.92, window 3** | ~1.3k | **~40 tok/s** |
-| **MTP (MP), temp 1.0, window 3** | **~75k** | **~40 tok/s** |
+| **MTP (MP), temp 1.0 / top_p 0.92** | **~75k** | **~44 tok/s sustained** (user-confirmed 2026-11-20) |
+| MTP (MP), temp 1.0 / top_p 0.92, window 3 | ~1.3k | ~40 tok/s |
 | MTP (MP), greedy | 4k | ~40 tok/s |
 | MTP (MP), greedy, counting prompt | 4k | ~53 tok/s (≈1.35× plain) |
 | Plain decode (MP), greedy | 4k | ~39 tok/s |
+| Prompt processing (MP) | ~1.3k | ~1000 tok/s |
 
-Prompt processing measures ~650 tok/s on a 75k prompt (cuDNN hd512 prefill);
-with the prompt cache, every reply after the first prefills only the new turn.
+With the prompt cache, every reply after the first prefills only the new turn — a measured
+continuation prefilled 297 tail tokens at ~5000 tok/s effective instead of re-processing the
+conversation.
 
 Sampled MTP is practical: probabilistic speculative acceptance (no resync forwards) plus the
 bonus-forward-eliminated round protocol bring temperature-1.0 generation to ~40 tok/s at ~1.3k
@@ -272,12 +285,16 @@ K/V gather (~1-4 ms), emitting ~2.4-2.5 tokens/round at ~1.4-1.5 acceptance. Acc
 tokens/round on mixed prose and ≈ 3.9 on structured prompts with wider windows; speedups scale
 with acceptance. Numbers vary with prompt, context length and hardware.
 
-**Prefill:** long prompts are dramatically faster than earlier builds. head_dim-512 prefill now
-runs on the cuDNN fused engine with persistent per-geometry FlashInfer wrappers (one plan per
-chunk, not per layer); sliding layers use FlashInfer's windowed kernel instead of a materialized
-torch mask. Previously the fa2 hd512 prefill kernel ran far below tensor-core peak and ms/chunk
-grew linearly with context (≈0.9 s/chunk early → ≈5.4 s/chunk at 56k of a 75k prompt). Set
-`EXL2_PREFILL_TRACE=1` (default) to watch per-chunk progress on long loads.
+**Prefill:** head_dim-512 eager prefill dispatches to FlashInfer's **fa2 ragged kernel first**,
+with persistent per-geometry wrappers (one plan per chunk, not per layer); sliding layers use
+FlashInfer's windowed kernel instead of a materialized torch mask. A load-time shape sweep
+(`[prefill] hd512 fa2 shape sweep`) measures the kernel on your box — on the test rig it holds
+32-43 TFLOPS from q256/kv4k through q2048/kv75k. cuDNN and single-prefill remain automatic
+fallbacks. (History: the earliest builds ran a ~2 TFLOPS hd512 single-prefill path whose
+ms/chunk grew linearly with context; a later build preferred cuDNN, whose sm86 hd512 engine is
+~4× slower than fa2 ragged at depth — both are now superseded.) `EXL2_PREFILL_TRACE=1` (default)
+prints per-chunk progress with a cost breakdown: `[prefill] N/total (ms/chunk; coll X attn Y
+gemm+other Z)` — collective, attention-kernel and remainder time per chunk.
 
 **Remaining headroom:** decode is still collective-latency-bound over PCIe (no NVLink) — the
 tensor-parallel all-gathers and the quantized-GEMM efficiency are the main bottlenecks, and
@@ -293,9 +310,14 @@ All optional; defaults are the verified best state. Set them in the server/proce
 | `EXL2_TP_SEQPAR` | `1` | MP sequence-parallel hidden-sharded residual (less collective volume; prefill/long-context win). `0` = replicated-residual TP (slightly faster pure short-context decode). |
 | `EXL2_MTP_BONUS_ELIM` | `1` | MP MTP bonus-forward elimination (one target forward per round). `0` = legacy verify+bonus protocol. |
 | `EXL2_VERIFY_PREFILL` | `1` | Graphed MTP verify uses one single-pass FlashInfer paged-prefill kernel per layer (KV read once for all rows). `0` = per-row decode kernels. Per-row/torch fallbacks are automatic if a plan can't serve a shape. |
-| `EXL2_PREFILL_CUDNN` | `1` | Prefer the cuDNN fused engine for head_dim>256 eager prefill (probed once at load; automatic fa2/single-prefill fallback). `0` = FlashInfer fa2 only. |
+| `EXL2_TP_VOCAB_HEAD` | `1` | Vocab-shard the fp16 lm_head across ranks (¼ each) + logits all-gather; frees ~2 GB on the master. `0` = replicated master-only head. Requires an unquantized head. |
+| `EXL2_TP_VOCAB_EMBED` | `1` | Vocab-shard the embedding table + SUM-reduced lookups; frees ~2 GB on every rank. `0` = replicated table. |
+| `EXL2_TP_O_RS` | `0` | o_proj reduce-scatter for eager prefill: `1` = hd512 full layers only (~440 MB/rank fp16 row shards, recommended opt-in); `2` = all layers (~1.5 GB/rank, experimental); `0` = off. Decode/graphs keep the quantized path. |
+| `EXL2_TP_DOWN_RS` | `0` | Experimental down_proj row-parallel reduce-scatter (4× less MLP collective volume). Currently under investigation for a long-context correctness issue — leave off. |
+| `EXL2_PREFILL_HD512_CUDA` | `0` | Experimental custom wmma hd512 prefill kernel (parity + timing probe at load; auto-keeps fa2 unless faster). v1 measured slower than fa2 ragged — leave off. |
+| `EXL2_PREFILL_CUDNN` | `1` | Allow the cuDNN engine as a *fallback* for head_dim>256 eager prefill (fa2 ragged is tried first; on sm86 the cuDNN hd512 engine is ~4× slower at depth). `0` = fa2/single-prefill only. |
 | `EXL2_MTP_WARMUP` | `1` | Compile FlashInfer kernels at load (dummy prefill + draft step) instead of on the first request. `0` skips. |
-| `EXL2_PREFILL_TRACE` | `1` | Print `[prefill] N/total (ms/chunk)` progress for prompts >64 tokens. `0` disables. |
+| `EXL2_PREFILL_TRACE` | `1` | Print `[prefill] N/total (ms/chunk; coll X attn Y gemm+other Z)` progress + cost breakdown for prompts >64 tokens, and the hd512 fa2 shape sweep at load. `0` disables. |
 | `EXL2_MTP_DRAFT_GRAPH` | `0` | Opt-in drafter CUDA graph. Eager FlashInfer drafting is the verified best state; the graphed drafter is bandwidth-bound at long context. |
 | `EXL2_TP_GRAPHS` | `1` | Whole-step TP CUDA graphs (decode, bonus, verify). `0` = eager TP. |
 | `NCCL_P2P_LEVEL` | — | `PXB` is the tested setting for 4× 3090 PCIe rigs. |

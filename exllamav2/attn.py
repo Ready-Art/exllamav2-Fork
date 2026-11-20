@@ -2468,10 +2468,20 @@ class ExLlamaV2Attention(ExLlamaV2Module):
             # (BUG 113): the GEMM applies q_perm internally to the full-width gathered
             # attention output. The post-attention norm runs on the shard (tiny cross-rank
             # RMS stat all_reduce), then the residual add is shard-local.
-            gathered = self.model.tp_context.allgather(
-                1, attn_outputs, BROADCAST_Q, BROADCAST_Q, dim = self.head_dim
-            )
-            out_shard = self.o_proj.forward_tp(gathered, loras = loras, output_split = True)[0]
+            _o_row = getattr(self, "_o_fp16_row", None)
+            if _o_row is not None and q_len > 1 and not self.model.tp_context.graph_mode:
+                # Eager prefill: ROW-parallel on the fp16 logical-order shard. This rank's
+                # attention output IS the shard's input range, so the Q allgather (the
+                # layer's largest collective at hd512) is replaced by a reduce-scatter of
+                # the full-hidden partial -- 0.75*hidden vs 0.75*heads*hd bytes per rank.
+                # Decode and graphed verify keep the quantized column path above/below.
+                partial = torch.matmul(attn_outputs[0], _o_row)
+                out_shard = self.model.tp_context.reduce_scatter_hidden(partial)
+            else:
+                gathered = self.model.tp_context.allgather(
+                    1, attn_outputs, BROADCAST_Q, BROADCAST_Q, dim = self.head_dim
+                )
+                out_shard = self.o_proj.forward_tp(gathered, loras = loras, output_split = True)[0]
             if self.post_layernorm is not None:
                 out_shard = self.post_layernorm.forward_tp_sharded(out_shard)
             if self.has_residual:
@@ -2969,6 +2979,77 @@ class ExLlamaV2Attention(ExLlamaV2Module):
         self.set_device_idx(None)
 
 
+    def _build_o_fp16_row(self, rank: int):
+        """
+        fp16 o_proj shard in LOGICAL input order, rows [a*hd, b*hd) of this rank's Q split.
+
+        Serves the eager-prefill row-parallel path: this rank's attention output shard is
+        exactly that logical input range, so ``matmul(attn_shard, shard)`` produces the
+        full-hidden partial with NO allgather and NO permutation. The BUG 113 q_perm trap
+        only bites the quantized row GEMM (storage rows are permuted); reconstruct()
+        writes row q_perm[k] for storage row k -- i.e. logical order -- so a contiguous
+        row slice here is clean. The quantized RS-column handle loaded by tp_load_rank
+        remains the decode/graph path; this shard is prefill-only (~22-44 MB per layer).
+
+        Load-time transient: full quantized tensor + full fp16 reconstruct + temp_dq,
+        all freed before returning. Returns None when the shape is not servable.
+        """
+        from exllamav2.compat import safe_move_tensor
+        from exllamav2.ext import make_group_map
+
+        cfg = self.model.config
+        ctx = self.model.tp_context
+        split = ctx.get_split(BROADCAST_Q)
+        if len(split) != 1:
+            return None
+        _, a, b = split[0]
+        lo, hi = a * self.head_dim, b * self.head_dim
+        op = self.o_proj
+        if op.q_handle is None:
+            return None
+
+        prev_device = op.device_idx
+        op.device_idx = -1
+        try:
+            w = op.load_weight(cpu = True)
+        finally:
+            op.device_idx = prev_device
+        if not isinstance(w, dict) or "q_perm" not in w:
+            return None
+
+        if "q_group_map" not in w:
+            w["q_group_map"] = make_group_map(w["q_groups"], w["q_weight"].shape[0])
+        w["q_perm"] = w["q_perm"].short()
+        w["q_invperm"] = w["q_invperm"].short()
+        # Mirror ext.make_q_matrix()'s prescale fold (tp_load_rank BUG 50 note): the C++
+        # binding does not fold it, reconstruct's dq_scale expects the folded scale_max.
+        _prescale = op.prev_prescale if op.prev_prescale is not None else op.prescale
+        w["q_scale_max"] = (w["q_scale_max"].float() * (_prescale / 256.0)).half()
+        w = {k: safe_move_tensor(v, rank) for k, v in w.items()}
+
+        inf, outf = op.in_features, op.out_features
+        temp_dq = torch.empty(2 * min(inf * outf, cfg.max_dq_size),
+                              dtype = torch.uint8, device = rank)
+        handle = ext_c.make_q_matrix(
+            w["q_weight"],
+            w.get("q_perm", none_tensor),
+            w.get("q_invperm", none_tensor),
+            w["q_scale"],
+            w["q_scale_max"],
+            w["q_groups"],
+            w["q_group_map"],
+            none_tensor, none_tensor, none_tensor,
+            w.get("bias", none_tensor),
+            temp_dq,
+            cfg.max_dq_size // outf
+        )
+        full = torch.empty((inf, outf), dtype = torch.half, device = rank)
+        ext_c.reconstruct(handle, full)
+        shard = full[lo:hi].contiguous()
+        ext_c.free_q_matrix(handle)
+        del w, full, temp_dq
+        return shard
+
     def tp_load_rank(self, rank: int):
         """
         Load only this attention block's slice for device ``rank``.
@@ -3026,8 +3107,22 @@ class ExLlamaV2Attention(ExLlamaV2Module):
             # Sequence-parallel: COLUMN-parallel o_proj, output split by the residual (RS)
             # split so the output shard is the next residual shard. q_perm stays in the
             # shard (the GEMM permutes the full-width gathered attention input itself).
+            # This quantized handle serves decode + graphed verify.
             self.o_proj_row_parallel = False
             self.o_proj.tp_load_rank(rank, BROADCAST_RS)
+            # Eager prefill can additionally get an fp16 ROW shard (logical input order)
+            # so o_proj runs on this rank's own attention output with no Q allgather,
+            # reduce-scattering the partial instead. OPT-IN (EXL2_TP_O_RS):
+            #   =1 (recommended): fp16 row shards for the hd512 FULL layers only
+            #      (~440 MB/rank). All-layers shards are ~1.54 GB/rank and OOMed the
+            #      master during a 75k re-prefill (idk.txt: 22.77 GiB allocated, 22 MiB
+            #      transpose alloc failed). SWA layers keep the quantized AG+column path.
+            #   =2: all layers (experimental -- needs ~1.5 GB/rank of headroom).
+            #   =0: off (default).
+            self._o_fp16_row = None
+            _o_rs = os.environ.get("EXL2_TP_O_RS", "0")
+            if _o_rs == "2" or (_o_rs == "1" and self.head_dim > 256):
+                self._o_fp16_row = self._build_o_fp16_row(rank)
         elif self.o_proj_row_parallel:
             # Keep the full permutation: tp_load_rank_row drops q_perm from the shard, so the forward
             # path needs the original to build each device's column index.

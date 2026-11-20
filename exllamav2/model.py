@@ -591,7 +591,16 @@ class ExLlamaV2:
             load_head = (rank == 0)
 
         # BUG 77: forward_chunk must know whether this process owns lm_head.
-        self._tp_has_head = bool(load_head)
+        # Vocab-parallel head (default ON; EXL2_TP_VOCAB_HEAD=0 restores the replicated
+        # master-only head): every rank owns a vocab shard of the unquantized head and
+        # runs it, so every rank "has" the head. Frees ~2 GB on the master (the hb16
+        # head was rank-0-only) -- the fix for the master OOM at 160k cache + drafter
+        # + MTP shadow. Logits shards are allgathered inside head.forward (~0.5 MB/token).
+        self._tp_vocab_head = os.environ.get("EXL2_TP_VOCAB_HEAD", "1") != "0"
+        # Vocab-sharded embedding table (EXL2_TP_VOCAB_EMBED=0 restores the 2.8 GB
+        # replicated table): same VC split as the head, SUM-reduced masked lookups.
+        self._tp_vocab_embed = os.environ.get("EXL2_TP_VOCAB_EMBED", "1") != "0"
+        self._tp_has_head = bool(load_head) or self._tp_vocab_head
 
         # The fused single-device graph path assumes one device.
         self.config.no_graphs = True
@@ -628,7 +637,13 @@ class ExLlamaV2:
         # for every module so those lists are consistent, but only this rank's scratch is allocated.
         devs = self.tp_context.num_devices
         scratch = [0] * devs
-        for module in self.modules[1:]:
+        for _mi, module in enumerate(self.modules[1:], start = 1):
+            # The unquantized vocab-sharded head needs no temp_dq scratch; the generic
+            # VC-split sizing would otherwise reserve ~0.7 GB of dead pool on EVERY rank
+            # (it dominated the device scratch max). The vocab loader resets the head's
+            # out_features_tp lists itself, so skipping keeps dispatch consistent.
+            if self._tp_vocab_head and _mi == self.head_layer_idx:
+                continue
             ms = module.scratch_space_tp()
             for i, m in enumerate(ms):
                 scratch[i] = max(scratch[i], m)
@@ -645,7 +660,10 @@ class ExLlamaV2:
                     callback(idx, len(self.modules))
 
                 if isinstance(module, ExLlamaV2Embedding):
-                    module.tp_load_rank(rank)
+                    if self._tp_vocab_embed:
+                        module.tp_load_rank_sharded(rank)
+                    else:
+                        module.tp_load_rank(rank)
 
                 elif isinstance(module, ExLlamaV2Attention):
                     module.tp_load_rank(rank)
@@ -666,7 +684,9 @@ class ExLlamaV2:
 
                 elif isinstance(module, ExLlamaV2Linear):
                     if idx == self.head_layer_idx:
-                        if load_head:
+                        if self._tp_vocab_head:
+                            module.tp_load_rank_vocab(rank)
+                        elif load_head:
                             module.tp_load_rank_replicated(rank)
                         else:
                             module.set_device_idx(rank)
@@ -1146,8 +1166,35 @@ class ExLlamaV2:
                 if cache.current_seq_len == 0 and cache.window_beg != 0:
                     cache.window_beg = 0  # new sequence
                 chunk_size = min(chunk_size, _ring)
+                # Correctness cap: after the overflow shift the ring retains ring - chunk
+                # prefix rows, and the chunk's first row needs window - 1 of them to see
+                # its full sliding window. Capping at ring - window + 1 guarantees that
+                # for EVERY row of every chunk (the default ring = window + max_input_len
+                # makes this a no-op at the configured chunk size; an explicit smaller
+                # sliding_window_overp shrinks the chunk instead of truncating attention).
+                _swa_win = getattr(cache, "sliding_window", None)
+                if _swa_win is None:
+                    for _c in getattr(cache, "caches", ()):
+                        if _c is not None:
+                            _swa_win = getattr(_c, "sliding_window", 0)
+                            break
+                if _swa_win:
+                    chunk_size = min(chunk_size, max(1, _ring - _swa_win + 1))
+                # Decode-time fill cap: the graphed SWA attention wrappers (windowed
+                # paged decode + per-row verify) are verified only up to the OLD ring
+                # fill (window + 2 pages = 1280). The deeper ring exists for prefill
+                # staging (window + chunk); letting decode fill grow into it exposed
+                # unverified windowed-graph kv_lens and corrupted generation
+                # (debug5.txt: repetition salad a few hundred tokens in, acc 0.5).
+                # Small forwards (decode/verify, chunk <= 2 pages) keep the ring
+                # trimmed to the verified envelope; prefill chunks use the full ring.
+                # The shift stays a deterministic function of (cpos, chunk, cap), so
+                # all ranks move in lockstep with no communication (BUG 94).
+                _fill_cap = _ring
+                if _swa_win and chunk_size <= 2 * _page:
+                    _fill_cap = min(_ring, _swa_win + 2 * _page)
                 _cpos = cache.current_seq_len - cache.window_beg
-                _overflow = _cpos + chunk_size - _ring
+                _overflow = _cpos + chunk_size - _fill_cap
                 if _overflow > 0:
                     _shift = ((_overflow + _page - 1) // _page) * _page
                     assert 0 < _shift <= _ring, \
@@ -1215,8 +1262,18 @@ class ExLlamaV2:
                 return
 
             if _trace:
-                print(f"[prefill] {chunk_end}/{q_len} "
-                      f"({1000 * (_time.perf_counter() - _chunk_t0):.0f} ms/chunk)", flush=True)
+                # Cost attribution: coll = rank-mode NCCL collectives, attn = eager
+                # prefill attention kernels (FI ragged / cuDNN / triton), gemm+other =
+                # the remainder (GEMMs incl. reconstruct, norms, rope, KV writes, plans,
+                # host). One sync here at the chunk boundary drains the event pairs.
+                from exllamav2 import tensor_p as _tp_mod
+                from exllamav2 import attn_backend as _ab_mod
+                _coll_ms = _tp_mod.prefill_trace_coll_ms()
+                _attn_ms = _ab_mod.prefill_trace_attn_ms()
+                _chunk_ms = 1000 * (_time.perf_counter() - _chunk_t0)
+                print(f"[prefill] {chunk_end}/{q_len} ({_chunk_ms:.0f} ms/chunk; "
+                      f"coll {_coll_ms:.0f} attn {_attn_ms:.0f} "
+                      f"gemm+other {max(0.0, _chunk_ms - _coll_ms - _attn_ms):.0f})", flush=True)
 
             if not _preprocess_only:
                 if cpu_logits:
@@ -1291,7 +1348,13 @@ class ExLlamaV2:
             for idx, (dev, a, b) in enumerate(split):
                 nq = (b - a) * m.num_key_value_groups
                 nkv = b - a
-                if q_len > 1 and verify_prefill:
+                # SWA layers stay on the per-row windowed DECODE wrappers below (the
+                # path verified 2026-11-19). The windowed paged-PREFILL verify wrapper
+                # under CUDA graphs was never validated: with the old 1280 ring it was
+                # almost always skipped (base+q_len > depth), but the deeper prefill
+                # ring made it plan every round and corrupted acceptance/generation
+                # (debug5.txt). Full hd512 layers keep the single-pass prefill verify.
+                if q_len > 1 and verify_prefill and not m.sliding_window:
                     pf_key = (dev, nq, nkv, m.head_dim, m.scaling, window_left, q_len)
                     if pf_key not in seen:
                         seen.add(pf_key)

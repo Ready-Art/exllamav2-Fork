@@ -134,6 +134,25 @@ class Gemma4AssistantDrafter:
         #   * final norm : the RMSNorm just before the target's lm_head
         #   * kv layers  : last full (59) and last sliding (58) target attention layers
         self.t_embed = target.modules[0]
+        # The drafter indexes the target table with ARBITRARY token ids directly
+        # (_target_embed / _stage_emb bypass the shard-aware forward). With the
+        # vocab-sharded embedding (EXL2_TP_VOCAB_EMBED) the rank-local table holds
+        # only this rank's rows -> out-of-bounds CUDA assert. Keep a full CPU copy
+        # for the drafter: host RAM is plentiful, the per-token H2D is ~10 KB, and
+        # the lookup stays off the collective path (the drafter runs on the master
+        # alone, so it cannot participate in the embedding all_reduce).
+        self._t_embed_full = None
+        if getattr(self.t_embed, "_tp_vocab_shard", None) is not None:
+            _prev = self.t_embed.device_idx
+            self.t_embed.device_idx = -1
+            try:
+                _w = self.t_embed.load_weight(cpu = True)
+            finally:
+                self.t_embed.device_idx = _prev
+            _w = _w.data.clone()
+            if target.config.scale_emb != 1:
+                _w *= target.config.scale_emb
+            self._t_embed_full = _w
         self.t_final_norm = target.modules[target.head_layer_idx - 1]
         assert type(self.t_final_norm).__name__ == "ExLlamaV2RMSNorm", \
             f"drafting requires an RMSNorm final norm, got {type(self.t_final_norm).__name__}"
@@ -357,7 +376,9 @@ class Gemma4AssistantDrafter:
         target's blocks saw.
         """
         tid = token_id.to("cpu", non_blocking = False).long()
-        w = self.t_embed.embedding.weight                      # (vocab, backbone) on CPU (or target dev)
+        # Full CPU copy when the target table is vocab-sharded (see __init__).
+        w = self._t_embed_full if self._t_embed_full is not None \
+            else self.t_embed.embedding.weight                 # (vocab, backbone)
         e = w[tid]                                             # (1,1,backbone)
         ap = self.t_embed.archparams
         if getattr(ap, "normalize_embeddings", False):
@@ -652,7 +673,9 @@ class Gemma4AssistantDrafter:
         Mirrors _target_embed exactly, including the normalize_embeddings sqrt(hidden)
         scale; copy_ does the H2D move and fp16 cast in one op on the current stream.
         """
-        e = self.t_embed.embedding.weight[tok_id]        # (backbone,) on CPU
+        w = self._t_embed_full if self._t_embed_full is not None \
+            else self.t_embed.embedding.weight
+        e = w[tok_id]                                    # (backbone,) on CPU
         ap = self.t_embed.archparams
         if getattr(ap, "normalize_embeddings", False):
             e = e * (self.backbone_hidden_size ** 0.5)

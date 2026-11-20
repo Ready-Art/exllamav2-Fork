@@ -262,7 +262,13 @@ def _worker_kv_slice(ctx, layer_idx, start, end):
 
 
 def _clone_swa_ring(cache):
-    """Device-side copy of every SWA layer's ring (the ring-depth buffers).
+    """Pinned-CPU copy of every SWA layer's ring (the ring-depth buffers).
+
+    Was a device-side clone: at ring = window + chunk (2304+ slots) that is ~0.5 GB
+    of GPU per rank held for the whole job, which OOMs the master alongside the hb16
+    head + drafter + 160k KV (debug2.txt). Host pinned memory is free here (125 GB
+    RAM); the snapshot pays one ~30 ms D2H at job end and the restore one H2D, both
+    negligible against seconds of prefill.
 
     inference_mode: the cache buffers are inference tensors (allocated under
     inference_mode at load); these helpers run OUTSIDE model.forward's
@@ -270,17 +276,28 @@ def _clone_swa_ring(cache):
     ops on inference tensors raise. Nesting the mode is reentrant-safe."""
     ring = cache.kv_state_size
     with torch.inference_mode():
-        return {l: (cache.key_states[l].detach().clone(),
-                    cache.value_states[l].detach().clone())
-                for l in range(len(cache.key_states))
-                if cache.key_states[l].shape[1] == ring}
+        out = {}
+        for l in range(len(cache.key_states)):
+            if cache.key_states[l].shape[1] != ring:
+                continue
+            kc, vc = cache.key_states[l], cache.value_states[l]
+            k = torch.empty(kc.shape, dtype = kc.dtype, pin_memory = True)
+            v = torch.empty(vc.shape, dtype = vc.dtype, pin_memory = True)
+            k.copy_(kc, non_blocking = True)
+            v.copy_(vc, non_blocking = True)
+            out[l] = (k, v)
+        # The caller may overwrite the rings (next prefill) as soon as this returns;
+        # every async D2H above must have landed first. One sync for the whole batch.
+        torch.cuda.synchronize()
+        return out
 
 
 def _restore_swa_ring(cache, backup, seq, wb):
     with torch.inference_mode():
         for l, (k, v) in backup.items():
-            cache.key_states[l].copy_(k)
-            cache.value_states[l].copy_(v)
+            cache.key_states[l].copy_(k, non_blocking = True)
+            cache.value_states[l].copy_(v, non_blocking = True)
+        torch.cuda.synchronize()
     cache.current_seq_len = seq
     cache.window_beg = wb
 
@@ -542,7 +559,10 @@ class TPProcessGroup:
         model; it reads the target's sharded K/V via :meth:`gather_kv_mtp`."""
         self.mtp_drafter = drafter
         self.num_speculative_tokens = int(num_draft_tokens)
+        # Allocate the joined KV shadow NOW, at load time with a clean allocator --
+        # not lazily on the first gather after a long prefill (debug10.txt OOM).
         self._mtp_kv = None
+        self._alloc_mtp_kv()
 
         # Cold-start fix (results.md, 2026-11-20): FlashInfer JIT-compiles each kernel
         # geometry on FIRST use. The first server run paid ~33 s in prefill (1315 tokens
@@ -625,8 +645,9 @@ class TPProcessGroup:
         _restore_swa_ring(self.cache, self._ring_backup_local, seq, self._ring_backup_wb)
         for device, w in sorted(self.workers.items()):
             w.recv()
-        # the drafter's incremental gather shadow is stale after a rewind
-        self._mtp_kv = None
+        # the drafter's incremental gather shadow is stale after a rewind -- reset the
+        # bookkeeping and re-zero, but KEEP the buffers (post-prefill realloc OOMs)
+        self._reset_mtp_kv()
         return True
 
     def mtp_reset_cache(self):
@@ -637,10 +658,64 @@ class TPProcessGroup:
             w.recv()
         self.cache.current_seq_len = 0
         self.cache.window_beg = 0
-        # drop any cached MTP gather buffers so the next gather starts fresh
-        self._mtp_kv = None
+        # reset the MTP gather shadow so the next gather starts fresh -- keep the
+        # buffers allocated (freeing them forces a post-prefill realloc; debug10.txt)
+        self._reset_mtp_kv()
         # a stale disconnect abort from a previous job must not kill this one
         self.abort_flag.clear()
+
+    def _alloc_mtp_kv(self):
+        """Allocate the drafter's joined KV shadow (fixed-size, zero-initialized).
+
+        Called at LOAD time (enable_mtp): the 2x626 MiB full-KV buffers must come from
+        a clean allocator. The old lazy path allocated them on the first gather AFTER
+        a long prefill, when the caching allocator was full and fragmented -- the V
+        buffer's 626 MiB request OOMed the master with 387 MiB free (debug10.txt).
+        Resets REUSE these buffers (_reset_mtp_kv) instead of freeing/reallocating.
+
+        Change98: zero-init (not empty). The draft graph's attention matmul reads the
+        FULL buffer depth; unwritten tail rows must be finite (0) or NaN/inf garbage
+        poisons the softmax. Zero rows score 0 and get masked out.
+        """
+        d = self.mtp_drafter
+        mc = self.cache
+        dev = d.dev
+        # inference_mode(FALSE): enable_mtp runs under the loader's InferenceMode, but
+        # gather_kv_mtp mutates these buffers IN PLACE on the job thread OUTSIDE it
+        # (ring-shift mirror copy_, delta H2D copy_). Inference tensors forbid that
+        # (debug11.txt); the old lazy allocation created them outside InferenceMode as
+        # normal tensors -- preserve exactly that semantics here at load time.
+        with torch.inference_mode(False):
+            self._mtp_kv = {
+                "fl": 0,
+                "sl": 0,      # absolute seq_len at the last SWA gather
+                "wb": 0,      # window_beg at the last SWA gather
+                # 3-D (S, kvh, hd) -- identical layout to the single-process drafter.
+                "kf": torch.zeros((self.max_seq_len, d.num_global_kv_heads, d.global_head_dim),
+                                  dtype = torch.half, device = dev),
+                "vf": torch.zeros((self.max_seq_len, d.num_global_kv_heads, d.global_head_dim),
+                                  dtype = torch.half, device = dev),
+                "ks": torch.zeros((mc.kv_state_size, d.num_kv_heads, d.head_dim),
+                                  dtype = torch.half, device = dev),
+                "vs": torch.zeros((mc.kv_state_size, d.num_kv_heads, d.head_dim),
+                                  dtype = torch.half, device = dev),
+            }
+        return self._mtp_kv
+
+    def _reset_mtp_kv(self):
+        """Reset the gather bookkeeping and re-zero the shadow, KEEPING the buffers.
+        Freeing them here (the old `_mtp_kv = None`) forced a post-prefill reallocation
+        of 1.25 GB at the worst possible allocator state (debug10.txt OOM). Re-zeroing
+        ~1.3 GB costs ~1.5 ms per job -- nothing against seconds of prefill."""
+        st = self._mtp_kv
+        if st is None:
+            return
+        with torch.inference_mode():
+            for _k in ("kf", "vf", "ks", "vs"):
+                st[_k].zero_()
+        st["fl"] = 0
+        st["sl"] = 0
+        st["wb"] = 0
 
     def gather_kv_mtp(self):
         """Give the drafter the target's last full (59) and sliding (58) K/V, joined
@@ -674,23 +749,7 @@ class TPProcessGroup:
 
         st = self._mtp_kv
         if st is None:
-            st = self._mtp_kv = {
-                "fl": 0,
-                "sl": 0,      # absolute seq_len at the last SWA gather
-                "wb": 0,      # window_beg at the last SWA gather
-                # 3-D (S, kvh, hd) -- identical layout to the single-process drafter.
-                # Change98: zero-init (not empty). The draft graph's attention matmul reads
-                # the FULL buffer depth; unwritten tail rows must be finite (0) or NaN/inf
-                # garbage poisons the softmax. Zero rows score 0 and get masked out.
-                "kf": torch.zeros((self.max_seq_len, d.num_global_kv_heads, d.global_head_dim),
-                                  dtype = torch.half, device = dev),
-                "vf": torch.zeros((self.max_seq_len, d.num_global_kv_heads, d.global_head_dim),
-                                  dtype = torch.half, device = dev),
-                "ks": torch.zeros((mc.kv_state_size, d.num_kv_heads, d.head_dim),
-                                  dtype = torch.half, device = dev),
-                "vs": torch.zeros((mc.kv_state_size, d.num_kv_heads, d.head_dim),
-                                  dtype = torch.half, device = dev),
-            }
+            st = self._alloc_mtp_kv()
 
         # ---- SWA ring: mirror the page shift on the shadow, pull only new rows ----
         ring = mc.kv_state_size

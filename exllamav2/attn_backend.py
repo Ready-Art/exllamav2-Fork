@@ -534,6 +534,40 @@ _ragged_planned: dict = {}
 _cudnn_prefill_ok: bool | None = None
 
 
+# Prefill cost attribution (EXL2_PREFILL_TRACE): event pairs around the eager prefill
+# attention runs, drained once per chunk by model.forward's trace print (same contract
+# as tensor_p._coll_events -- queue only, no host sync at record time).
+_PREFILL_TRACE = os.environ.get("EXL2_PREFILL_TRACE", "1") != "0"
+_attn_events: list = []
+
+
+class _AttnTimer:
+    def __init__(self, on: bool):
+        self.on = on
+
+    def __enter__(self):
+        if self.on:
+            self.s = torch.cuda.Event(enable_timing = True)
+            self.e = torch.cuda.Event(enable_timing = True)
+            self.s.record()
+        return self
+
+    def __exit__(self, *exc):
+        if self.on:
+            self.e.record()
+            _attn_events.append((self.s, self.e))
+        return False
+
+
+def prefill_trace_attn_ms() -> float:
+    if not _attn_events:
+        return 0.0
+    torch.cuda.synchronize()
+    ms = sum(s.elapsed_time(e) for s, e in _attn_events)
+    _attn_events.clear()
+    return ms
+
+
 def _ragged_key(q, k, sm_scale, window_left, backend):
     return (str(q.device), q.shape[2], k.shape[2], q.shape[3],
             sm_scale, window_left, backend)
@@ -580,7 +614,9 @@ def ragged_prefill(
             kv_data_type=k.dtype,
         )
         _ragged_planned[key] = (ql, kv, causal)
-    return wrapper.run(q[0], k[0], v[0]).unsqueeze(0)
+    with _AttnTimer(_PREFILL_TRACE and ql > 32):
+        out = wrapper.run(q[0], k[0], v[0])
+    return out.unsqueeze(0)
 
 
 def cudnn_prefill_ok(device: torch.device) -> bool:
@@ -602,6 +638,119 @@ def cudnn_prefill_ok(device: torch.device) -> bool:
     return _cudnn_prefill_ok
 
 
+_hd512_cuda_ok: bool | None = None
+
+
+_hd512_sweep_done: bool = False
+
+
+def _hd512_fa2_sweep(device):
+    """
+    One-time diagnostic: time FI's fa2 ragged hd512 prefill across representative
+    shapes and print ms + effective TFLOPS.
+
+    Why: the first probe measured fa2 at ~36 TFLOPS @ q256/kv4096, but the live
+    EXL2_PREFILL_TRACE attn column implies ~9.6 TFLOPS @ q2048/kv75k -- a 4x
+    collapse with kv length that points at split-KV scheduling / workspace
+    underfill (fewer CTAs -> idle SMs), NOT an inherent kernel limit. This sweep
+    shows exactly where the falloff happens so the next fix targets the cause.
+    Runs once at the first hd512 prefill (~8 s), independent of the kernel gate.
+    """
+    global _hd512_sweep_done
+    if _hd512_sweep_done:
+        return
+    _hd512_sweep_done = True
+    try:
+        g = torch.Generator(device = device).manual_seed(1234)
+        scale = 512 ** -0.5
+        print("[prefill] hd512 fa2 shape sweep (ms / effective TFLOPS):", flush = True)
+        for ql, kv, iters in ((256, 4096, 5), (2048, 4096, 3), (2048, 32768, 2), (2048, 75000, 2)):
+            q = torch.randn((1, ql, 8, 512), dtype = torch.half, device = device, generator = g) * 0.1
+            k = torch.randn((1, kv, 1, 512), dtype = torch.half, device = device, generator = g) * 0.1
+            v = torch.randn((1, kv, 1, 512), dtype = torch.half, device = device, generator = g) * 0.1
+            ragged_prefill(q, k, v, scale, True, -1, backend = "fa2")
+            torch.cuda.synchronize(device)
+            s = torch.cuda.Event(enable_timing = True); e = torch.cuda.Event(enable_timing = True)
+            s.record()
+            for _ in range(iters):
+                ragged_prefill(q, k, v, scale, True, -1, backend = "fa2")
+            e.record(); torch.cuda.synchronize(device)
+            ms = s.elapsed_time(e) / iters
+            flops = 4.0 * ql * (kv - ql / 2) * 8 * 512
+            print(f"[prefill]   q{ql:>5}/kv{kv:>6}: {ms:8.2f} ms  {flops / (ms * 1e-3) / 1e12:6.1f} TFLOPS", flush = True)
+            del q, k, v
+    except Exception as ex:
+        print(f"[prefill] hd512 sweep failed ({type(ex).__name__}: {ex})", flush = True)
+
+
+def hd512_cuda_prefill_ok(device) -> bool:
+    """
+    Gate for the custom wmma hd512 prefill kernel (ext_c.prefill_hd512).
+
+    DEFAULT OFF: v1 measured 2.02 ms vs fa2 0.46 ms @ q256/kv4096 (occupancy-starved
+    16-row tiles). Kept in-tree for iteration; EXL2_PREFILL_HD512_CUDA=1 re-runs the
+    parity + timing probe at a representative prefill shape (q2048/kv32768) and
+    enables only if it beats fa2 there. The fa2 shape sweep runs regardless.
+    """
+    global _hd512_cuda_ok
+    _hd512_fa2_sweep(device)
+    if _hd512_cuda_ok is not None:
+        return _hd512_cuda_ok
+    if os.environ.get("EXL2_PREFILL_HD512_CUDA", "0") == "0":
+        _hd512_cuda_ok = False
+        return False
+    try:
+        from exllamav2.ext import ext_c
+        g = torch.Generator(device = device).manual_seed(1234)
+        scale = 512 ** -0.5
+        ok = True
+        for ql, kv in ((129, 385), (64, 64), (33, 2049)):
+            q = torch.randn((1, ql, 8, 512), dtype = torch.half, device = device, generator = g) * 0.1
+            k = torch.randn((1, kv, 1, 512), dtype = torch.half, device = device, generator = g) * 0.1
+            v = torch.randn((1, kv, 1, 512), dtype = torch.half, device = device, generator = g) * 0.1
+            ref = ragged_prefill(q, k, v, scale, True, -1, backend = "fa2")
+            o = torch.empty_like(q)
+            ext_c.prefill_hd512(q[0], k[0], v[0], o[0], ql, kv, 8, 1, scale)
+            torch.cuda.synchronize(device)
+            a, b = o.float().flatten(), ref.float().flatten()
+            cos = torch.nn.functional.cosine_similarity(a, b, dim = 0).item()
+            err = (a - b).abs().max().item()
+            if not (cos > 0.999 and err < 0.01 * ref.float().abs().max().item() + 1e-3):
+                print(f"[prefill] hd512 CUDA parity FAIL @ q{ql}/kv{kv} (cos {cos:.5f}, err {err:.4f}); using fa2", flush = True)
+                ok = False
+                break
+        if ok:
+            ql, kv = 2048, 32768
+            q = torch.randn((1, ql, 8, 512), dtype = torch.half, device = device, generator = g) * 0.1
+            k = torch.randn((1, kv, 1, 512), dtype = torch.half, device = device, generator = g) * 0.1
+            v = torch.randn((1, kv, 1, 512), dtype = torch.half, device = device, generator = g) * 0.1
+            o = torch.empty_like(q)
+            for _ in range(2):
+                ext_c.prefill_hd512(q[0], k[0], v[0], o[0], ql, kv, 8, 1, scale)
+                ragged_prefill(q, k, v, scale, True, -1, backend = "fa2")
+            torch.cuda.synchronize(device)
+            s = torch.cuda.Event(enable_timing = True); e = torch.cuda.Event(enable_timing = True)
+            s.record()
+            for _ in range(3):
+                ext_c.prefill_hd512(q[0], k[0], v[0], o[0], ql, kv, 8, 1, scale)
+            e.record(); torch.cuda.synchronize(device)
+            t_cuda = s.elapsed_time(e) / 3
+            s.record()
+            for _ in range(3):
+                ragged_prefill(q, k, v, scale, True, -1, backend = "fa2")
+            e.record(); torch.cuda.synchronize(device)
+            t_fa2 = s.elapsed_time(e) / 3
+            ok = t_cuda < t_fa2
+            print(f"[prefill] hd512 CUDA kernel {'ENABLED' if ok else 'slower than fa2, keeping fa2'} "
+                  f"(cuda {t_cuda:.2f} ms vs fa2 {t_fa2:.2f} ms @ q2048/kv32768)", flush = True)
+            del q, k, v, o
+        _hd512_cuda_ok = ok
+    except Exception as ex:
+        print(f"[prefill] hd512 CUDA probe failed ({type(ex).__name__}: {ex}); using fa2", flush = True)
+        _hd512_cuda_ok = False
+    return _hd512_cuda_ok
+
+
 def smart_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -610,18 +759,39 @@ def smart_prefill(
     causal: bool = True,
     window_left: int = -1,
 ) -> torch.Tensor:
-    """Eager prefill dispatch: cuDNN (hd>256, probed) -> FA2 ragged -> single_prefill."""
-    global _cudnn_prefill_ok
-    if q.shape[3] > 256 and cudnn_prefill_ok(q.device):
-        try:
-            return ragged_prefill(q, k, v, sm_scale, causal, window_left, backend="cudnn")
-        except Exception:
-            _cudnn_prefill_ok = False
-            _evict_ragged_backend("cudnn")
+    """Eager prefill dispatch: hd512 CUDA (probed, opt-in) -> FA2 ragged -> cuDNN -> single.
+
+    FA2 FIRST for hd512 (BUG 115): the load-time shape sweep (debug99.txt) measured
+    FI's fa2 ragged hd512 at 32-43 TFLOPS across q256/kv4k .. q2048/kv75k -- NO
+    falloff with kv length. Yet live prefill ran at ~9.6 TFLOPS because this dispatch
+    preferred cuDNN whenever its tiny-shape probe passed: on sm86 the probe succeeds
+    but the hd512 cuDNN engine is ~4x slower than fa2 ragged at depth. The original
+    "cuDNN preference" was anchored to the OLD 2 TFLOPS measurement, which was the
+    single_prefill path, not ragged fa2. cuDNN remains a fallback if fa2 ever raises.
+    """
+    global _cudnn_prefill_ok, _hd512_cuda_ok
+    if q.shape[3] > 256 and causal and window_left < 0 and q.dtype == torch.half:
+        if hd512_cuda_prefill_ok(q.device):
+            try:
+                from exllamav2.ext import ext_c
+                ql, H, D = q.shape[1], q.shape[2], q.shape[3]
+                kv, KVH = k.shape[1], k.shape[2]
+                o = torch.empty_like(q)
+                with _AttnTimer(_PREFILL_TRACE and ql > 32):
+                    ext_c.prefill_hd512(q[0], k[0], v[0], o[0], ql, kv, H, KVH, sm_scale)
+                return o
+            except Exception:
+                _hd512_cuda_ok = False
     try:
         return ragged_prefill(q, k, v, sm_scale, causal, window_left, backend="fa2")
     except Exception:
         _evict_ragged_backend("fa2")
+        if q.shape[3] > 256 and cudnn_prefill_ok(q.device):
+            try:
+                return ragged_prefill(q, k, v, sm_scale, causal, window_left, backend="cudnn")
+            except Exception:
+                _cudnn_prefill_ok = False
+                _evict_ragged_backend("cudnn")
         return single_prefill(q, k, v, sm_scale=sm_scale, causal=causal,
                               window_left=window_left)
 
@@ -657,15 +827,16 @@ def single_prefill(
     # (the generator packs sequences into the sequence dimension), so this is not a hot path.
     outs = []
     for b in range(batch):
-        outs.append(flashinfer.single_prefill_with_kv_cache(
-            q[b].contiguous(),
-            k[b].contiguous(),
-            v[b].contiguous(),
-            causal = causal,
-            sm_scale = sm_scale,
-            window_left = window_left,
-            logits_soft_cap = logits_soft_cap,
-        ))
+        with _AttnTimer(_PREFILL_TRACE and seq > 32):
+            outs.append(flashinfer.single_prefill_with_kv_cache(
+                q[b].contiguous(),
+                k[b].contiguous(),
+                v[b].contiguous(),
+                causal = causal,
+                sm_scale = sm_scale,
+                window_left = window_left,
+                logits_soft_cap = logits_soft_cap,
+            ))
 
     return outs[0].unsqueeze(0) if batch == 1 else torch.stack(outs, dim = 0)
 

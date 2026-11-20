@@ -58,6 +58,40 @@ class ExLlamaV2Embedding(ExLlamaV2Module):
         self.embedding.weight = w
 
 
+    def tp_load_rank_sharded(self, rank: int):
+        """
+        Vocab-sharded embedding: load ONLY rows [a, b) of the VC split (~0.67 GB instead
+        of the 2.8 GB replicated table). forward() masks the local lookup and SUM-reduces
+        the partials -- each token id lives on exactly one rank, so the sum reconstructs
+        the full embedding row. Mirror of the vocab-parallel lm_head; together they
+        remove ~4 GB of replicated vocab tables per rank (master OOM fix, debug10.txt).
+        """
+        from exllamav2.tensor_p import BROADCAST_VC
+        cfg = self.model.config
+        ctx = self.model.tp_context
+        split = ctx.get_split(BROADCAST_VC)
+        assert len(split) == 1, f"rank {rank} owns no vocab slice of {self.key}"
+        _, a, b = split[0]
+
+        self.device_idx = -1
+        w = self.load_weight(cpu = True)
+        assert isinstance(w, nn.Parameter)
+        self.native_vocab_size = w.shape[0]
+        if cfg.scale_emb != 1:
+            w = nn.Parameter(w.data * cfg.scale_emb)
+
+        self.device_idx = rank
+        # padding_idx=None: nn.Embedding would zero LOCAL row 0 on every rank, but only
+        # the rank owning the global pad id may zero it. Replicate the semantics explicitly.
+        self.embedding = nn.Embedding(b - a, cfg.hidden_size, None, device = "meta")
+        self.embedding.weight = nn.Parameter(
+            safe_move_tensor(w.data[a:b].contiguous(), rank), requires_grad = False)
+        if cfg.pad_token_id is not None and a <= cfg.pad_token_id < b:
+            self.embedding.weight.data[cfg.pad_token_id - a].zero_()
+        del w
+        self._tp_vocab_shard = (a, b)
+        self.is_tp = False
+
     def tp_load_rank(self, rank: int):
         """
         Load the embedding table in full, pinned to one device, for a rank-local worker.
@@ -138,6 +172,14 @@ class ExLlamaV2Embedding(ExLlamaV2Module):
         input_ids = hidden_states
         hidden_states = hidden_states.clamp(min = 0)
 
+        if getattr(self, "_tp_vocab_shard", None) is not None:
+            if kwargs.get("indexed_embeddings"):
+                raise NotImplementedError(
+                    "vocab-sharded embedding does not support indexed_embeddings")
+            if loras is not None and loras[0].embed_tokens is not None:
+                raise NotImplementedError(
+                    "vocab-sharded embedding does not support embed_tokens LoRAs")
+
         # Apply indexed embeddings
 
         indexed_embeddings = kwargs.get("indexed_embeddings")
@@ -201,6 +243,25 @@ class ExLlamaV2Embedding(ExLlamaV2Module):
         else:
             if loras is not None and loras[0].embed_tokens is not None:
                 hidden_states = loras[0].embed_tokens(hidden_states)
+            elif getattr(self, "_tp_vocab_shard", None) is not None:
+                # Vocab-sharded lookup: out-of-range ids clamp to local row 0 and are
+                # zeroed, then the partials are SUM-reduced -- each id belongs to exactly
+                # one rank, so the sum is the exact full embedding row (no precision
+                # loss: one nonzero addend). ~1.5*rows*hidden*2 bytes per rank (33 MB per
+                # 2048-token chunk, 16 KB per decode token). Symmetric on every rank and
+                # graph-capturable, like the other rank-mode collectives.
+                a, b = self._tp_vocab_shard
+                ids = hidden_states
+                local = (ids - a).clamp(0, b - a - 1)
+                part = self.embedding(local)
+                part.mul_(((ids >= a) & (ids < b)).unsqueeze(-1).to(part.dtype))
+                import torch.distributed as dist
+                if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+                    from exllamav2.tensor_p import _CollTimer, _PREFILL_TRACE
+                    _ctx = self.model.tp_context
+                    with _CollTimer(_PREFILL_TRACE and ids.numel() > 32 and not _ctx.graph_mode):
+                        dist.all_reduce(part, op = dist.ReduceOp.SUM)
+                hidden_states = part
             else:
                 hidden_states = self.embedding(hidden_states)
 
