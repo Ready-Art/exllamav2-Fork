@@ -261,7 +261,7 @@ class ExLlamaV2Embedding(ExLlamaV2Module):
                     _ctx = self.model.tp_context
                     with _CollTimer(_PREFILL_TRACE and ids.numel() > 32 and not _ctx.graph_mode):
                         _p2p = getattr(_ctx, "p2p", None)
-                        if _p2p is None or _ctx.graph_mode or not _p2p.allreduce(part):
+                        if _p2p is None or not _p2p.allreduce(part):
                             dist.all_reduce(part, op = dist.ReduceOp.SUM)
                 hidden_states = part
             else:

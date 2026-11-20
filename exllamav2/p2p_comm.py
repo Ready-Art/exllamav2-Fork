@@ -27,7 +27,11 @@ class P2PComm:
     SLOT_BYTES = 1 << 20
     # 32 double-buffered slots (32 MB arena). The model uses ~14; headroom avoids
     # silent slot-exhaustion fallback (which would drop a collective to NCCL mid-graph).
-    NSLOTS = 32
+    # 64 slots: eager (~12) + each captured graph gets its OWN permanent slot region
+    # (~12/graph x decode/verify/bonus + shape variants). Per-graph isolation is what
+    # makes in-graph P2P safe -- shared keys across persistent graphs otherwise bake
+    # overlapping slots and clobber each other on replay (the gibberish bug).
+    NSLOTS = 64
 
     def __init__(self, rank: int, world: int):
         self.rank = rank
@@ -38,6 +42,8 @@ class P2PComm:
         self._slots: dict = {}
         self._alt: dict = {}
         self._next_slot = 0
+        # Slot epoch: 0 = eager; each graph capture bumps to a fresh permanent region.
+        self._epoch = 0
 
         if os.environ.get("EXL2_TP_P2P", "1") == "0":
             return
@@ -119,20 +125,32 @@ class P2PComm:
         print(f"[p2p] rank {rank}: PCIe P2P collectives ENABLED "
               f"({self.NSLOTS} x 1 MB slots, world {world})", flush = True)
 
+    def begin_graph(self) -> int:
+        """Start a fresh permanent slot region for a graph capture (warmup + capture
+        share it). Slots are NEVER reused across epochs, so persistent graphs can't
+        clobber each other's baked arena addresses on replay."""
+        self._epoch += 1
+        return self._epoch
+
+    def end_graph(self):
+        self._epoch = 0
+
     def _slot(self, key) -> int | None:
         # Double-buffered pairs, mirroring the NCCL _ag_cache aliasing contract:
         # a caller may still be reading the previous result of the SAME key when
         # the next gather runs. Alternate between the pair's two slots.
-        s = self._slots.get(key)
+        # Keyed by (epoch, key): each captured graph owns a distinct slot region.
+        k = (self._epoch, key)
+        s = self._slots.get(k)
         if s is None:
             if self._next_slot + 2 > self.NSLOTS:
                 return None
             s = self._next_slot
             self._next_slot += 2
-            self._slots[key] = s
-            self._alt[key] = 0
-        self._alt[key] ^= 1
-        return s + self._alt[key]
+            self._slots[k] = s
+            self._alt[k] = 0
+        self._alt[k] ^= 1
+        return s + self._alt[k]
 
     def _probe(self) -> bool:
         # Uses the UNGATED raw paths: self.enabled is still False here (it is set

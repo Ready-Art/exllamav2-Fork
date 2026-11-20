@@ -1150,7 +1150,7 @@ class TPContext:
         # prefill gathers and uneven splits stay on NCCL below. Symmetric decision
         # on every rank (same shapes, same enabled flag agreed at init).
         _p2p = self.p2p
-        if _p2p is not None and _p2p.enabled and not self.graph_mode \
+        if _p2p is not None and _p2p.enabled \
                 and len(set(widths)) == 1 and widths[0] == local.shape[1]:
             _out = _p2p.allgather(local, (tag, broadcast_type, widths[0], dtype),
                                   (rows, world * widths[0]))

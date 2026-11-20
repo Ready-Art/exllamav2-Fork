@@ -255,7 +255,7 @@ class ExLlamaV2RMSNorm(ExLlamaV2Module):
         ss = xf.pow(2).sum(-1, keepdim = True)
         if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
             _p2p = getattr(self.model.tp_context, "p2p", None)
-            if _p2p is None or self.model.tp_context.graph_mode or not _p2p.allreduce(ss):
+            if _p2p is None or not _p2p.allreduce(ss):
                 dist.all_reduce(ss, op = dist.ReduceOp.SUM)
         inv = torch.rsqrt(ss / self.model.config.hidden_size + self.variance_epsilon)
         # Weight is loaded FULL on every rank (the decode_repl flow needs it whole);

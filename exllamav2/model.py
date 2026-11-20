@@ -1580,6 +1580,12 @@ class ExLlamaV2:
                 # captured, plan() is host work and cannot run inside the capture region.
                 self._fi_tp_graph_plan(cache, past_len + seq_len, q_len = seq_len)
                 ctx.graph_mode = True
+                # Per-graph P2P slot region: warmup + capture bake slots from a fresh
+                # permanent epoch so this graph never shares arena slots with another
+                # persistent graph (the in-graph clobber bug). Restored to eager (0) after.
+                _p2p = getattr(ctx, "p2p", None)
+                if _p2p is not None:
+                    _p2p.begin_graph()
                 try:
                     runner.capture()
                     break
@@ -1587,6 +1593,9 @@ class ExLlamaV2:
                     _capture_err = e
                     ctx.graph_mode = False
                     runner = None
+                finally:
+                    if _p2p is not None:
+                        _p2p.end_graph()
             if runner is None:
                 if seq_len > 1:
                     # BUG 107: a verify-window capture failure must NOT disable the proven
