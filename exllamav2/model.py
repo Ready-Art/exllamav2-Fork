@@ -59,6 +59,14 @@ from exllamav2.util import get_basic_progress, timed
 from exllamav2.ext import exllamav2_ext as ext_c, none_tensor
 
 
+# BUG 117: a TP whole-step graph is only valid within this many tokens of the kv length it
+# was captured at. Beyond it the FlashInfer graph-mode attention launch (baked at capture)
+# writes out of bounds, so the step recaptures at the current length. Large enough that
+# normal generation (a few hundred tokens per job) never recaptures, small enough to stay
+# well inside the kernel's valid range; jumps across it happen at job boundaries / resets.
+TP_GRAPH_KV_ENVELOPE = 2048
+
+
 def _torch_device(idx):
     if idx == -1: return "cpu"
     return f"cuda:{idx}"
@@ -1294,6 +1302,12 @@ class ExLlamaV2:
             if r.get("row_states") is not None:
                 row_states = r["row_states"]
 
+        # BUG 117: checkpoint the FI plan buffers right after a long prefill so the
+        # guard evidence distinguishes "corrupted during prefill" from "corrupted by
+        # the first graphed decode/verify step at long context".
+        if q_len > 64 and self.tp_context is not None and cache is not None:
+            self.tp_context._fi_guard("post-prefill", cache.current_seq_len, 0)
+
         if return_row_states:
             return result, row_states
         if last_state is None:
@@ -1466,6 +1480,28 @@ class ExLlamaV2:
         runner = self.tp_graph.get(batch_size, seq_len, cache,
                                    state = state_mode, last_id_only = last_id_only)
 
+        # BUG 117: a whole-step graph captured at short context corrupts memory when it is
+        # replayed far beyond that length -- the FlashInfer graph-mode attention launch is
+        # baked at capture and is not valid at arbitrarily longer kv (the bonus graph captured
+        # at ~3k sprayed fp16 over the FI metadata buffers on its first 122k replay; a graph
+        # captured AT long context replays fine). Recapture when this step's kv falls outside
+        # the capture envelope. This fires on large context jumps (a new job after a long
+        # prefill, or a cache reset), not per token: normal generation grows kv by a few
+        # hundred tokens, well inside the envelope, so the amortized recapture cost is tiny.
+        if runner is not None:
+            _kv = past_len + seq_len
+            _cap_kv = getattr(runner, "capture_kv", 0)
+            if _kv > _cap_kv + TP_GRAPH_KV_ENVELOPE or _kv < _cap_kv - TP_GRAPH_KV_ENVELOPE:
+                # Context-regime change: rebuild EVERY graph and FlashInfer graph wrapper at
+                # the new length. Clearing the wrappers too covers both possible bad states
+                # (the capture-baked graph launch and the wrapper's first-plan sizing); all
+                # runners are released first so no live graph still references the freed
+                # wrapper buffers. Graphs stay enabled -- the shapes recapture on demand.
+                self.tp_graph.clear()
+                ctx.fi_decode.clear()
+                ctx.fi_prefill.clear()
+                runner = None
+
         def stage_inputs(input_buf):
             # Write every dynamic input on dev0's TP stream, ordered before the graph launch.
             # flash_attn_with_kvcache takes cache_seqlens as a device tensor; fill the STABLE
@@ -1610,6 +1646,9 @@ class ExLlamaV2:
                 return None
             ctx.graph_mode = False
             runner.logits = out["logits"]
+            # BUG 117: remember the kv length this graph was captured at, so a later step far
+            # outside this envelope recaptures instead of replaying an invalid baked launch.
+            runner.capture_kv = past_len + seq_len
             self.tp_graph.add(batch_size, seq_len, runner,
                               state = state_mode, last_id_only = last_id_only)
 
@@ -1661,6 +1700,9 @@ class ExLlamaV2:
                     # Replay while dev0's stream is still current: CUDAGraph.replay() launches on
                     # the torch current stream, and the graph's nodes were captured on this one.
                     runner.replay()
+                    # BUG 117: pinpoint whether a long-context graph replay is the one-shot
+                    # writer that sprays the FI metadata buffers (guard syncs the device).
+                    self.tp_context._fi_guard(f"post-replay{runner.key}", past_len + seq_len, seq_len)
                 finally:
                     torch.cuda.set_stream(prev_stream)
         finally:

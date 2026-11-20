@@ -254,9 +254,14 @@ class ExLlamaV2RMSNorm(ExLlamaV2Module):
         xf = x.float()
         ss = xf.pow(2).sum(-1, keepdim = True)
         if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-            _p2p = getattr(self.model.tp_context, "p2p", None)
-            if _p2p is None or not _p2p.allreduce(ss):
-                dist.all_reduce(ss, op = dist.ReduceOp.SUM)
+            # BUG 118: NCCL, not P2P, for the prefill stat AR. This seqpar path runs only in
+            # eager prefill, interleaved with the large NCCL allgather/reduce-scatter traffic.
+            # The P2P AR's two-phase spin rendezvous stalls waiting for peers still busy in
+            # those large NCCL kernels (~120 stat ARs/chunk), inflating prefill collective time
+            # well above the bandwidth floor (coll ~1550ms/chunk vs ~530ms). NCCL synchronizes
+            # these tiny reductions efficiently amid its own large collectives. Decode keeps
+            # P2P (its embedding AR); the decode_repl flow has no stat AR (full-width norm).
+            dist.all_reduce(ss, op = dist.ReduceOp.SUM)
         inv = torch.rsqrt(ss / self.model.config.hidden_size + self.variance_epsilon)
         # Weight is loaded FULL on every rank (the decode_repl flow needs it whole);
         # slice this rank's RS range for the shard-local multiply.

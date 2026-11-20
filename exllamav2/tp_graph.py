@@ -81,6 +81,9 @@ class TPGraphRunner:
         self.graph: torch.cuda.CUDAGraph | None = None
         self.capture_stream: torch.cuda.Stream | None = None
         self.num_replays = 0
+        # BUG 117: kv length (past_len + seq_len) at capture; the caller recaptures when a
+        # step falls outside this envelope (the graph-mode attention launch is capture-baked).
+        self.capture_kv = 0
         # Set by the caller so capture() can restore the KV cache position after its warmup
         # iterations. The warmup runs the real step, which advances cache.current_seq_len and
         # writes KV rows; without restoring it the cache is left several tokens ahead and every
@@ -375,6 +378,14 @@ class TPGraphManager:
         runner = self.runners.pop(self.key_for(batch_size, q_len, state, last_id_only), None)
         if runner is not None:
             runner.release()
+
+    def clear(self):
+        """BUG 117: release every runner (graphs stay ENABLED) on a context-regime change,
+        so all shapes recapture at the new kv length instead of replaying short-capture
+        graphs far outside their valid envelope."""
+        for k in list(self.runners.keys()):
+            self.runners.pop(k).release()
+        self.runners.clear()
 
     def disable(self, reason: str):
         self.failed = True

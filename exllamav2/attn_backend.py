@@ -311,12 +311,21 @@ class FlashInferPaged:
 
     # -- workspace ---------------------------------------------------------------------------
 
+    # BUG 117 probe: 4 KB canary allocated in the SAME block right after the workspace
+    # (a separate small tensor would land in the small pool, never adjacent). FI should
+    # never write past WORKSPACE_BYTES; if a split-KV schedule overflows the workspace,
+    # the canary catches it. Checked by TPContext._fi_guard.
+    _workspace_canary: dict = {}
+
     @classmethod
     def _get_workspace(cls, device: torch.device) -> torch.Tensor:
         key = str(device)
         ws = cls._workspace_cache.get(key)
         if ws is None:
-            ws = torch.zeros(cls.WORKSPACE_BYTES, dtype = torch.uint8, device = device)
+            full = torch.zeros(cls.WORKSPACE_BYTES + 4096, dtype = torch.uint8, device = device)
+            ws = full[:cls.WORKSPACE_BYTES]
+            cls._workspace_canary[key] = full[cls.WORKSPACE_BYTES:]
+            cls._workspace_canary[key].fill_(0xA5)
             cls._workspace_cache[key] = ws
         return ws
 

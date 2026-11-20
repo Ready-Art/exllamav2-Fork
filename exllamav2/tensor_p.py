@@ -292,6 +292,7 @@ class TPContext:
         torch.cuda.set_device(dev)
         torch.cuda.set_stream(self.streams_dev[dev])
         try:
+            self._fi_guard("decode-plan", kv_len, 1)
             if entry is None:
                 workspace = attn_backend.FlashInferPaged._get_workspace(torch.device("cuda", dev))
                 npages = depth // page
@@ -320,6 +321,7 @@ class TPContext:
                     "indices": indices,
                     "indptr": indptr,
                     "last_page_len": last_page_len,
+                    "ptrs": (indptr.data_ptr(), last_page_len.data_ptr(), indices.data_ptr()),
                 }
                 self.fi_decode[key] = entry
 
@@ -344,6 +346,9 @@ class TPContext:
                 # BUG 103: split-KV stays ENABLED (full parallel reduction). Graph safety
                 # comes from use_cuda_graph=True above (fixed buffers), not from disabling
                 # split-KV -- disabling it cost long-context decode speed unnecessarily.
+                # BUG 117 A/B knob: EXL2_FI_SPLITKV=0 disables it (default unchanged) to
+                # test whether the long-context split-KV schedule is the OOB writer.
+                disable_split_kv = os.environ.get("EXL2_FI_SPLITKV", "1") == "0",
             )
         finally:
             torch.cuda.set_stream(prev_stream)
@@ -399,6 +404,7 @@ class TPContext:
         torch.cuda.set_device(dev)
         torch.cuda.set_stream(self.streams_dev[dev])
         try:
+            self._fi_guard("prefill-plan", kv_len, q_len)
             if entry is None:
                 workspace = attn_backend.FlashInferPaged._get_workspace(torch.device("cuda", dev))
                 npages = depth // page
@@ -425,6 +431,8 @@ class TPContext:
                     "indices": indices,
                     "indptr": indptr,
                     "last_page_len": last_page_len,
+                    "ptrs": (qo_indptr.data_ptr(), indptr.data_ptr(),
+                             last_page_len.data_ptr(), indices.data_ptr()),
                 }
                 self.fi_prefill[key] = entry
 
@@ -448,6 +456,7 @@ class TPContext:
                 sm_scale = scale,
                 q_data_type = torch.half,
                 kv_data_type = k_cache_dev.dtype,
+                disable_split_kv = os.environ.get("EXL2_FI_SPLITKV", "1") == "0",
             )
         finally:
             torch.cuda.set_stream(prev_stream)
@@ -470,6 +479,99 @@ class TPContext:
         v_pages = v_cache_dev.view(npages, page, nkv, hd)
         out = entry["wrapper"].run(q.view(q_len, q.shape[2], hd), (k_pages, v_pages))
         return out.view(1, q_len, q.shape[2] * hd)
+
+    def _fi_guard(self, phase: str, kv_len: int, q_len: int):
+        """
+        BUG 117 instrumented guard: validate the fixed FI plan buffers before plan().
+
+        log.txt (122k MTP): the q_len=3 verify wrapper's qo_indptr read back as
+        garbage ("rows 721464845 ... cannot exceed ... initialization 3") on the
+        first verify after a long prefill, while the q_len=2 / decode wrappers
+        stayed intact. These buffers are created once and never rewritten (except
+        indptr[1]/last_page_len, which plan() refreshes), so garbage means an OOB
+        device write landed on them or their storage was reused. This guard checks
+        every entry's invariants + pointer stability, prints the evidence (which
+        buffer, got vs want, phase), and repairs IN PLACE -- the captured graphs
+        hold these addresses, so recreating an entry would stale them. A changed
+        data_ptr (storage reuse) cannot be repaired and raises with the evidence.
+        EXL2_FI_GUARD=0 disables; only active at kv_len > 20000 (the corruption
+        regime) so short-context runs carry no per-plan sync cost.
+        """
+        if kv_len <= 20000 or os.environ.get("EXL2_FI_GUARD", "1") == "0":
+            return
+        from exllamav2 import attn_backend
+        # Truthful readbacks: the TP streams are non-blocking, so drain the device
+        # first. (If the corruption is an ordering race, this sync also masks it --
+        # a clean run with the guard on vs a crash with EXL2_FI_GUARD=0 is itself
+        # the evidence for that class.)
+        torch.cuda.synchronize()
+        bad = []
+        reuse = []
+        for kind, d in (("decode", self.fi_decode), ("prefill", self.fi_prefill)):
+            for key, entry in d.items():
+                npages = entry["npages"]
+                ind = entry["indptr"]
+                lpl = entry["last_page_len"]
+                idx = entry["indices"]
+                ptrs = (ind.data_ptr(), lpl.data_ptr(), idx.data_ptr())
+                if kind == "prefill":
+                    ptrs = (entry["qo_indptr"].data_ptr(),) + ptrs
+                if "ptrs" in entry and entry["ptrs"] != ptrs:
+                    reuse.append((kind, key, entry["ptrs"], ptrs))
+                    continue
+                meta = torch.cat([ind, lpl, idx[:1], idx[-1:]]).cpu()
+                if kind == "prefill":
+                    qo = entry["qo_indptr"].cpu()
+                    if int(qo[0]) != 0 or int(qo[1]) != key[-1]:
+                        bad.append((kind, key, "qo_indptr", entry["qo_indptr"].data_ptr(),
+                                    qo.tolist(), [0, key[-1]]))
+                if int(meta[0]) != 0 or not (1 <= int(meta[1]) <= npages):
+                    bad.append((kind, key, "indptr", ind.data_ptr(),
+                                meta[:2].tolist(), [0, f"1..{npages}"]))
+                if not (1 <= int(meta[2]) <= 128):
+                    bad.append((kind, key, "last_page_len", lpl.data_ptr(),
+                                [int(meta[2])], "1..128"))
+                if int(meta[3]) != 0 or int(meta[4]) != npages - 1:
+                    bad.append((kind, key, "indices", idx.data_ptr(),
+                                [int(meta[3]), int(meta[4])], [0, npages - 1]))
+        ws_bad = []
+        for wkey, canary in attn_backend.FlashInferPaged._workspace_canary.items():
+            tail = canary[:1024].cpu()
+            if not bool((tail == 0xA5).all()):
+                nz = int((tail != 0xA5).sum())
+                ws_bad.append((wkey, nz, tail[:8].tolist()))
+        if not bad and not reuse and not ws_bad:
+            return
+        rank = self.rank if self.rank is not None else 0
+        print(f"[fi-guard] CORRUPTION rank={rank} phase={phase} kv_len={kv_len} q_len={q_len}",
+              flush=True)
+        for kind, key, name, ptr, got, want in bad:
+            print(f"[fi-guard]   {kind} key={key} buf={name} ptr={hex(ptr)} got={got} want={want}",
+                  flush=True)
+        for kind, key, old, new in reuse:
+            print(f"[fi-guard]   {kind} key={key} STORAGE REUSE ptrs {old} -> {new}", flush=True)
+        for wkey, nz, sample in ws_bad:
+            print(f"[fi-guard]   WORKSPACE {wkey} tail overwritten ({nz}/1024 bytes) sample={sample}",
+                  flush=True)
+        if reuse:
+            raise RuntimeError("[fi-guard] FI buffer storage reuse -- cannot repair in place "
+                               "(captured graphs hold the old addresses); evidence above")
+        for kind, key, name, ptr, got, want in bad:
+            entry = (self.fi_decode if kind == "decode" else self.fi_prefill)[key]
+            if name == "qo_indptr":
+                entry["qo_indptr"].copy_(torch.tensor([0, key[-1]], dtype=torch.int32,
+                                                      device=entry["qo_indptr"].device))
+            elif name == "indptr":
+                entry["indptr"][0] = 0   # [1] is refreshed by the plan about to run
+            elif name == "last_page_len":
+                entry["last_page_len"][0] = 1
+            elif name == "indices":
+                entry["indices"].copy_(torch.arange(entry["npages"], dtype=torch.int32,
+                                                    device=entry["indices"].device))
+        for wkey, _, _ in ws_bad:
+            attn_backend.FlashInferPaged._workspace_canary[wkey].fill_(0xA5)
+        print("[fi-guard]   repaired in place (graph addresses preserved); continuing", flush=True)
+
 
     def fi_decode_order_before_replay(self):
         """
