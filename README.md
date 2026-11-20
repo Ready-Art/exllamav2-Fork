@@ -45,6 +45,10 @@ architectures are untested here — treat them as experimental and verify correc
 - **Tested hardware:** **4× RTX 3090 (sm86) on a PCI switch with P2P enabled**
   (`NCCL_P2P_LEVEL=PXB`), no NVLink. The P2P collective path and the performance numbers in this
   README are validated on exactly this topology.
+- **Power-throttled test rig:** the 3090s are **power-limited to 200 W each via
+  [LACT](https://github.com/ilya-zlobintsev/LACT)** (stock TDP is 350 W). **Every performance number
+  here is measured at that 200 W cap — a full-powered GPU will be significantly faster.** Treat the
+  figures as a lower bound, not the ceiling.
 - **Other configurations work, but they are not the priority.** Single-process TP (`sp`), the
   `native` paged backend, non-MTP decoding, other GPU architectures, and other model families are
   functional, but they receive far less optimization effort and **will not match the performance
@@ -79,8 +83,8 @@ architectures are untested here — treat them as experimental and verify correc
 
 - **Built and tested on SM86 (Ampere — NVIDIA RTX 3090).** This fork is developed and validated
   on the Ampere `sm_86` architecture — **4× RTX 3090 on a PCI switch with P2P enabled**
-  (`NCCL_P2P_LEVEL=PXB`), no NVLink. Other architectures may work but are untested.
-  The bundled kernel build targets `TORCH_CUDA_ARCH_LIST="8.6"`.
+  (`NCCL_P2P_LEVEL=PXB`), no NVLink, **power-limited to 200 W each via LACT** (stock 350 W). Other
+  architectures may work but are untested. The bundled kernel build targets `TORCH_CUDA_ARCH_LIST="8.6"`.
 - **Python 3.12** and a CUDA build of [PyTorch](https://pytorch.org/get-started/locally/).
   Tested combination: **Python 3.12.15, torch 2.15.0+cu132**, CUDA toolkit 13.x with `nvcc` on
   `PATH` (built with nvcc 13.5 against cu132 torch — a minor-version mismatch is only a warning).
@@ -258,7 +262,8 @@ requirements, and how to run the converted model tensor-parallel.
 > [Release status](#release-status--alphabeta-proof-of-concept)). Shared for transparency.
 
 Measured on **4× RTX 3090 (sm86) on a PCI switch with P2P enabled** (`NCCL_P2P_LEVEL=PXB`),
-Gemma-4-31B EXL2 6.0 bpw, greedy:
+**power-limited to 200 W each via LACT** (stock 350 W), Gemma-4-31B EXL2 6.0 bpw, greedy.
+**These are 200 W-cap numbers — full-powered GPUs will be significantly faster:**
 
 | Mode | 4k context | counting prompt |
 |---|---:|---:|
