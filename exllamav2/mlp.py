@@ -469,9 +469,14 @@ class ExLlamaV2MLP(ExLlamaV2Module):
             # to full width for the input norm + column-parallel gate/up; keep the shard
             # for the residual add. down_proj is ALREADY column-parallel on the RS split,
             # so its output shard is the next residual shard with no extra collective.
+            # decode_repl (q_len <= 32): residual stays FULL-width -- no input gather,
+            # full-width post-norm below, no tiny stat all_reduces (see attn.py).
             residual = hidden_states
-            full = ctx.gather_residual(hidden_states)
-            post_norm = [self.pre_layernorm.forward(full)] if self.pre_layernorm else [full]
+            if ctx.decode_repl and q_len <= 32:
+                post_norm = [self.pre_layernorm.forward(hidden_states)] if self.pre_layernorm else [hidden_states]
+            else:
+                full = ctx.gather_residual(hidden_states)
+                post_norm = [self.pre_layernorm.forward(full)] if self.pre_layernorm else [full]
         else:
             hidden_states = ctx.broadcast(0, hidden_states, BROADCAST_ID)
 
@@ -496,6 +501,18 @@ class ExLlamaV2MLP(ExLlamaV2Module):
             output *= up[idx]
             # output.clamp_(min = -65504.0, max = 65504.0)
             outputs.append(output)
+
+        if ctx.seqpar and ctx.decode_repl and q_len <= 32:
+            # decode_repl: gather the down RS output shard to FULL width, post-norm
+            # full-width (no stat all_reduce), add the full residual. Mirrors attn.py.
+            outputs = ctx.allgather(1, outputs, BROADCAST_ID, BROADCAST_ID)
+            down = self.down_proj.forward_tp(outputs, output_split = True)
+            out_full = ctx.allgather(1, [down[0]], BROADCAST_RS, BROADCAST_RS)
+            if self.post_layernorm is not None:
+                out_full = self.post_layernorm.forward(out_full)
+            if self.has_residual:
+                out_full = out_full + residual
+            return out_full.view(batch_size, q_len, out_full.shape[-1])
 
         if ctx.seqpar and getattr(self, "_down_rs_row", False):
             # Row-parallel down_proj: this rank's activation shard IS its input slice, so
@@ -725,11 +742,9 @@ class ExLlamaV2MLP(ExLlamaV2Module):
             # SP: the input norm runs full-width on the allgathered residual (full weight).
             self.pre_layernorm.tp_load_rank(rank, BROADCAST_RS)
         if self.post_layernorm is not None:
-            if self.model.tp_context.seqpar:
-                # SP: the post-FF norm runs on down_proj's output SHARD.
-                self.post_layernorm.tp_load_rank_sharded(rank, BROADCAST_RS)
-            else:
-                self.post_layernorm.tp_load_rank(rank, BROADCAST_RS)
+            # FULL weight on every rank (~10 KB): the seqpar shard flow slices it in
+            # forward_tp_sharded; the decode_repl flow runs the norm full-width.
+            self.post_layernorm.tp_load_rank(rank, BROADCAST_RS)
 
         # down_proj first: it yields the permutation that gate/up must be remapped with.
         #

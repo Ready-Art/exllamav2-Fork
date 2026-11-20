@@ -1974,9 +1974,19 @@ class ExLlamaV2Attention(ExLlamaV2Module):
             # (which consume the whole hidden dim), and keep the shard for the residual
             # add at the bottom. The norm runs full-width replicated (same bytes on the
             # wire as allgathering a sharded norm result, but no extra stat collective).
+            #
+            # decode_repl (q_len <= 32, EXL2_TP_DECODE_REPLICATED): the residual stays
+            # FULL-width -- no input gather, and the post-norm below runs full-width
+            # instead of paying a tiny cross-rank stat all_reduce. At decode sizes the
+            # collectives are latency-bound, and removing ~120 stat ARs/token is the
+            # single biggest base-decode lever short of a custom PCIe kernel.
             residual = hidden_states
-            full = self.model.tp_context.gather_residual(hidden_states)
-            post_norm = self.pre_layernorm.forward(full) if self.has_norm else full
+            _ctx = self.model.tp_context
+            if _ctx.decode_repl and q_len <= 32:
+                post_norm = self.pre_layernorm.forward(hidden_states) if self.has_norm else hidden_states
+            else:
+                full = _ctx.gather_residual(hidden_states)
+                post_norm = self.pre_layernorm.forward(full) if self.has_norm else full
         else:
             hidden_states = self.model.tp_context.broadcast(0, hidden_states, BROADCAST_KV, dim = self.head_dim)
 
@@ -2468,25 +2478,42 @@ class ExLlamaV2Attention(ExLlamaV2Module):
             # (BUG 113): the GEMM applies q_perm internally to the full-width gathered
             # attention output. The post-attention norm runs on the shard (tiny cross-rank
             # RMS stat all_reduce), then the residual add is shard-local.
-            _o_row = getattr(self, "_o_fp16_row", None)
-            if _o_row is not None and q_len > 1 and not self.model.tp_context.graph_mode:
-                # Eager prefill: ROW-parallel on the fp16 logical-order shard. This rank's
-                # attention output IS the shard's input range, so the Q allgather (the
-                # layer's largest collective at hd512) is replaced by a reduce-scatter of
-                # the full-hidden partial -- 0.75*hidden vs 0.75*heads*hd bytes per rank.
-                # Decode and graphed verify keep the quantized column path above/below.
-                partial = torch.matmul(attn_outputs[0], _o_row)
-                out_shard = self.model.tp_context.reduce_scatter_hidden(partial)
-            else:
-                gathered = self.model.tp_context.allgather(
+            _ctx = self.model.tp_context
+            if _ctx.decode_repl and q_len <= 32:
+                # decode_repl: gather the RS output shard to FULL width, run the post-norm
+                # full-width (weight is loaded full; no stat all_reduce), add the full
+                # residual. One extra RS allgather replaces the tiny stat AR -- a win at
+                # decode sizes where every collective is pure PCIe latency.
+                gathered = _ctx.allgather(
                     1, attn_outputs, BROADCAST_Q, BROADCAST_Q, dim = self.head_dim
                 )
                 out_shard = self.o_proj.forward_tp(gathered, loras = loras, output_split = True)[0]
-            if self.post_layernorm is not None:
-                out_shard = self.post_layernorm.forward_tp_sharded(out_shard)
-            if self.has_residual:
-                out_shard = out_shard + residual
-            hidden_states = out_shard
+                out_full = _ctx.allgather(1, [out_shard], BROADCAST_RS, BROADCAST_RS)
+                if self.post_layernorm is not None:
+                    out_full = self.post_layernorm.forward(out_full)
+                if self.has_residual:
+                    out_full = out_full + residual
+                hidden_states = out_full
+            else:
+                _o_row = getattr(self, "_o_fp16_row", None)
+                if _o_row is not None and q_len > 1 and not _ctx.graph_mode:
+                    # Eager prefill: ROW-parallel on the fp16 logical-order shard. This rank's
+                    # attention output IS the shard's input range, so the Q allgather (the
+                    # layer's largest collective at hd512) is replaced by a reduce-scatter of
+                    # the full-hidden partial -- 0.75*hidden vs 0.75*heads*hd bytes per rank.
+                    # Decode and graphed verify keep the quantized column path above/below.
+                    partial = torch.matmul(attn_outputs[0], _o_row)
+                    out_shard = _ctx.reduce_scatter_hidden(partial)
+                else:
+                    gathered = _ctx.allgather(
+                        1, attn_outputs, BROADCAST_Q, BROADCAST_Q, dim = self.head_dim
+                    )
+                    out_shard = self.o_proj.forward_tp(gathered, loras = loras, output_split = True)[0]
+                if self.post_layernorm is not None:
+                    out_shard = self.post_layernorm.forward_tp_sharded(out_shard)
+                if self.has_residual:
+                    out_shard = out_shard + residual
+                hidden_states = out_shard
 
         elif getattr(self, "o_proj_row_parallel", False):
 
@@ -3074,8 +3101,9 @@ class ExLlamaV2Attention(ExLlamaV2Module):
             self.pre_layernorm.tp_load_rank(rank, BROADCAST_KV)
         if self.post_layernorm is not None:
             if ctx.seqpar:
-                # SP: the post-attention norm runs on the o_proj output SHARD.
-                self.post_layernorm.tp_load_rank_sharded(rank, BROADCAST_RS)
+                # FULL weight on every rank (~10 KB): the seqpar shard flow slices it in
+                # forward_tp_sharded, and the decode_repl flow runs the norm full-width.
+                self.post_layernorm.tp_load_rank(rank, BROADCAST_RS)
             else:
                 self.post_layernorm.tp_load_rank(rank, BROADCAST_KV)
 

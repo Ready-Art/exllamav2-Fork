@@ -618,6 +618,10 @@ class ExLlamaV2:
         # residual cuts prefill/long-context collective volume; EXL2_TP_SEQPAR=0 restores
         # the replicated-residual path (slightly faster pure short-ctx decode).
         self.tp_context.seqpar = os.environ.get("EXL2_TP_SEQPAR", "1") != "0"
+        # Decode/verify-sized forwards keep a FULL-width replicated residual (no tiny
+        # post-norm stat all_reduces); prefill chunks keep the seqpar shard flow.
+        self.tp_context.decode_repl = self.tp_context.seqpar and \
+            os.environ.get("EXL2_TP_DECODE_REPLICATED", "1") != "0"
         if self.tp_context.seqpar:
             assert bool(getattr(self.config.arch.lm, "tp_per_layer_geometry", False)), \
                 "EXL2_TP_SEQPAR requires the per-layer-geometry TP path (Gemma-4)"
@@ -1496,8 +1500,10 @@ class ExLlamaV2:
                 # and therefore outside the graph (see the note above).
                 x = input_buf
                 # Sequence-parallel: the residual stream runs as this rank's hidden shard;
-                # slice the replicated embedding locally (no collective).
-                if ctx.seqpar:
+                # slice the replicated embedding locally (no collective). Decode-sized
+                # steps keep the full width (decode_repl) -- no shard, no final gather.
+                _repl_step = ctx.decode_repl and seq_len <= 32
+                if ctx.seqpar and not _repl_step:
                     x = ctx.shard_residual(x)
                 for idx, module in enumerate(self.modules):
                     if idx < first_module:
@@ -1509,7 +1515,9 @@ class ExLlamaV2:
                         break
                     # Sequence-parallel: reassemble the full hidden width before the final
                     # norm / head / state extraction (the only full-width consumers left).
-                    if ctx.seqpar and idx == self.head_layer_idx - 1:
+                    # decode_repl steps are already full-width -- gathering again would
+                    # allgather the FULL tensor to world*width (garbage).
+                    if ctx.seqpar and not _repl_step and idx == self.head_layer_idx - 1:
                         x = ctx.gather_residual(x)
                     # MTP state: capture BEFORE the final norm (module head_layer_idx - 1)
                     # runs -- the same point forward_chunk's eager extract_state_indices clones
@@ -1755,8 +1763,11 @@ class ExLlamaV2:
 
                 # Sequence-parallel: reassemble the full hidden width before the final
                 # norm / head / state extraction (mirrors the graphed step_fn).
+                # decode_repl steps are already full-width (see attn/mlp.forward_tp_old).
+                _repl_chunk = self.tp_context is not None and self.tp_context.decode_repl \
+                    and seq_len <= 32
                 if self.tp_context is not None and self.tp_context.seqpar \
-                        and idx == self.head_layer_idx - 1:
+                        and not _repl_chunk and idx == self.head_layer_idx - 1:
                     x = self.tp_context.gather_residual(x)
 
                 if idx == self.head_layer_idx and last_id_only:
@@ -1790,7 +1801,8 @@ class ExLlamaV2:
 
                 # Sequence-parallel: the replicated embedding output enters the block
                 # stack as this rank's hidden shard (pure local slice, no collective).
-                if idx == 0 and self.tp_context is not None and self.tp_context.seqpar:
+                if idx == 0 and self.tp_context is not None and self.tp_context.seqpar \
+                        and not _repl_chunk:
                     x = self.tp_context.shard_residual(x)
 
                 if os.environ.get("EXL2_TRACE_X") and not isinstance(x, torch.Tensor):

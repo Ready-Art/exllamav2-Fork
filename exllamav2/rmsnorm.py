@@ -247,15 +247,22 @@ class ExLlamaV2RMSNorm(ExLlamaV2Module):
         eps added after the mean, Gemma's +1 weight bias already folded at load.
         """
         import torch.distributed as dist
+        from exllamav2.tensor_p import BROADCAST_RS
         assert not getattr(self, "is_tp", False), \
-            "forward_tp_sharded expects a rank-local sharded norm (tp_load_rank_sharded)"
+            "forward_tp_sharded expects a rank-local norm (tp_load_rank)"
         x = hidden_states.view(-1, hidden_states.shape[-1])
         xf = x.float()
         ss = xf.pow(2).sum(-1, keepdim = True)
         if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
             dist.all_reduce(ss, op = dist.ReduceOp.SUM)
         inv = torch.rsqrt(ss / self.model.config.hidden_size + self.variance_epsilon)
-        out = (xf * inv * self.weight.float()).to(x.dtype)
+        # Weight is loaded FULL on every rank (the decode_repl flow needs it whole);
+        # slice this rank's RS range for the shard-local multiply.
+        w = self.weight
+        if w.numel() == self.model.config.hidden_size:
+            _, a, b = self.model.tp_context.get_split(BROADCAST_RS)[0]
+            w = w[a:b]
+        out = (xf * inv * w.float()).to(x.dtype)
         return out.view(hidden_states.shape)
 
     def forward_torch(

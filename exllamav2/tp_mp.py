@@ -140,11 +140,16 @@ def mp_worker(conn, device, world_size, rank, init_method, uuid_hex, model_dir, 
         except EOFError:
             break
         if msg == "quit":
-            try:
-                torch.cuda.synchronize()
-                dist.destroy_process_group()
-            except Exception:
-                pass
+            # Do NOT synchronize / destroy_process_group here: with peers exiting at
+            # different times the NCCL teardown blocks indefinitely (the shutdown
+            # freeze that left VRAM-holding processes behind). Process exit releases
+            # the CUDA context and VRAM; the parent escalates to SIGTERM/SIGKILL if
+            # exit stalls, and the watchdog below bounds it no matter what.
+            def _quit_watchdog():
+                import time
+                time.sleep(5)
+                os._exit(0)
+            threading.Thread(target = _quit_watchdog, daemon = True).start()
             break
 
         cmd, args = msg
@@ -419,6 +424,9 @@ class TPWorkerHandle:
             self.conn.send("quit")
         except Exception:
             pass
+        self.join_and_escalate()
+
+    def join_and_escalate(self):
         self.proc.join(timeout = 5)
         if self.proc.is_alive():
             self.proc.terminate()
@@ -848,8 +856,23 @@ class TPProcessGroup:
         return logits
 
     def close(self):
+        # Stop any in-flight prefill at its next chunk boundary so workers reach the
+        # quit command promptly instead of finishing a multi-minute job first.
+        try:
+            self.abort_flag.set()
+        except Exception:
+            pass
+        # Broadcast quit to ALL workers BEFORE joining any. The old sequential
+        # quit/join left worker 1 blocked in NCCL teardown waiting for peers that
+        # had not been told to quit yet -- every shutdown paid the full timeout
+        # escalation per worker, and a stuck teardown froze the whole exit.
         for w in self.workers.values():
-            w.close()
+            try:
+                w.conn.send("quit")
+            except Exception:
+                pass
+        for w in self.workers.values():
+            w.join_and_escalate()
         self.workers = {}
         # BUG 92: the master's NCCL teardown hangs indefinitely once the worker
         # ranks have already destroyed their comms and exited -- the main thread

@@ -18,6 +18,14 @@ BROADCAST_VC = 2
 BROADCAST_RS = 3
 BROADCAST_Q = 4
 
+# Decode-time replicated-residual flow (EXL2_TP_DECODE_REPLICATED): forwards with
+# q_len <= this threshold keep the residual FULL-width on every rank instead of the
+# seqpar hidden shard. Same weights, same math -- but the two tiny per-layer post-norm
+# stat all_reduces (the worst latency offenders at ~120/token) disappear, replaced by
+# full-width post-norms on the already-gathered projection outputs. Prefill chunks
+# (large q_len) keep the seqpar shard flow and its collective-volume win.
+DECODE_REPL_MAX_Q = 32
+
 
 # Prefill cost attribution (EXL2_PREFILL_TRACE): CUDA-event pairs recorded around the
 # large rank-mode collectives, drained once per chunk by model.forward's trace print.
@@ -194,6 +202,8 @@ class TPContext:
         # and projection outputs run on shards, and only the column-parallel inputs are
         # allgathered to full width. See attn/mlp.forward_tp_old.
         self.seqpar = False
+        # Set by load_tp_rank (MP rank-local path only); single-process TP keeps False.
+        self.decode_repl = False
 
         # FlashInfer paged decode wrappers for head_dim > 256 layers in CUDA-graph mode
         # (Gemma-4's hd512 global layers). One wrapper per (device, geometry): all such

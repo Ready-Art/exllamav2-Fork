@@ -308,6 +308,7 @@ All optional; defaults are the verified best state. Set them in the server/proce
 | Variable | Default | Effect |
 |---|---|---|
 | `EXL2_TP_SEQPAR` | `1` | MP sequence-parallel hidden-sharded residual (less collective volume; prefill/long-context win). `0` = replicated-residual TP (slightly faster pure short-context decode). |
+| `EXL2_TP_DECODE_REPLICATED` | `1` | Decode/verify-sized forwards (q_len ≤ 32) keep a full-width replicated residual: no input gather and full-width post-norms, removing the ~120 tiny post-norm stat all-reduces per token (the base-decode latency win). Prefill chunks keep the seqpar shard flow. `0` = shard flow everywhere. |
 | `EXL2_MTP_BONUS_ELIM` | `1` | MP MTP bonus-forward elimination (one target forward per round). `0` = legacy verify+bonus protocol. |
 | `EXL2_VERIFY_PREFILL` | `1` | Graphed MTP verify uses one single-pass FlashInfer paged-prefill kernel per layer (KV read once for all rows). `0` = per-row decode kernels. Per-row/torch fallbacks are automatic if a plan can't serve a shape. |
 | `EXL2_TP_VOCAB_HEAD` | `1` | Vocab-shard the fp16 lm_head across ranks (¼ each) + logits all-gather; frees ~2 GB on the master. `0` = replicated master-only head. Requires an unquantized head. |
