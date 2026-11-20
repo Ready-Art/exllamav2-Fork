@@ -1561,6 +1561,17 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                     sm_scale = self.scaling,
                     causal = causal,
                 )
+            elif softcap is None:
+                # Persistent-wrapper prefill; hd512 prefers the probed cuDNN engine
+                # (the FA2 hd512 prefill kernel is the kv_len-scaling chunk cost).
+                attn_output = attn_backend.smart_prefill(
+                    q_states,
+                    k_states,
+                    v_states,
+                    sm_scale = self.scaling,
+                    causal = causal,
+                    window_left = window_left,
+                )
             else:
                 attn_output = attn_backend.single_prefill(
                     q_states,
@@ -2349,7 +2360,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                                 # causal=True aligns the query block to the END of the
                                 # ring prefix (row i sees keys <= cache_a + _drop + i);
                                 # window_left is INCLUSIVE, hence sliding_window - 1.
-                                attn_output = attn_backend.single_prefill(
+                                attn_output = attn_backend.smart_prefill(
                                     q[idx][:, _drop:, :, :],
                                     k_cache[idx][:batch_size, :cache_b, :, :],
                                     v_cache[idx][:batch_size, :cache_b, :, :],

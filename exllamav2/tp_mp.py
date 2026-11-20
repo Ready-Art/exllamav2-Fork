@@ -414,6 +414,10 @@ class TPProcessGroup:
         self._mtp_kv = None
         self._init_method = None
         self._world_size = len(gpu_split)
+        # Client-disconnect abort: set by the API layer (job.cancel), polled by
+        # model.forward at every prefill chunk boundary on the master rank and
+        # broadcast to the workers with a MAX all_reduce (same-boundary abort).
+        self.abort_flag = multiprocessing.Event()
 
     def start(self):
         port = _find_free_port()
@@ -464,6 +468,9 @@ class TPProcessGroup:
         self.master_ctx["model"] = model
         self.master_ctx["cfg"] = cfg
         self.master_ctx["cache"] = cache
+        # Abortable prefill: only the master polls the API-layer event; the workers
+        # contribute 0 to the per-chunk MAX all_reduce (see model.forward).
+        model.tp_context.abort_flag = self.abort_flag
 
         # Wait for every worker to finish loading.
         for device, w in sorted(self.workers.items()):
@@ -512,8 +519,10 @@ class TPProcessGroup:
                 _logits, _state = self.forward_state(dummy, last_id_only = True,
                                                      cpu_logits = True)
                 drafter.gather_target(self)
+                # last_state is (1, q_len, H) from the eager multi-token prefill -- the
+                # drafter consumes only the LAST row (same slice mtp_mp.begin() applies).
                 drafter.draft_window(torch.tensor([[0]], dtype = torch.long),
-                                     _state.float().cpu(), 2, 1)
+                                     _state[:, -1:, :].float().cpu(), 2, 1)
                 self.mtp_reset_cache()
                 print(f"[mtp] warmup done in {_time.perf_counter() - _t0:.1f}s", flush=True)
             except Exception as e:
@@ -557,6 +566,8 @@ class TPProcessGroup:
         self.cache.window_beg = 0
         # drop any cached MTP gather buffers so the next gather starts fresh
         self._mtp_kv = None
+        # a stale disconnect abort from a previous job must not kill this one
+        self.abort_flag.clear()
 
     def gather_kv_mtp(self):
         """Give the drafter the target's last full (59) and sliding (58) K/V, joined

@@ -1109,6 +1109,24 @@ class ExLlamaV2:
         chunk_begin = 0
         while chunk_begin < q_len:
 
+            # Abortable prefill (MP rank mode): a client disconnect must stop the chunk
+            # loop, not just the token loop -- an 80k prompt otherwise keeps processing
+            # for minutes after the request is gone. The master polls the shared abort
+            # event; a 4-byte MAX all_reduce makes EVERY rank reach the same decision at
+            # the SAME chunk boundary (a local-only check would desync the ranks and hang
+            # the next collective). One tiny collective per chunk is negligible against
+            # seconds of chunk work; decode (q_len == 1) and graphs are untouched.
+            if self.tp_context is not None and self.tp_context.rank is not None and q_len > 1:
+                import torch.distributed as _dist
+                _ctx = self.tp_context
+                if _ctx._abort_dev is None:
+                    _ctx._abort_dev = torch.zeros(1, dtype = torch.int32, device = _ctx.device)
+                _ctx._abort_dev.fill_(
+                    1 if (_ctx.abort_flag is not None and _ctx.abort_flag.is_set()) else 0)
+                _dist.all_reduce(_ctx._abort_dev, op = _dist.ReduceOp.MAX)
+                if _ctx._abort_dev.item():
+                    return None
+
             # Limit chunk_size to max_input_len
 
             chunk_size = min(remaining_q_len, effective_max_input_len)
@@ -1189,7 +1207,12 @@ class ExLlamaV2:
                 **kwargs
             )
 
-            if abort_event and abort_event.is_set(): return
+            # In MP rank mode the collective flag at the top of the loop is the abort
+            # authority -- a master-local return here would leave the workers parked in
+            # the next chunk's collective.
+            if abort_event and abort_event.is_set() \
+                    and (self.tp_context is None or self.tp_context.rank is None):
+                return
 
             if _trace:
                 print(f"[prefill] {chunk_end}/{q_len} "

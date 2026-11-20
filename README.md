@@ -40,7 +40,9 @@ architectures are untested here — treat them as experimental and verify correc
 |---|---|
 | **Multi-GPU tensor parallelism (TP)** | Shard one model across GPUs. Single-process TP (`load_tp`, `--gpu_split`) for simplicity. |
 | **Multiprocess backend (MP)** | One worker process per GPU (`TPProcessGroup`) so dispatch overlaps across devices — higher decode throughput than single-process TP. |
-| **MTP speculative decoding** | A Gemma-4 *assistant* drafter proposes a window of tokens; the target verifies them in one forward. Works **with TP and MP** (the drafter gathers the target's sharded K/V). |
+| **MTP speculative decoding** | A Gemma-4 *assistant* drafter proposes a window of tokens; the target verifies them in one forward. Works **with TP and MP**, greedy **and sampled** (probabilistic speculative acceptance — the output distribution is exactly target-autoregressive at any temperature). The MP driver eliminates the separate bonus-token forward: the bonus becomes row 0 of the next verify window, so a round costs **one** target forward. |
+| **Sequence-parallel residual (MP)** | The residual stream lives as a per-rank hidden shard (`EXL2_TP_SEQPAR`, default on): sharded post-norms with a tiny cross-rank RMS-stat all-reduce, column-parallel output projections whose shard *is* the next residual shard. Cuts collective volume vs replicated-residual TP — the win is prefill and long context. |
+| **Long-prompt prefill** | head_dim-512 prefill runs on the **cuDNN fused engine** (probed at load, automatic FlashInfer-fa2 fallback) with persistent per-geometry wrappers — one plan per chunk instead of one per layer. Sliding layers use FlashInfer's windowed kernel. Long prompts no longer crawl (the old fa2 hd512 prefill kernel scaled linearly with context at a fraction of tensor-core peak). |
 | **Gemma-4-31B-IT support** | Text-only. Handles the model's two attention geometries (head_dim 256 sliding / 512 full), `k_eq_v` layers, proportional RoPE and per-layer norms. |
 | **Sliding-window + TP KV cache** | `ExLlamaV2Cache_SWA` / `ExLlamaV2Cache_TP`: ring buffers for sliding layers make long context fit (≈22.5 GB instead of ≈236 GB at 256k for Gemma-4-31B). |
 | **TP CUDA graphs** | Whole-step decode graphs (`tp_graph`) remove per-op launch latency on the tensor-parallel path. |
@@ -156,11 +158,20 @@ gen.begin_stream(input_ids, settings, token_healing=True)
 
 For the MP backend use `MTPMPDriver` (`exllamav2/mtp_mp.py`); runnable benchmarks and examples
 are in [`mtp/`](mtp/). Every emitted token is sampled from the **target's** verified logits.
-Under sampling, a token that deviates from the cached draft/bonus token triggers a
-rewind-and-recommit of the cache (BUG 100 fix), so the K/V cache can never desync from the
-emitted text and the output distribution stays exactly target-autoregressive. Greedy MTP
+Under sampling, the driver uses **probabilistic speculative acceptance**: a draft token is
+accepted with probability `p_target(draft)`, and on rejection the replacement is drawn from
+the residual distribution — no extra forward, no rewind-and-recommit. The emitted
+distribution is exactly target-autoregressive at any temperature; draft quality only affects
+the acceptance *rate*. The K/V cache can never desync from the emitted text. Greedy MTP
 matches plain autoregressive generation except for rare fp16 near-tie flips between the
 verify-window and single-token decode attention kernels on long prose.
+
+The MP round protocol is **bonus-forward-eliminated**: the bonus token decided by a round
+becomes row 0 of the *next* round's verify window (W+1 rows), which writes its K/V, produces
+its logits and returns its hidden state (per-row pre-final-norm states are extracted inside
+the verify CUDA graph). The drafter seeds from the last committed token's state. One target
+forward per round instead of two. `EXL2_MTP_BONUS_ELIM=0` restores the legacy two-forward
+protocol.
 
 ## Gemma-4-31B-IT
 
@@ -180,7 +191,9 @@ internals are per-layer:
 | KV cache | ring buffer, 1280 tokens | full `max_seq_len` |
 
 Both geometries run on FlashInfer on sm86: the hd512 full layers use the paged decode wrapper
-(including CUDA-graph mode) and FlashInfer prefill; the sliding layers use its windowed kernels.
+(including CUDA-graph mode), a single-pass paged-prefill kernel for the graphed MTP verify
+window, and the cuDNN fused engine for eager prefill; the sliding layers use its windowed
+kernels. Client disconnects abort long prefills at the next chunk boundary on every rank.
 
 Use the `gemma4` prompt format:
 ```
@@ -201,7 +214,7 @@ OpenAI-compatible API with:
 - `tensor_parallel_backend: sp` (single-process TP) or `mp` (one worker per GPU),
 - MTP drafting via `draft_model.draft_mode: mtp` + the
   [gemma-4-31B-it-assistant](https://huggingface.co/google/gemma-4-31B-it-assistant) drafter
-  (greedy requests on MP; full sampler on SP),
+  (full sampler on **both** SP and MP — probabilistic speculative acceptance),
 - TP CUDA graphs (`tp_graphs`) and FlashInfer controls,
 - Gemma-4 **thinking** (thought-channel `reasoning_content`) and **tool calls** (`gemma4` tool
   format), plus `reasoning_effort` on chat completions.
@@ -226,27 +239,49 @@ requirements, and how to run the converted model tensor-parallel.
 > Early proof-of-concept numbers — **below the target**, not a tuned result (see
 > [Release status](#release-status--alphabeta-proof-of-concept)). Shared for transparency.
 
-Measured on 4× RTX 3090 (sm86, PCIe), Gemma-4-31B EXL2 6.0 bpw, greedy:
+Measured on 4× RTX 3090 (sm86, PCIe), Gemma-4-31B EXL2 6.0 bpw:
 
-| Mode | 4k context | counting prompt |
-|---|---:|---:|
-| Plain decode (MP) | ~39 tok/s | ~40 tok/s |
-| **MTP (MP)** | **~40 tok/s** | **~53 tok/s (≈1.35×)** |
+| Mode | Context | Throughput |
+|---|---|---:|
+| **MTP (MP), temp 1.0 / top_p 0.92, window 3** | ~1.3k | **~40 tok/s** |
+| MTP (MP), greedy | 4k | ~40 tok/s |
+| MTP (MP), greedy, counting prompt | 4k | ~53 tok/s (≈1.35× plain) |
+| Plain decode (MP), greedy | 4k | ~39 tok/s |
 
-MTP acceptance ≈ 2.7 tokens/round on mixed prose, ≈ 3.9 on structured prompts, up to 5–6 on
-arithmetic. Speedups scale with acceptance; long-context (32k/64k) MTP also matches or beats plain
-decode. Numbers vary with prompt, context length and hardware. **Short-context caveat:** at ~512
-tokens of context, MP MTP greedy currently runs *slower* than plain MP decode (~27 vs ~37 tok/s
-measured through TabbyAPI) — the per-round fixed costs (worker-pipe K/V gather/rewind round trips
-and the torch hd512 verify-window attention) dominate when there is little context to amortize
-them over. Reducing those round costs is the main MTP optimization target.
+Sampled MTP is practical: probabilistic speculative acceptance (no resync forwards) plus the
+bonus-forward-eliminated round protocol bring temperature-1.0 generation to ~40 tok/s at ~1.3k
+context — a round is one verify forward (~39 ms), one eager drafter window (~12 ms) and a packed
+K/V gather (~1-4 ms), emitting ~2.4-2.5 tokens/round at ~1.4-1.5 acceptance. Acceptance ≈ 2.7
+tokens/round on mixed prose and ≈ 3.9 on structured prompts with wider windows; speedups scale
+with acceptance. Numbers vary with prompt, context length and hardware.
 
-**Sampling caveat:** the numbers above are greedy. Under sampling (e.g. temperature 1.0), every
-deviation from the drafted tokens costs a rewind + recommit forward (the BUG 100 correctness
-fix), so MTP throughput drops toward — or below — plain decode at short context (~12 vs ~19 tok/s
-SP measured at temp 1.0 / top_p 0.92). MTP's speedup is concentrated in greedy / low-temperature
-/ structured generation where acceptance is high; probabilistic speculative acceptance to recover
-sampling throughput is future work.
+**Prefill:** long prompts are dramatically faster than earlier builds. head_dim-512 prefill now
+runs on the cuDNN fused engine with persistent per-geometry FlashInfer wrappers (one plan per
+chunk, not per layer); sliding layers use FlashInfer's windowed kernel instead of a materialized
+torch mask. Previously the fa2 hd512 prefill kernel ran far below tensor-core peak and ms/chunk
+grew linearly with context (≈0.9 s/chunk early → ≈5.4 s/chunk at 56k of a 75k prompt). Set
+`EXL2_PREFILL_TRACE=1` (default) to watch per-chunk progress on long loads.
+
+**Remaining headroom:** decode is still collective-latency-bound over PCIe (no NVLink) — the
+tensor-parallel all-gathers and the quantized-GEMM efficiency are the main bottlenecks, and
+short-context MTP still carries per-round fixed costs. Reaching vLLM/llama.cpp-class sampled
+throughput on this hardware is the ongoing target.
+
+## Performance controls (environment variables)
+
+All optional; defaults are the verified best state. Set them in the server/process environment.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `EXL2_TP_SEQPAR` | `1` | MP sequence-parallel hidden-sharded residual (less collective volume; prefill/long-context win). `0` = replicated-residual TP (slightly faster pure short-context decode). |
+| `EXL2_MTP_BONUS_ELIM` | `1` | MP MTP bonus-forward elimination (one target forward per round). `0` = legacy verify+bonus protocol. |
+| `EXL2_VERIFY_PREFILL` | `1` | Graphed MTP verify uses one single-pass FlashInfer paged-prefill kernel per layer (KV read once for all rows). `0` = per-row decode kernels. Per-row/torch fallbacks are automatic if a plan can't serve a shape. |
+| `EXL2_PREFILL_CUDNN` | `1` | Prefer the cuDNN fused engine for head_dim>256 eager prefill (probed once at load; automatic fa2/single-prefill fallback). `0` = FlashInfer fa2 only. |
+| `EXL2_MTP_WARMUP` | `1` | Compile FlashInfer kernels at load (dummy prefill + draft step) instead of on the first request. `0` skips. |
+| `EXL2_PREFILL_TRACE` | `1` | Print `[prefill] N/total (ms/chunk)` progress for prompts >64 tokens. `0` disables. |
+| `EXL2_MTP_DRAFT_GRAPH` | `0` | Opt-in drafter CUDA graph. Eager FlashInfer drafting is the verified best state; the graphed drafter is bandwidth-bound at long context. |
+| `EXL2_TP_GRAPHS` | `1` | Whole-step TP CUDA graphs (decode, bonus, verify). `0` = eager TP. |
+| `NCCL_P2P_LEVEL` | — | `PXB` is the tested setting for 4× 3090 PCIe rigs. |
 
 ## Upstream features
 

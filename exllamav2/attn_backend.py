@@ -511,6 +511,121 @@ class FlashInferPaged:
 # Non-paged (no cache) helpers, used by _attn_flash
 # ---------------------------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------------------------
+# Eager prefill: persistent ragged wrappers + cuDNN for head_dim 512
+# ---------------------------------------------------------------------------------------------
+#
+# Prefill chunk-curve fix (2026-11-20): the stateless single_prefill API builds a fresh
+# wrapper and plan per layer per chunk (60 plans/chunk), and on sm86 "auto" resolves to
+# the FA2 backend, whose hd512 prefill kernel runs far below tensor-core peak -- the
+# measured ms/chunk grew ~linearly with kv_len (~900 ms early -> ~5400 ms at 56k on a
+# 75k prompt). Two fixes:
+#   1. Persistent per-geometry ragged wrappers; plan once per (q_len, kv_len) -- layers
+#      sharing a geometry within a chunk reuse the plan (60 plans/chunk -> 2).
+#   2. head_dim > 256 prefill prefers the cuDNN fused engine (backend="cudnn"), which
+#      handles large head dims at tensor-core efficiency on Ampere. Probed once with a
+#      tiny shape; any failure falls back to FA2 ragged, then to stateless single_prefill.
+#      EXL2_PREFILL_CUDNN=0 disables the cuDNN preference.
+# Wrappers share the per-device 128 MB workspace with the paged wrappers; all runs are
+# sequential on the TP stream (eager prefill is never graph-captured), so sharing is safe.
+
+_ragged_wrappers: dict = {}
+_ragged_planned: dict = {}
+_cudnn_prefill_ok: bool | None = None
+
+
+def _ragged_key(q, k, sm_scale, window_left, backend):
+    return (str(q.device), q.shape[2], k.shape[2], q.shape[3],
+            sm_scale, window_left, backend)
+
+
+def _evict_ragged_backend(backend):
+    for d in (_ragged_wrappers, _ragged_planned):
+        for key in [key for key in d if key[-1] == backend]:
+            del d[key]
+
+
+def ragged_prefill(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    sm_scale: float,
+    causal: bool = True,
+    window_left: int = -1,
+    backend: str = "fa2",
+) -> torch.Tensor:
+    """Persistent-wrapper ragged prefill. q/k/v are [1, seq, heads, head_dim]."""
+    key = _ragged_key(q, k, sm_scale, window_left, backend)
+    wrapper = _ragged_wrappers.get(key)
+    if wrapper is None:
+        workspace = FlashInferPaged._get_workspace(q.device)
+        wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+            workspace, "NHD", backend=backend)
+        _ragged_wrappers[key] = wrapper
+    ql, kv = q.shape[1], k.shape[1]
+    if _ragged_planned.get(key) != (ql, kv, causal):
+        qo_indptr = torch.tensor([0, ql], dtype=torch.int32, device=q.device)
+        kv_indptr = torch.tensor([0, kv], dtype=torch.int32, device=q.device)
+        wrapper.plan(
+            qo_indptr=qo_indptr,
+            kv_indptr=kv_indptr,
+            num_qo_heads=q.shape[2],
+            num_kv_heads=k.shape[2],
+            head_dim_qk=q.shape[3],
+            head_dim_vo=v.shape[3],
+            causal=causal,
+            sm_scale=sm_scale,
+            window_left=window_left,
+            q_data_type=q.dtype,
+            kv_data_type=k.dtype,
+        )
+        _ragged_planned[key] = (ql, kv, causal)
+    return wrapper.run(q[0], k[0], v[0]).unsqueeze(0)
+
+
+def cudnn_prefill_ok(device: torch.device) -> bool:
+    """One-time tiny-shape probe of the cuDNN ragged prefill backend (hd512)."""
+    global _cudnn_prefill_ok
+    if _cudnn_prefill_ok is None:
+        if os.environ.get("EXL2_PREFILL_CUDNN", "1") == "0":
+            _cudnn_prefill_ok = False
+        else:
+            try:
+                z = torch.zeros((1, 2, 8, 512), dtype=torch.half, device=device)
+                kv = torch.zeros((1, 2, 1, 512), dtype=torch.half, device=device)
+                ragged_prefill(z, kv, kv, 512 ** -0.5, backend="cudnn")
+                torch.cuda.synchronize(device)
+                _cudnn_prefill_ok = True
+            except Exception:
+                _cudnn_prefill_ok = False
+                _evict_ragged_backend("cudnn")
+    return _cudnn_prefill_ok
+
+
+def smart_prefill(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    sm_scale: float,
+    causal: bool = True,
+    window_left: int = -1,
+) -> torch.Tensor:
+    """Eager prefill dispatch: cuDNN (hd>256, probed) -> FA2 ragged -> single_prefill."""
+    global _cudnn_prefill_ok
+    if q.shape[3] > 256 and cudnn_prefill_ok(q.device):
+        try:
+            return ragged_prefill(q, k, v, sm_scale, causal, window_left, backend="cudnn")
+        except Exception:
+            _cudnn_prefill_ok = False
+            _evict_ragged_backend("cudnn")
+    try:
+        return ragged_prefill(q, k, v, sm_scale, causal, window_left, backend="fa2")
+    except Exception:
+        _evict_ragged_backend("fa2")
+        return single_prefill(q, k, v, sm_scale=sm_scale, causal=causal,
+                              window_left=window_left)
+
+
 def single_prefill(
     q: torch.Tensor,
     k: torch.Tensor,

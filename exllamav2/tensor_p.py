@@ -143,6 +143,14 @@ class TPContext:
         # single-process path. Set by TPContext.set_rank() from a worker before loading.
         self.rank = None
 
+        # Abortable prefill (MP): the master's TPProcessGroup sets abort_flag to a
+        # multiprocessing.Event the API layer signals on client disconnect. model.forward
+        # polls it at every prefill chunk boundary and propagates the decision with a tiny
+        # MAX all_reduce so ALL ranks abort at the SAME chunk (a local-only check would
+        # desync the ranks and hang NCCL). Workers leave it None and contribute 0.
+        self.abort_flag = None
+        self._abort_dev = None
+
         # Sequence-parallel (hidden-sharded residual) mode, EXL2_TP_SEQPAR=1. Set by
         # model.load_tp_rank() BEFORE any module loads (the loaders shard norm weights
         # and pick o_proj's parallel layout from it). MP rank-local path only: the
