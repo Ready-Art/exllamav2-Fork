@@ -2496,14 +2496,35 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                 hidden_states = out_full
             else:
                 _o_row = getattr(self, "_o_fp16_row", None)
-                if _o_row is not None and q_len > 1 and not _ctx.graph_mode:
+                _o_row_cpu = getattr(self, "_o_fp16_row_cpu", None)
+                if (_o_row is not None or _o_row_cpu is not None) and q_len > 1 and not _ctx.graph_mode:
                     # Eager prefill: ROW-parallel on the fp16 logical-order shard. This rank's
                     # attention output IS the shard's input range, so the Q allgather (the
                     # layer's largest collective at hd512) is replaced by a reduce-scatter of
                     # the full-hidden partial -- 0.75*hidden vs 0.75*heads*hd bytes per rank.
                     # Decode and graphed verify keep the quantized column path above/below.
+                    if _o_row is None:
+                        # BUG 119: shard lives in pinned host memory; stage it into a SHARED GPU
+                        # buffer (context-level, keyed by shape -- only hd512/hd256 shapes exist,
+                        # ~33 MiB total) reused across all layers, since they run sequentially on
+                        # one stream. Per-module buffers would re-accumulate to ~1.3 GB. This makes
+                        # O_RS=2 cost ~33 MiB persistent instead of 1.47 GB/rank that OOMed GPU0.
+                        _pool = getattr(_ctx, "_o_rs_stage_bufs", None)
+                        if _pool is None:
+                            _pool = {}
+                            _ctx._o_rs_stage_bufs = _pool
+                        _key = (_o_row_cpu.shape, _o_row_cpu.dtype, attn_outputs[0].device)
+                        _buf = _pool.get(_key)
+                        if _buf is None:
+                            _buf = torch.empty(_o_row_cpu.shape, dtype = _o_row_cpu.dtype,
+                                               device = attn_outputs[0].device)
+                            _pool[_key] = _buf
+                        _buf.copy_(_o_row_cpu, non_blocking = True)
+                        _o_row = _buf
                     partial = torch.matmul(attn_outputs[0], _o_row)
                     out_shard = _ctx.reduce_scatter_hidden(partial)
+                    if _o_row_cpu is not None:
+                        del partial
                 else:
                     gathered = _ctx.allgather(
                         1, attn_outputs, BROADCAST_Q, BROADCAST_Q, dim = self.head_dim
@@ -3140,17 +3161,35 @@ class ExLlamaV2Attention(ExLlamaV2Module):
             self.o_proj.tp_load_rank(rank, BROADCAST_RS)
             # Eager prefill can additionally get an fp16 ROW shard (logical input order)
             # so o_proj runs on this rank's own attention output with no Q allgather,
-            # reduce-scattering the partial instead. OPT-IN (EXL2_TP_O_RS):
-            #   =1 (recommended): fp16 row shards for the hd512 FULL layers only
-            #      (~440 MB/rank). All-layers shards are ~1.54 GB/rank and OOMed the
-            #      master during a 75k re-prefill (idk.txt: 22.77 GiB allocated, 22 MiB
-            #      transpose alloc failed). SWA layers keep the quantized AG+column path.
-            #   =2: all layers (experimental -- needs ~1.5 GB/rank of headroom).
-            #   =0: off (default).
+            # reduce-scattering the partial instead (the Q AG is the layer's largest
+            # collective; RS moves hidden=5376 vs heads*hd=8192 wide -> ~34% fewer bytes).
+            # EXL2_TP_O_RS:
+            #   =1 (DEFAULT): fp16 row shards for the hd512 FULL layers only (~440 MB/rank,
+            #      host-resident via BUG 119). User-measured 64681-token prefill: 97.1 s vs
+            #      101.09 s for =2 -- the full layers carry the heavy hd512 attention, so the
+            #      collective saving beats the per-layer staging H2D there. SWA layers keep
+            #      the quantized AG+column path.
+            #   =2: all layers (kept available, opt-in). Net LOSS on the measured prefill
+            #      (101.09 s): the SWA layers' staging H2D outweighs their smaller collective
+            #      saving. Needs the BUG 119 host-resident shards to avoid the ~1.47 GB/rank
+            #      GPU footprint that OOMed the master (OOM.txt).
+            #   =0: off.
             self._o_fp16_row = None
-            _o_rs = os.environ.get("EXL2_TP_O_RS", "0")
+            self._o_fp16_row_cpu = None
+            _o_rs = os.environ.get("EXL2_TP_O_RS", "1")
             if _o_rs == "2" or (_o_rs == "1" and self.head_dim > 256):
-                self._o_fp16_row = self._build_o_fp16_row(rank)
+                _shard = self._build_o_fp16_row(rank)
+                if _shard is not None and os.environ.get("EXL2_O_RS_CPU", "1") != "0":
+                    # BUG 119: keep the prefill-only fp16 row shard in PINNED HOST memory, not
+                    # persistent GPU VRAM. All-layer shards (O_RS=2) are ~1.47 GB/rank and OOMed
+                    # the master on a 64k re-prefill (OOM.txt: GPU0 full, 12 MiB norm alloc failed).
+                    # The shard is used ONLY by eager prefill, so stage it to a reusable GPU buffer
+                    # per layer call and release it right after -- ~22 MiB transient instead of a
+                    # persistent 1.47 GB. EXL2_O_RS_CPU=0 restores the old persistent-GPU behavior.
+                    self._o_fp16_row_cpu = _shard.to("cpu", non_blocking = False).pin_memory()
+                    del _shard
+                else:
+                    self._o_fp16_row = _shard
         elif self.o_proj_row_parallel:
             # Keep the full permutation: tp_load_rank_row drops q_perm from the shard, so the forward
             # path needs the original to build each device's column index.

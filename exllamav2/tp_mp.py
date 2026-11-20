@@ -571,6 +571,8 @@ class TPProcessGroup:
         # not lazily on the first gather after a long prefill (debug10.txt OOM).
         self._mtp_kv = None
         self._alloc_mtp_kv()
+        if os.environ.get("EXL2_VRAM_TRACE", "1") != "0":
+            self._vram_breakdown()
 
         # Cold-start fix (results.md, 2026-11-20): FlashInfer JIT-compiles each kernel
         # geometry on FIRST use. The first server run paid ~33 s in prefill (1315 tokens
@@ -671,6 +673,42 @@ class TPProcessGroup:
         self._reset_mtp_kv()
         # a stale disconnect abort from a previous job must not kill this one
         self.abort_flag.clear()
+
+    def _vram_breakdown(self):
+        """One-time load-time VRAM accounting (EXL2_VRAM_TRACE=0 disables). Prints the
+        master process's per-device torch footprint and the big opt-in component sizes
+        (o_rs fp16 shards, MTP KV shadow, drafter weights, KV cache) so an OOM can be
+        attributed to a specific component instead of guessed at."""
+        try:
+            from exllamav2.attn import ExLlamaV2Attention
+            m = self.model
+            mb = lambda n: n / 1024 ** 2
+            o_rs = sum(a._o_fp16_row.numel() * a._o_fp16_row.element_size()
+                       for a in m.modules if isinstance(a, ExLlamaV2Attention)
+                       and getattr(a, "_o_fp16_row", None) is not None)
+            shadow = sum(t.numel() * t.element_size() for t in self._mtp_kv.values()
+                         if torch.is_tensor(t))
+            draft = 0
+            d = self.mtp_drafter
+            for obj in [d] + list(getattr(d, "layers", [])):
+                for v in vars(obj).values():
+                    if torch.is_tensor(v):
+                        draft += v.numel() * v.element_size()
+            kv = 0
+            for ks in (self.cache.key_states, self.cache.value_states):
+                for t in ks:
+                    if torch.is_tensor(t):
+                        kv += t.numel() * t.element_size()
+                    elif isinstance(t, (list, tuple)):
+                        kv += sum(x.numel() * x.element_size() for x in t if torch.is_tensor(x))
+            ndev = torch.cuda.device_count()
+            per = " ".join(f"dev{i}={mb(torch.cuda.memory_allocated(i)):.0f}" for i in range(ndev))
+            print(f"[vram] master torch alloc MiB: {per} (reserved dev0="
+                  f"{mb(torch.cuda.memory_reserved(0)):.0f})", flush=True)
+            print(f"[vram] components MiB: o_rs_fp16={mb(o_rs):.0f} mtp_shadow={mb(shadow):.0f} "
+                  f"drafter={mb(draft):.0f} kv_cache={mb(kv):.0f}", flush=True)
+        except Exception as e:
+            print(f"[vram] breakdown skipped ({type(e).__name__}: {e})", flush=True)
 
     def _alloc_mtp_kv(self):
         """Allocate the drafter's joined KV shadow (fixed-size, zero-initialized).
