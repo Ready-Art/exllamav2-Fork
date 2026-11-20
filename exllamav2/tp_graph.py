@@ -294,13 +294,16 @@ class TPGraphManager:
         # Set once a capture has failed, so we do not retry (and re-fail) every token.
         self.failed = False
 
-    def key_for(self, batch_size: int, q_len: int, state: bool = False,
+    def key_for(self, batch_size: int, q_len: int, state: int = 0,
                 last_id_only: bool = True) -> tuple:
-        # The state flag separates the plain decode graph from the MTP bonus-commit
-        # graph (same (1, 1) shape, but the bonus graph also copies the pre-final-norm
-        # hidden state into a static buffer). last_id_only is part of the key because
-        # it changes whether step_fn narrows the residual before the head.
-        return (batch_size, q_len, bool(state), bool(last_id_only))
+        # The state mode separates the plain decode graph (0) from the MTP bonus-commit
+        # graph (1: same (1, 1) shape, but also copies the pre-final-norm hidden state
+        # into a static buffer) and the bonus-eliminated verify graph (2: copies the
+        # pre-final-norm state of EVERY row, so the driver can seed the next round's
+        # drafter from the last accepted draft's state without a bonus forward).
+        # last_id_only is part of the key because it changes whether step_fn narrows
+        # the residual before the head.
+        return (batch_size, q_len, int(state), bool(last_id_only))
 
     def can_capture(self, batch_size: int, q_len: int, loras,
                     allow_multi: bool = False) -> bool:
@@ -331,7 +334,7 @@ class TPGraphManager:
             return False
         return True
 
-    def get(self, batch_size: int, q_len: int, cache = None, state: bool = False,
+    def get(self, batch_size: int, q_len: int, cache = None, state: int = 0,
             last_id_only: bool = True) -> TPGraphRunner | None:
         """
         Return the runner for this shape, but ONLY if it was captured against ``cache``.
@@ -363,10 +366,10 @@ class TPGraphManager:
         return runner
 
     def add(self, batch_size: int, q_len: int, runner: TPGraphRunner,
-            state: bool = False, last_id_only: bool = True):
+            state: int = 0, last_id_only: bool = True):
         self.runners[self.key_for(batch_size, q_len, state, last_id_only)] = runner
 
-    def drop(self, batch_size: int, q_len: int, state: bool = False,
+    def drop(self, batch_size: int, q_len: int, state: int = 0,
              last_id_only: bool = True):
         """Discard a runner and release its captured graph and memory pool."""
         runner = self.runners.pop(self.key_for(batch_size, q_len, state, last_id_only), None)

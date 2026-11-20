@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import torch
 from exllamav2.util import get_all_gpu_memory, integer_split
 from exllamav2.device import global_streams
@@ -141,6 +142,14 @@ class TPContext:
         # Multiprocess mode: the device index this process owns, or None for the
         # single-process path. Set by TPContext.set_rank() from a worker before loading.
         self.rank = None
+
+        # Sequence-parallel (hidden-sharded residual) mode, EXL2_TP_SEQPAR=1. Set by
+        # model.load_tp_rank() BEFORE any module loads (the loaders shard norm weights
+        # and pick o_proj's parallel layout from it). MP rank-local path only: the
+        # residual stream lives as a per-rank hidden shard (BROADCAST_RS split), norms
+        # and projection outputs run on shards, and only the column-parallel inputs are
+        # allgathered to full width. See attn/mlp.forward_tp_old.
+        self.seqpar = False
 
         # FlashInfer paged decode wrappers for head_dim > 256 layers in CUDA-graph mode
         # (Gemma-4's hd512 global layers). One wrapper per (device, geometry): all such
@@ -1140,6 +1149,38 @@ class TPContext:
         dist.all_gather(parts, padded)
         trimmed = [parts[d][:, :widths[d]] for d in range(world) if widths[d] > 0]
         return torch.cat(trimmed, dim = 1)
+
+    # ------------------------------------------------------------------ seqpar residual
+
+    def shard_residual(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Sequence-parallel: slice a full-width hidden tensor to this rank's residual shard.
+
+        The RS split partitions the hidden dim; every rank keeps only its slice of the
+        residual stream. Pure view, no collective -- the embedding is replicated, so each
+        rank can slice its own range locally.
+        """
+        split = self.get_split(BROADCAST_RS)
+        assert len(split) == 1, "shard_residual requires rank-local (MP) mode"
+        _, a, b = split[0]
+        return x[..., a:b]
+
+    def gather_residual(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Sequence-parallel: allgather a residual shard back to full hidden width.
+
+        Used at the two points where full width is structurally required: before a
+        column-parallel projection's input norm (q/k/v/gate/up consume the whole hidden
+        dim) and before the final norm / lm_head / MTP state extraction. Tag 2 keeps the
+        cached destination distinct from the projection gathers (tags 0/1). The result is
+        a cached, double-buffered device tensor (graph-stable, BUG 82/110 pattern).
+        """
+        shape = x.shape
+        x2 = x.reshape(-1, shape[-1])
+        if not x2.is_contiguous():
+            x2 = x2.contiguous()
+        full = self._gather_nccl(x2, BROADCAST_RS, 1, tag = 2)
+        return full.view(*shape[:-1], full.shape[-1])
 
     def gather_dev(
         self,

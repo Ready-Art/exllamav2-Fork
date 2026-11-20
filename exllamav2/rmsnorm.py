@@ -231,6 +231,33 @@ class ExLlamaV2RMSNorm(ExLlamaV2Module):
         return outputs
 
 
+    def forward_tp_sharded(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Sequence-parallel RMSNorm on a per-rank hidden SHARD (EXL2_TP_SEQPAR).
+
+        Input and weight are both sliced to this rank's RS range. The RMS reduction needs
+        the whole hidden width, so the local sum-of-squares is summed across ranks with a
+        tiny (rows, 1) fp32 NCCL all_reduce -- a few bytes, vs the full-width allgather the
+        replicated path would need. The normalize/multiply then runs on the shard only.
+
+        Pure torch ops + one NCCL collective: CUDA-graph-capturable (the all_reduce is the
+        same primitive the row-parallel o_proj already captures). Allocations made inside
+        a capture are graph-pool-owned and replay-stable; eager calls allocate per step.
+        Matches ext_c.rms_norm math: variance = mean(x^2) over the FULL hidden width,
+        eps added after the mean, Gemma's +1 weight bias already folded at load.
+        """
+        import torch.distributed as dist
+        assert not getattr(self, "is_tp", False), \
+            "forward_tp_sharded expects a rank-local sharded norm (tp_load_rank_sharded)"
+        x = hidden_states.view(-1, hidden_states.shape[-1])
+        xf = x.float()
+        ss = xf.pow(2).sum(-1, keepdim = True)
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            dist.all_reduce(ss, op = dist.ReduceOp.SUM)
+        inv = torch.rsqrt(ss / self.model.config.hidden_size + self.variance_epsilon)
+        out = (xf * inv * self.weight.float()).to(x.dtype)
+        return out.view(hidden_states.shape)
+
     def forward_torch(
         self,
         hidden_states: torch.Tensor,
@@ -289,6 +316,31 @@ class ExLlamaV2RMSNorm(ExLlamaV2Module):
             self.weight.data = safe_move_tensor(self.weight.data, rank)
         if self.bias is not None:
             self.bias.data = safe_move_tensor(self.bias.data, rank)
+
+    def tp_load_rank_sharded(self, rank: int, broadcast_type: int):
+        """
+        Sequence-parallel loader: keep only this rank's hidden SHARD of the weight.
+
+        Counterpart of tp_load_rank for norms whose input is a residual shard (the
+        post-attention / post-FF norms in EXL2_TP_SEQPAR mode). The full weight is loaded
+        (Gemma's +1 bias folded by load()), then sliced to the rank's RS range. The module
+        stays in single-device state; forward_tp_sharded does the cross-rank RMS reduction.
+        """
+        self.device_idx = rank
+        self.load()
+        split = self.model.tp_context.get_split(broadcast_type)
+        target = [(d, a, b) for d, a, b in split if d == rank]
+        assert len(target) == 1, f"rank {rank} owns no slice of {self.key}"
+        _, a, b = target[0]
+        self.broadcast_type = broadcast_type
+        self.is_tp = False
+        self._tp_replicated_dev = rank
+        self._tp_shard_range = (a, b)
+        if self.weight is not None:
+            self.weight.data = self.weight.data[a:b].contiguous()
+            self.weight.data = safe_move_tensor(self.weight.data, rank)
+        if self.bias is not None:
+            self.bias.data = safe_move_tensor(self.bias.data[a:b].contiguous(), rank)
 
     def tp_replicate(self, device_idx: int):
         """

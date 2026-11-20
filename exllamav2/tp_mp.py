@@ -150,7 +150,8 @@ def mp_worker(conn, device, world_size, rank, init_method, uuid_hex, model_dir, 
         cmd, args = msg
         try:
             if cmd == "forward":
-                # args: (input_ids, cache_state, past_len, seq_len, batch_size, last_id_only)
+                # args: (input_ids, past_len, seq_len, batch_size, last_id_only,
+                #        graph_verify[, return_row_states])
                 result = _worker_forward(ctx, *args)
                 conn.send(("ok", result))
             elif cmd == "forward-state":
@@ -174,6 +175,10 @@ def mp_worker(conn, device, world_size, rank, init_method, uuid_hex, model_dir, 
                 # MTP: return this rank's K/V rows [start:end] of one layer (the parent
                 # joins the four ranks' slices along the kv-head axis).
                 conn.send(("ok", _worker_kv_slice(ctx, *args)))
+            elif cmd == "kv-pack":
+                # MTP gather batching: both drafter source layers' K/V deltas packed
+                # into one pinned CPU tensor (see _worker_kv_pack).
+                conn.send(("ok", _worker_kv_pack(ctx, *args)))
             elif cmd == "sync":
                 torch.cuda.synchronize()
                 conn.send(("ok", None))
@@ -242,8 +247,46 @@ def _worker_kv_slice(ctx, layer_idx, start, end):
     return (k, v)
 
 
+def _worker_kv_pack(ctx, lf, fl0, fl1, ls, sl0, sl1):
+    """MTP gather batching: this rank's K/V deltas for BOTH drafter source layers in
+    ONE pinned CPU tensor (one pipe message instead of two commands + two replies).
+
+    Flat layout: [K_full | V_full | K_swa | V_swa], each (rows, kvh_local, hd). The
+    parent knows every shape from the request args and unpacks zero-copy views.
+    Grow-only pinned staging (the first, full-length gather is the largest; steady
+    deltas are a handful of rows). The four D2H copies are async on the worker's
+    stream with a single sync, instead of four synchronous .cpu() round trips.
+    """
+    cache = ctx["cache"]
+
+    def clamp(layer, a, b):
+        width = cache.key_states[layer].shape[1]
+        a = max(0, min(a, width))
+        b = max(a, min(b, width))
+        return a, b
+
+    fl0, fl1 = clamp(lf, fl0, fl1)
+    sl0, sl1 = clamp(ls, sl0, sl1)
+    kf = cache.key_states[lf][0, fl0:fl1].detach()
+    vf = cache.value_states[lf][0, fl0:fl1].detach()
+    ks = cache.key_states[ls][0, sl0:sl1].detach()
+    vs = cache.value_states[ls][0, sl0:sl1].detach()
+    n = kf.numel() + vf.numel() + ks.numel() + vs.numel()
+    stag = ctx.get("kv_pack_staging")
+    if stag is None or stag.numel() < n:
+        stag = ctx["kv_pack_staging"] = torch.empty(n, dtype = torch.half, pin_memory = True)
+    o = 0
+    for t in (kf, vf, ks, vs):
+        stag[o:o + t.numel()].view(t.shape).copy_(t, non_blocking = True)
+        o += t.numel()
+    torch.cuda.current_stream().synchronize()
+    # Safe to return a view of the reusable staging: the pipe pickler copies CPU tensor
+    # data into shared memory at send time (same mechanism the old kv-slice path used).
+    return stag[:n]
+
+
 def _worker_forward(ctx, input_ids, past_len, seq_len, batch_size, last_id_only,
-                    graph_verify = False):
+                    graph_verify = False, return_row_states = False):
     """
     Run this rank's share of one forward pass.
 
@@ -254,6 +297,12 @@ def _worker_forward(ctx, input_ids, past_len, seq_len, batch_size, last_id_only,
     ``graph_verify`` marks the fixed-shape MTP verify window so forward_chunk may capture /
     replay it as a CUDA graph (Change98). Every rank must agree on it: the capture is a
     collective step, and a rank taking the eager path while the others replay would deadlock.
+
+    ``return_row_states`` (bonus-forward elimination): also return the pre-final-norm hidden
+    state of EVERY processed row, so the MTP driver can seed the next round's drafter from
+    the last accepted draft's verify state instead of paying a separate bonus forward.
+    Rank 0 returns ``(logits, row_states)``; the other ranks return None. Every rank must
+    agree on this flag too -- it changes the captured graph's state mode.
     """
     model = ctx["model"]
     cache = ctx["cache"]
@@ -269,9 +318,15 @@ def _worker_forward(ctx, input_ids, past_len, seq_len, batch_size, last_id_only,
         cache = cache,
         last_id_only = last_id_only,
         graph_verify = graph_verify,
+        return_row_states = return_row_states,
     )
     if r is None:
         return None
+    if return_row_states:
+        if ctx["rank"] != 0:
+            return None
+        logits, states = r
+        return (logits, states)
     if isinstance(r, tuple):
         r = r[0]
     if isinstance(r, dict):
@@ -438,6 +493,37 @@ class TPProcessGroup:
         self.num_speculative_tokens = int(num_draft_tokens)
         self._mtp_kv = None
 
+        # Cold-start fix (results.md, 2026-11-20): FlashInfer JIT-compiles each kernel
+        # geometry on FIRST use. The first server run paid ~33 s in prefill (1315 tokens
+        # at 40 T/s) plus ~19.4 s inside the first draft phase (the running draft average
+        # fits C/N + 11.9 ms with C ≈ 19.4 s at every checkpoint) -- about a minute to
+        # first text. The second run started fast ONLY because the JIT disk cache was
+        # warm, not because of EXL2_TP_SEQPAR. Compile at LOAD time instead: a 2-token
+        # dummy prefill (target FI prefill kernels) + one draft step (drafter hd512/hd256
+        # single_decode kernels), then reset the cache. EXL2_MTP_WARMUP=0 skips; failure
+        # is non-fatal (the first request would just pay the JIT as before).
+        if os.environ.get("EXL2_MTP_WARMUP", "1") != "0":
+            try:
+                import time as _time
+                _t0 = _time.perf_counter()
+                print("[mtp] warmup: pre-compiling FlashInfer kernels "
+                      "(slow only on the very first load)...", flush=True)
+                dummy = torch.tensor([[0, 0]], dtype = torch.long)
+                _logits, _state = self.forward_state(dummy, last_id_only = True,
+                                                     cpu_logits = True)
+                drafter.gather_target(self)
+                drafter.draft_window(torch.tensor([[0]], dtype = torch.long),
+                                     _state.float().cpu(), 2, 1)
+                self.mtp_reset_cache()
+                print(f"[mtp] warmup done in {_time.perf_counter() - _t0:.1f}s", flush=True)
+            except Exception as e:
+                print(f"[mtp] warmup skipped ({type(e).__name__}: {e}); first request "
+                      f"will pay FlashInfer JIT", flush=True)
+                try:
+                    self.mtp_reset_cache()
+                except Exception:
+                    pass
+
     def forward_state(self, input_ids, last_id_only = True, cpu_logits = True):
         """Distributed forward that returns ``(logits, last_state)``.
 
@@ -522,11 +608,6 @@ class TPProcessGroup:
                                   dtype = torch.half, device = dev),
             }
 
-        def _join(parts):
-            # per-rank slice is (S, 1, hd) [full] / (S, 4, hd) [swa]; joining the four
-            # ranks along dim 1 (kv-head axis) gives the full-width (S, kvh, hd).
-            return torch.cat(parts, dim = 1)
-
         # ---- SWA ring: mirror the page shift on the shadow, pull only new rows ----
         ring = mc.kv_state_size
         swa_shift = window_beg - st["wb"]
@@ -545,31 +626,45 @@ class TPProcessGroup:
         # prefix consists only of rows written after it (window_beg > st["sl"] forces
         # swa_start == 0), so the delta pull below re-covers the whole prefix.
 
-        # ---- full layer: append only the new rows since the last gather ----
-        full_parts = [(mc.key_states[lf][0, st["fl"]:seq_len].detach(),
-                       mc.value_states[lf][0, st["fl"]:seq_len].detach())]
-        swa_parts = [(mc.key_states[ls][0, swa_start:swa_len].detach(),
-                      mc.value_states[ls][0, swa_start:swa_len].detach())]
+        # ---- packed pull: ONE message per worker (was 2 commands + 2 replies each) ----
+        # Each worker packs [K_full | V_full | K_swa | V_swa] deltas into one pinned CPU
+        # tensor (async D2H + single sync); the parent unpacks zero-copy views, joins the
+        # ranks along the kv-head axis on CPU (a few KB), and copies straight into the
+        # device shadow -- 4 H2D total instead of 8 H2D + 4 device cats + 4 assigns.
+        world = len(self.workers) + 1
+        assert d.num_global_kv_heads % world == 0 and d.num_kv_heads % world == 0, \
+            "kv-pack: kv heads must divide evenly across ranks"
+        fkh = d.num_global_kv_heads // world
+        skh = d.num_kv_heads // world
+        df = seq_len - st["fl"]
+        ds = swa_len - swa_start
         # issue every request first (workers copy in parallel), then collect
         for device, w in sorted(self.workers.items()):
-            w.send("kv-slice", (lf, st["fl"], seq_len))
-            w.send("kv-slice", (ls, swa_start, swa_len))
+            w.send("kv-pack", (lf, st["fl"], seq_len, ls, swa_start, swa_len))
+        # master's own slices, on CPU like the workers' so the join is uniform
+        full_k = [mc.key_states[lf][0, st["fl"]:seq_len].detach().cpu()]
+        full_v = [mc.value_states[lf][0, st["fl"]:seq_len].detach().cpu()]
+        swa_k = [mc.key_states[ls][0, swa_start:swa_len].detach().cpu()]
+        swa_v = [mc.value_states[ls][0, swa_start:swa_len].detach().cpu()]
         for device, w in sorted(self.workers.items()):
-            full_parts.append(w.recv())
-            swa_parts.append(w.recv())
-        if seq_len > st["fl"]:
-            st["kf"][st["fl"]:seq_len] = _join(
-                [p[0].to(dev, non_blocking = True) for p in full_parts])
-            st["vf"][st["fl"]:seq_len] = _join(
-                [p[1].to(dev, non_blocking = True) for p in full_parts])
+            flat = w.recv()
+            o = 0
+            for rows, kh, hd, acc in ((df, fkh, d.global_head_dim, full_k),
+                                      (df, fkh, d.global_head_dim, full_v),
+                                      (ds, skh, d.head_dim, swa_k),
+                                      (ds, skh, d.head_dim, swa_v)):
+                n = rows * kh * hd
+                acc.append(flat[o:o + n].view(rows, kh, hd))
+                o += n
+        if df > 0:
+            st["kf"][st["fl"]:seq_len].copy_(torch.cat(full_k, dim = 1))
+            st["vf"][st["fl"]:seq_len].copy_(torch.cat(full_v, dim = 1))
         # (after a rewind, st["fl"] < seq_len and the delta above re-writes from there)
         st["fl"] = seq_len
 
-        if swa_len > swa_start:
-            st["ks"][swa_start:swa_len] = _join(
-                [p[0].to(dev, non_blocking = True) for p in swa_parts])
-            st["vs"][swa_start:swa_len] = _join(
-                [p[1].to(dev, non_blocking = True) for p in swa_parts])
+        if ds > 0:
+            st["ks"][swa_start:swa_len].copy_(torch.cat(swa_k, dim = 1))
+            st["vs"][swa_start:swa_len].copy_(torch.cat(swa_v, dim = 1))
         st["sl"] = seq_len
         st["wb"] = window_beg
 
@@ -578,7 +673,7 @@ class TPProcessGroup:
                 seq_len, window_beg)
 
     def forward(self, input_ids, past_len, seq_len, batch_size, last_id_only,
-                graph_verify = False):
+                graph_verify = False, return_row_states = False):
         """
         Fan out the step, then run the master's own share.
 
@@ -588,14 +683,20 @@ class TPProcessGroup:
 
         ``graph_verify=True`` marks the MTP verify window (fixed q_len) as graph-capturable
         on every rank (Change98).
+
+        ``return_row_states=True`` (bonus-forward elimination) returns ``(logits, row_states)``
+        from the master: the pre-final-norm hidden state of every processed row. Only the
+        master produces a value (workers return None), so no CUDA tensor crosses a pipe.
+        The states are the verify graph's static buffer -- consume them before the next
+        replay (the driver copies them to CPU immediately).
         """
         for device, w in sorted(self.workers.items()):
             w.send("forward", (input_ids, past_len, seq_len, batch_size, last_id_only,
-                               graph_verify))
+                               graph_verify, return_row_states))
 
         # Master's own share, overlapped with the workers.
         logits = _worker_forward(self.master_ctx, input_ids, past_len, seq_len,
-                                 batch_size, last_id_only, graph_verify)
+                                 batch_size, last_id_only, graph_verify, return_row_states)
 
         # Collect the workers' replies so their errors surface here rather than as a hang.
         for device, w in sorted(self.workers.items()):

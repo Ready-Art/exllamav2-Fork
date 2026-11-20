@@ -1957,11 +1957,21 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                 "TP attention without flash-attn or FlashInfer must use Torch SDPA with lower-right " \
                 "attention mask (use PyTorch 2.4.0+) and does not support logit softcapping."
 
-        hidden_states = self.model.tp_context.broadcast(0, hidden_states, BROADCAST_KV, dim = self.head_dim)
+        if self.model.tp_context.seqpar:
+            # Sequence-parallel: the incoming residual is this rank's hidden SHARD.
+            # Allgather it to full width for the input norm + column-parallel q/k/v
+            # (which consume the whole hidden dim), and keep the shard for the residual
+            # add at the bottom. The norm runs full-width replicated (same bytes on the
+            # wire as allgathering a sharded norm result, but no extra stat collective).
+            residual = hidden_states
+            full = self.model.tp_context.gather_residual(hidden_states)
+            post_norm = self.pre_layernorm.forward(full) if self.has_norm else full
+        else:
+            hidden_states = self.model.tp_context.broadcast(0, hidden_states, BROADCAST_KV, dim = self.head_dim)
 
-        residual = hidden_states
+            residual = hidden_states
 
-        post_norm = self.pre_layernorm.forward(hidden_states) if self.has_norm else hidden_states
+            post_norm = self.pre_layernorm.forward(hidden_states) if self.has_norm else hidden_states
         q = self.q_proj.forward_tp(post_norm, loras = loras, output_split = True, dim = self.head_dim)
         k = self.k_proj.forward_tp(post_norm, loras = loras, output_split = True, dim = self.head_dim)
         # BUG 90a (TP): on a k-eq-v layer V is K, but the two must be INDEPENDENT
@@ -2217,9 +2227,20 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                                 _fi_key, q[idx], k_cache[idx], v_cache[idx]
                             )
                         elif (q_len > 1 and batch_size == 1 and _fi_hd
+                                and (_fi_key + (q_len,)) in self.model.tp_context.fi_prefill):
+                            # Single-pass graphed verify: ONE paged-prefill run reads the
+                            # KV prefix once for all q_len rows (fa2 causal aligns row i to
+                            # base+i+1). Planned outside the graph per replay
+                            # (model._fi_tp_graph_plan); fixed-buffer graph contract per
+                            # BUG 103. Replaces q_len per-row decode runs: ~q_len x less KV
+                            # traffic at long context and q_len x fewer kernels per layer.
+                            attn_output = self.model.tp_context.fi_prefill_run(
+                                _fi_key + (q_len,), q[idx], k_cache[idx], v_cache[idx]
+                            )
+                        elif (q_len > 1 and batch_size == 1 and _fi_hd
                                 and all((_fi_key + (i,)) in self.model.tp_context.fi_decode
                                         for i in range(q_len))):
-                            # BUG 109: graph-safe MTP verify window via per-row FI DECODE.
+                            # BUG 109 fallback: graph-safe MTP verify via per-row FI DECODE.
                             # Each query row i is a decode query attending to its causal
                             # prefix kv_len = pos + i + 1 (planned per row outside the graph,
                             # model._fi_tp_graph_plan). The decode wrapper is graph-safe
@@ -2312,28 +2333,52 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                         k_cache[idx][:batch_size, cache_a:cache_b, :, :].copy_(k[idx][:, _drop:, :, :])
                         v_cache[idx][:batch_size, cache_a:cache_b, :, :].copy_(v[idx][:, _drop:, :, :])
                         if _swa_win:
-                            # Windowed causal mask over the written ring prefix, in ring
-                            # coordinates (same geometry as the graph-mode mask above).
-                            # mask_override makes _attn_torch skip its static last-window
-                            # slice, which would misalign for multi-token chunks.
                             _ql = q_len - _drop
-                            _dev = k_cache[idx].device
-                            _qi = torch.arange(_ql, device = _dev).view(_ql, 1) + cache_a
-                            _kj = torch.arange(cache_b, device = _dev).view(1, cache_b)
-                            _ok = (_kj <= _qi) & (_kj > _qi - _swa_win)
-                            _swa_mask = torch.where(
-                                _ok, 0.0, -65504.0
-                            ).to(torch.half).view(1, 1, _ql, cache_b)
-                            attn_output = self._attn_torch(
-                                batch_size,
-                                _ql,
-                                q[idx][:, _drop:, :, :],
-                                k_cache[idx][:batch_size, :cache_b, :, :],
-                                v_cache[idx][:batch_size, :cache_b, :, :],
-                                attn_params,
-                                cfg,
-                                mask_override = _swa_mask
+                            _fi_swa = (
+                                use_flashinfer(cfg)
+                                and not cfg.attn_logit_softcapping
+                                and attn_backend.FlashInferPaged.supports(
+                                    self.head_dim, q[idx].shape[2], k_cache[idx].shape[2],
+                                    128, q[idx].dtype)
                             )
+                            if _fi_swa:
+                                # PREFILL PERF: FI fa2 windowed prefill instead of the
+                                # torch path below -- tiled fp16 kernels, no per-chunk
+                                # (ql x cache_b) fp32 mask + scores materialization per
+                                # layer (50 SWA layers x every chunk at long prompts).
+                                # causal=True aligns the query block to the END of the
+                                # ring prefix (row i sees keys <= cache_a + _drop + i);
+                                # window_left is INCLUSIVE, hence sliding_window - 1.
+                                attn_output = attn_backend.single_prefill(
+                                    q[idx][:, _drop:, :, :],
+                                    k_cache[idx][:batch_size, :cache_b, :, :],
+                                    v_cache[idx][:batch_size, :cache_b, :, :],
+                                    sm_scale = self.scaling,
+                                    causal = True,
+                                    window_left = _swa_win - 1,
+                                )
+                            else:
+                                # Windowed causal mask over the written ring prefix, in ring
+                                # coordinates (same geometry as the graph-mode mask above).
+                                # mask_override makes _attn_torch skip its static last-window
+                                # slice, which would misalign for multi-token chunks.
+                                _dev = k_cache[idx].device
+                                _qi = torch.arange(_ql, device = _dev).view(_ql, 1) + cache_a
+                                _kj = torch.arange(cache_b, device = _dev).view(1, cache_b)
+                                _ok = (_kj <= _qi) & (_kj > _qi - _swa_win)
+                                _swa_mask = torch.where(
+                                    _ok, 0.0, -65504.0
+                                ).to(torch.half).view(1, 1, _ql, cache_b)
+                                attn_output = self._attn_torch(
+                                    batch_size,
+                                    _ql,
+                                    q[idx][:, _drop:, :, :],
+                                    k_cache[idx][:batch_size, :cache_b, :, :],
+                                    v_cache[idx][:batch_size, :cache_b, :, :],
+                                    attn_params,
+                                    cfg,
+                                    mask_override = _swa_mask
+                                )
                         elif _fi_hd and q_len == 1 and batch_size == 1:
                             # PERF: hd512 single-token decode via FlashInfer single_decode
                             # (~5x faster than the torch GEMV at 16k, gap widens with ctx).
@@ -2405,7 +2450,24 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 
         # Output projection
 
-        if getattr(self, "o_proj_row_parallel", False):
+        if self.model.tp_context.seqpar:
+            # Sequence-parallel: o_proj is COLUMN-parallel with its output split by the
+            # RS (residual) split, so its output shard IS the next residual shard -- no
+            # all_reduce, no reduce_scatter, and no q_perm row-parallel input trap
+            # (BUG 113): the GEMM applies q_perm internally to the full-width gathered
+            # attention output. The post-attention norm runs on the shard (tiny cross-rank
+            # RMS stat all_reduce), then the residual add is shard-local.
+            gathered = self.model.tp_context.allgather(
+                1, attn_outputs, BROADCAST_Q, BROADCAST_Q, dim = self.head_dim
+            )
+            out_shard = self.o_proj.forward_tp(gathered, loras = loras, output_split = True)[0]
+            if self.post_layernorm is not None:
+                out_shard = self.post_layernorm.forward_tp_sharded(out_shard)
+            if self.has_residual:
+                out_shard = out_shard + residual
+            hidden_states = out_shard
+
+        elif getattr(self, "o_proj_row_parallel", False):
 
             # Row-parallel o_proj: each device runs a partial GEMM over its own slice of
             # the INPUT features, then the partial sums are all-reduced. See tp_split() for
@@ -2915,9 +2977,15 @@ class ExLlamaV2Attention(ExLlamaV2Module):
         ctx.set_geometry(self.layer_idx)
 
         if self.pre_layernorm is not None:
+            # SP: the input norm runs full-width on the allgathered residual, so it keeps
+            # the FULL replicated weight even in seqpar mode.
             self.pre_layernorm.tp_load_rank(rank, BROADCAST_KV)
         if self.post_layernorm is not None:
-            self.post_layernorm.tp_load_rank(rank, BROADCAST_KV)
+            if ctx.seqpar:
+                # SP: the post-attention norm runs on the o_proj output SHARD.
+                self.post_layernorm.tp_load_rank_sharded(rank, BROADCAST_RS)
+            else:
+                self.post_layernorm.tp_load_rank(rank, BROADCAST_KV)
 
         # BUG 67: the per-head norms are loaded by module.load(), which the rank-local path
         # replaces. Without this q_norm/k_norm/v_norm stay None and forward_tp_old dies in
@@ -2943,7 +3011,13 @@ class ExLlamaV2Attention(ExLlamaV2Module):
         self.o_proj_row_parallel = (
             self.o_proj.out_features != self.num_attention_heads * self.head_dim
         )
-        if self.o_proj_row_parallel:
+        if ctx.seqpar:
+            # Sequence-parallel: COLUMN-parallel o_proj, output split by the residual (RS)
+            # split so the output shard is the next residual shard. q_perm stays in the
+            # shard (the GEMM permutes the full-width gathered attention input itself).
+            self.o_proj_row_parallel = False
+            self.o_proj.tp_load_rank(rank, BROADCAST_RS)
+        elif self.o_proj_row_parallel:
             # Keep the full permutation: tp_load_rank_row drops q_perm from the shard, so the forward
             # path needs the original to build each device's column index.
             perm = self.o_proj.tp_load_rank_row(
@@ -2991,7 +3065,11 @@ class ExLlamaV2Attention(ExLlamaV2Module):
         amax(self.k_proj.scratch_space_tp(BROADCAST_KV, self.head_dim))
         if self.v_proj is not None:
             amax(self.v_proj.scratch_space_tp(BROADCAST_KV, self.head_dim))
-        amax(self.o_proj.scratch_space_tp(BROADCAST_Q, self.head_dim))
+        if ctx.seqpar:
+            # SP loads o_proj column-parallel on the RS split (see tp_load_rank).
+            amax(self.o_proj.scratch_space_tp(BROADCAST_RS, 1))
+        else:
+            amax(self.o_proj.scratch_space_tp(BROADCAST_Q, self.head_dim))
         self.tp_dq_size = [s for s in scratch]
 
         maxrows = cfg.max_batch_size * cfg.max_input_len

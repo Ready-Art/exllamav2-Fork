@@ -28,6 +28,18 @@ The first base (logits + pre-final-norm state) is taken for free from the prefil
 fallback exists for the case where something moves ``current_seq_len`` out from
 under us (token healing / banned-string rewinds).
 
+Bonus-forward elimination (default ON, ``EXL2_MTP_BONUS_ELIM=0`` restores the old
+protocol): the separate 1-token bonus ``forward_state`` (~21 ms/round, a full second
+target forward) is gone. Instead the bonus token becomes ROW 0 of the NEXT round's
+verify window (W+1 rows), so that one forward writes its KV, produces its logits
+(acceptance row 0) and its pre-final-norm state (returned per-row via
+``return_row_states``). The drafter seeds from ``(bonus_id, last-committed-token
+state)`` at query position pos+1 -- the state is one position stale (the EAGLE-style
+tradeoff: acceptance may shift, but the emitted distribution stays EXACTLY
+target-autoregressive because acceptance is still probabilistic against the target's
+verified logits). The first round after begin()/re-commit has no pending bonus and
+runs the original W-row protocol with an aligned base state.
+
 Usage::
 
     pg  = TPProcessGroup(MD, [20]*4, MAXSEQ, MAXSEQ, "ExLlamaV2Cache_SWA"); pg.start()
@@ -40,6 +52,8 @@ Usage::
         tok = drv.step()
 """
 from __future__ import annotations
+
+import os
 
 import torch
 
@@ -64,6 +78,15 @@ class MTPMPDriver:
         self.pending_tokens = []     # BUG 104: cache token id expected for each pending row
         self.pending_pos = 0         # BUG 104: sequence position of the first pending row
         self.resyncs = 0             # BUG 104: sampling deviations that forced rewind+recommit
+        # Bonus-forward elimination: the decided bonus token whose KV is NOT yet in the
+        # cache (it becomes row 0 of the next verify). last_state is the pre-final-norm
+        # state of the last COMMITTED token (cache.current_seq_len - 1) -- the drafter's
+        # (stale) state seed while a bonus is pending. expected_pos is the cache position
+        # the next round must start at; any deviation triggers the re-commit fallback.
+        self._bonus_elim = os.environ.get("EXL2_MTP_BONUS_ELIM", "1") != "0"
+        self.pending_bonus = None    # int token id decided but not yet KV-committed
+        self.last_state = None       # (1,1,H) cpu, state of token at expected_pos-1
+        self.expected_pos = 0
         self.total_rounds = 0
         self.total_draft = 0
         self.total_acc = 0
@@ -100,6 +123,9 @@ class MTPMPDriver:
         self.pending = None
         self.pending_tokens = []
         self.pending_pos = 0
+        self.pending_bonus = None
+        self.last_state = self.state[1]
+        self.expected_pos = self.pg.cache.current_seq_len
         if self.heal:
             # Self-healing entry: re-commit the last prompt token (idempotent KV
             # rewrite + fresh pre-final-norm state), mirroring SP token_healing.
@@ -125,6 +151,10 @@ class MTPMPDriver:
         logits, state = self.pg.forward_state(base_tok, last_id_only=True, cpu_logits=True)
         self.state = (base_tok, state.float().cpu(), self.pg.cache.current_seq_len - 1)
         self.base_logits = logits.float().cpu()
+        # Re-commit restores an ALIGNED base: no pending bonus, fresh state/logits.
+        self.pending_bonus = None
+        self.last_state = self.state[1]
+        self.expected_pos = self.pg.cache.current_seq_len
         if self.verbose:
             print(f"[mtp-mp] commit_base pos={self.state[2]} tok={self.tokens[base_pos]}",
                   flush=True)
@@ -135,10 +165,11 @@ class MTPMPDriver:
         """Emit one token from the current round's accepted sequence.
 
         BUG 105: with ``settings`` (sampling) the round uses probabilistic speculative
-        acceptance (see _round), so the emitted tokens are already decided and their KV
-        is already in the cache -- step() just hands them out in order. Without
-        ``settings``: greedy argmax acceptance. Either way consuming a token never
-        advances current_seq_len (the round's bonus commit already moved the cache).
+        acceptance (see _round), so the emitted tokens are already decided -- step() just
+        hands them out in order. Without ``settings``: greedy argmax acceptance. Consuming
+        a token never advances current_seq_len: the accepted drafts' KV is already in the
+        cache, and the round's bonus token is KV-committed by the NEXT round's verify
+        (row 0) under bonus-forward elimination (or by the legacy bonus forward).
         """
         if not self.pending_tokens:
             self._round(settings, tokenizer, sequence_ids, ban_tokens)
@@ -205,10 +236,15 @@ class MTPMPDriver:
     def _round(self, settings=None, tokenizer=None, sequence_ids=None, ban_tokens=None):
         import random as _random
         # ---- begin a round ----
-        if self.state is None or self.pg.cache.current_seq_len != self.state[2] + 1:
+        # The cache must sit exactly where the previous round left it: committed tokens
+        # only. A pending bonus (if any) is NOT in the cache yet -- the next verify writes
+        # it as row 0. Any external move (token healing / banned-string rewind) falls back
+        # to the aligned re-commit protocol.
+        if self.state is None or self.pg.cache.current_seq_len != self.expected_pos:
+            self.pending_bonus = None
             self._commit_base()
-        base_tok, base_state, base_pos = self.state
-        pos = self.pg.cache.current_seq_len            # == base_pos + 1
+        pos = self.pg.cache.current_seq_len
+        mode_b = self._bonus_elim and self.pending_bonus is not None
         if sequence_ids is None:
             sequence_ids = torch.tensor([self.tokens], dtype=torch.long)
         _t = self._time.perf_counter()
@@ -218,31 +254,48 @@ class MTPMPDriver:
         self.t_gather += self._time.perf_counter() - _t
         _t = self._time.perf_counter()
 
-        # 2. draft a greedy window (with per-step logits when sampling, for q)
-        # BUG 105/106: the draft is greedy, so probabilistic acceptance only needs the
-        # draft IDS (q_k is a point mass on draft[k]) -- the per-step full-vocab logits are
-        # never read. Don't collect/return them (saves W x vocab fp32 copies + a PCIe hop).
-        draft, _ = self.d.draft_window(base_tok, base_state, pos, self.window)   # (1,W) cpu
+        # 2. draft a greedy window.
+        # Mode A (no pending bonus: first round / re-commit fallback): aligned base
+        #   (token at pos-1, its own state), predicting pos..pos+W-1, query at pos.
+        # Mode B (bonus eliminated): the pending bonus sits at pos (decided, emitted,
+        #   KV not yet written). The drafter seeds from (bonus, last-committed state) --
+        #   the state is one position stale by design -- and predicts pos+1..pos+W with
+        #   its query at pos+1 over the gathered KV (which ends at pos-1).
+        if mode_b:
+            base_tok = torch.tensor([[self.pending_bonus]], dtype=torch.long)
+            draft, _ = self.d.draft_window(base_tok, self.last_state, pos + 1, self.window)
+            draft = draft.cpu()                                    # cat with CPU bonus; pipe needs CPU
+            verify_ids = torch.cat([base_tok, draft], dim=-1)      # (1, W+1)
+        else:
+            base_tok, base_state, base_pos = self.state
+            draft, _ = self.d.draft_window(base_tok, base_state, pos, self.window)
+            draft = draft.cpu()
+            verify_ids = draft                                     # (1, W)
         self.total_draft += draft.shape[-1]
         self.t_draft += self._time.perf_counter() - _t
         _t = self._time.perf_counter()
 
-        # 3. verify: one target forward over the draft tokens, writing their KV.
-        #    vlogits[i] (processing draft[i] at position pos+i) predicts pos+i+1.
-        #    NOTE: input_ids cross the worker pipes -- they MUST be CPU tensors
-        #    (CUDA-IPC-over-pipe is not available in this environment; the baseline
-        #    path already sends CPU ids and _worker_forward moves them per-rank).
-        #    graph_verify: the window is a fixed shape (1, W), so every rank captures
-        #    it once and replays it per round (Change98) instead of running eager.
-        # BUG 107: verify GRAPHED again. Change98's graphed verify was slow (~250 ms)
-        # because the q_len>1 graph attention fell back to _attn_torch/SDPA over the FULL
-        # 160k cache depth on the hd512 layers. The graph path now uses a graph-safe
-        # FlashInfer paged-prefill kernel (use_cuda_graph=True, re-planned per step outside
-        # the capture -- the BUG 103 decode pattern), so the captured window replays at
-        # ~the graphed-decode cost instead of eager host dispatch + full-depth SDPA. If
-        # capture fails, forward_chunk falls back to eager automatically (still correct).
-        vlogits = self.pg.forward(draft.cpu(), pos, draft.shape[-1], 1, False,
-                                  graph_verify = True)
+        # 3. verify: ONE target forward over the window, writing its KV.
+        #    Mode A: vlogits[i] (draft[i] at pos+i) predicts pos+i+1; draft[0]'s predictor
+        #            is base_logits.
+        #    Mode B: row 0 is the pending bonus at pos -> vlogits[0] predicts pos+1 (the
+        #            bonus forward's logits, for free); vlogits[k] (k>=1) predicts the
+        #            token after draft[k-1], i.e. draft[k]'s position. Acceptance row for
+        #            draft[k] is therefore vlogits[k] directly, and the bonus row is
+        #            vlogits[m_acc] -- always in range (W+1 rows).
+        #    return_row_states: per-row pre-final-norm states (graph state mode 2), so the
+        #    next round's drafter can seed from the last accepted draft's state.
+        #    NOTE: input_ids cross the worker pipes -- they MUST be CPU tensors.
+        if self._bonus_elim:
+            vlogits, vstates = self.pg.forward(verify_ids.cpu(), pos, verify_ids.shape[-1],
+                                               1, False, graph_verify = True,
+                                               return_row_states = True)
+            # Static graph buffer: consume (copy off device) before the next replay.
+            vstates = vstates.cpu()
+        else:
+            vlogits = self.pg.forward(verify_ids.cpu(), pos, verify_ids.shape[-1], 1, False,
+                                      graph_verify = True)
+            vstates = None
         self.t_verify += self._time.perf_counter() - _t
         vlogits = vlogits.float().cpu()
 
@@ -253,23 +306,31 @@ class MTPMPDriver:
             # Greedy: longest draft prefix the target's argmax agrees with; bonus = argmax.
             m_acc = 0
             v_argmax = vlogits[0].argmax(dim=-1).tolist()
-            bonus_pred = int(self.base_logits[0, 0].argmax())
-            for k in range(W):
-                pred = bonus_pred if k == 0 else v_argmax[k - 1]
-                if pred == draft_flat[k]:
-                    m_acc = k + 1
-                else:
-                    break
-            bonus_row = self.base_logits if m_acc == 0 else vlogits[:, m_acc - 1:m_acc, :]
+            if mode_b:
+                for k in range(W):
+                    if v_argmax[k] == draft_flat[k]:
+                        m_acc = k + 1
+                    else:
+                        break
+                bonus_row = vlogits[:, m_acc:m_acc + 1, :]
+            else:
+                bonus_pred = int(self.base_logits[0, 0].argmax())
+                for k in range(W):
+                    pred = bonus_pred if k == 0 else v_argmax[k - 1]
+                    if pred == draft_flat[k]:
+                        m_acc = k + 1
+                    else:
+                        break
+                bonus_row = self.base_logits if m_acc == 0 else vlogits[:, m_acc - 1:m_acc, :]
             bonus_id = int(bonus_row[0, 0].argmax())
         else:
             # BUG 105: probabilistic speculative acceptance (exact target distribution).
             # The draft is greedy, so q_k is a point mass on draft_flat[k]: accept draft[k]
             # with probability p_target_k(draft[k]); on rejection resample from the residual
-            # normalize(max(0, p_target_k - q_k)) and end the round. Unlike exact-resync this
-            # costs NO extra forward on rejection -- the round truncates and the bonus commit
-            # (below) seeds the next base -- so temp-1 throughput stays high (vLLM/llama.cpp
-            # style). p_target_k is the sampler's own processed distribution.
+            # normalize(max(0, p_target_k - q_k)) and end the round. NO extra forward on
+            # rejection. The emitted distribution is exactly target-autoregressive even
+            # though mode B's drafts come from a stale state -- draft quality only affects
+            # acceptance RATE, never correctness.
             _t = self._time.perf_counter()
             m_acc = 0
             bonus_id = None
@@ -279,7 +340,10 @@ class MTPMPDriver:
             for k in range(W):
                 # Slice (not integer) index to keep the (1, 1, vocab) shape the sampler
                 # requires; vlogits[:, k-1, :] would drop a dim -> (1, vocab) -> crash.
-                row = self.base_logits if k == 0 else vlogits[:, k - 1:k, :]
+                if mode_b:
+                    row = vlogits[:, k:k + 1, :]
+                else:
+                    row = self.base_logits if k == 0 else vlogits[:, k - 1:k, :]
                 p = self._dense_probs(row, settings, tokenizer, seq, ban_tokens)
                 dk = draft_flat[k]
                 if _random.random() < float(p[dk]):
@@ -293,33 +357,66 @@ class MTPMPDriver:
                 bonus_id = self._sample_from(resid, _random.random())
                 break
             if bonus_id is None:
-                pW = self._dense_probs(vlogits[:, W - 1:W, :], settings, tokenizer,
-                                       seq, ban_tokens)
+                last_row = vlogits[:, W:W + 1, :] if mode_b else vlogits[:, W - 1:W, :]
+                pW = self._dense_probs(last_row, settings, tokenizer, seq, ban_tokens)
                 bonus_id = self._sample_from(pW, _random.random())
             self.t_accept += self._time.perf_counter() - _t
         self.total_acc += m_acc
         self.total_rounds += 1
         if self.verbose:
-            print(f"[mtp-mp] round pos={pos} acc={m_acc}/{W}", flush=True)
+            print(f"[mtp-mp] round pos={pos} acc={m_acc}/{W} mode={'B' if mode_b else 'A'}",
+                  flush=True)
         elif self.total_rounds % 50 == 0:
             st = self.stats()
             print(f"[mtp-mp] {st['rounds']} rounds acc/round={st['acc_per_round']} "
                   f"emit/round={st['emitted_per_round']} ms/round={st['ms/round']}", flush=True)
 
-        # 5. rewind past the unaccepted tail; commit the bonus token to seed the next base.
+        # 5. rewind past the unaccepted tail; seed the next round.
+        # Mode B: row 0 is the bonus at pos, so accepted draft d_k sits at pos+1+k and
+        # m_acc accepted drafts commit through pos+m_acc -> rewind to pos+m_acc+1.
+        # Mode A: drafts start at pos -> rewind to pos+m_acc (original protocol).
         _t = self._time.perf_counter()
-        self.pg.mtp_set_seq_len(pos + m_acc)
+        rewind_to = pos + m_acc + 1 if mode_b else pos + m_acc
+        self.pg.mtp_set_seq_len(rewind_to)
         self.t_rewind += self._time.perf_counter() - _t
         _t = self._time.perf_counter()
         self.pending_tokens = draft_flat[:m_acc] + [bonus_id]
-        self.pending_pos = pos
-        base_tok = torch.tensor([[bonus_id]], dtype=torch.long)
-        logits, state = self.pg.forward_state(base_tok, last_id_only=True, cpu_logits=True)
+        # Mode B's first pending token (draft[0]) sits at pos+1 -- the bonus at pos was
+        # already emitted at the end of the previous round.
+        self.pending_pos = pos + 1 if mode_b else pos
+        if self._bonus_elim:
+            # NO bonus forward. The bonus token's KV/logits/state come from row 0 of the
+            # NEXT verify. Track the state of the last COMMITTED token (rewind_to-1):
+            #   mode B: row m_acc holds it for EVERY m_acc -- m_acc>0 -> d_{m_acc-1} at
+            #           pos+m_acc (row i = d_{i-1} at pos+i); m_acc=0 -> the bonus itself
+            #           (row 0 at pos).
+            #   mode A: m_acc>0 -> row m_acc-1 (d_{m_acc-1} at pos+m_acc-1); m_acc=0 ->
+            #           the aligned base state (token at pos-1, not in this window).
+            if mode_b:
+                self.last_state = vstates[:, m_acc:m_acc + 1, :].float().cpu()
+                committed_tok = draft_flat[m_acc - 1] if m_acc > 0 else int(self.pending_bonus)
+            else:
+                if m_acc > 0:
+                    self.last_state = vstates[:, m_acc - 1:m_acc, :].float().cpu()
+                else:
+                    self.last_state = self.state[1]
+                committed_tok = draft_flat[m_acc - 1] if m_acc > 0 else int(self.tokens[pos - 1])
+            self.pending_bonus = bonus_id
+            self.expected_pos = rewind_to
+            self.state = (torch.tensor([[committed_tok]], dtype=torch.long),
+                          self.last_state, self.expected_pos - 1)
+        else:
+            # Legacy protocol: commit the bonus with a dedicated 1-token forward_state.
+            base_tok = torch.tensor([[bonus_id]], dtype=torch.long)
+            logits, state = self.pg.forward_state(base_tok, last_id_only=True, cpu_logits=True)
+            self.state = (base_tok, state.float().cpu(), self.pg.cache.current_seq_len - 1)
+            self.base_logits = logits.float().cpu()
+            self.pending_bonus = None
+            self.last_state = self.state[1]
+            self.expected_pos = self.pg.cache.current_seq_len
         self.t_bonus += self._time.perf_counter() - _t
-        self.state = (base_tok, state.float().cpu(), self.pg.cache.current_seq_len - 1)
-        self.base_logits = logits.float().cpu()
         if self.verbose:
-            print(f"[mtp-mp] bonus={bonus_id} new_base_pos={self.state[2]}", flush=True)
+            print(f"[mtp-mp] bonus={bonus_id} committed_pos={self.expected_pos}", flush=True)
 
     # ------------------------------------------------------------------ stats
     def stats(self):

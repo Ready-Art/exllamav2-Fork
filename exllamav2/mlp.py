@@ -459,15 +459,26 @@ class ExLlamaV2MLP(ExLlamaV2Module):
     ) -> torch.Tensor | dict[str: torch.Tensor]:
 
         cfg = self.model.config
+        ctx = self.model.tp_context
 
         batch_size, q_len, _ = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        hidden_states = self.model.tp_context.broadcast(0, hidden_states, BROADCAST_ID)
 
-        residual = hidden_states
+        if ctx.seqpar:
+            # Sequence-parallel: incoming residual is this rank's hidden shard. Allgather
+            # to full width for the input norm + column-parallel gate/up; keep the shard
+            # for the residual add. down_proj is ALREADY column-parallel on the RS split,
+            # so its output shard is the next residual shard with no extra collective.
+            residual = hidden_states
+            full = ctx.gather_residual(hidden_states)
+            post_norm = [self.pre_layernorm.forward(full)] if self.pre_layernorm else [full]
+        else:
+            hidden_states = ctx.broadcast(0, hidden_states, BROADCAST_ID)
 
-        post_norm = self.pre_layernorm.forward_tp(hidden_states, output_split = True) \
-            if self.pre_layernorm else hidden_states
+            residual = hidden_states
+
+            post_norm = self.pre_layernorm.forward_tp(hidden_states, output_split = True) \
+                if self.pre_layernorm else hidden_states
 
         gate = self.gate_proj.forward_tp(post_norm, output_split = True)
         up = self.up_proj.forward_tp(post_norm, output_split = True)
@@ -489,6 +500,17 @@ class ExLlamaV2MLP(ExLlamaV2Module):
         outputs = self.model.tp_context.allgather(1, outputs, BROADCAST_ID, BROADCAST_ID)
 
         down = self.down_proj.forward_tp(outputs, output_split = True)
+
+        if ctx.seqpar:
+            # Sequence-parallel: down's RS-split output shard is the residual shard.
+            # Post-FF norm on the shard (tiny cross-rank RMS stat all_reduce), then a
+            # shard-local residual add. No gather, no reduce_scatter.
+            out_shard = down[0]
+            if self.post_layernorm is not None:
+                out_shard = self.post_layernorm.forward_tp_sharded(out_shard)
+            if self.has_residual:
+                out_shard = out_shard + residual
+            return out_shard.view(batch_size, q_len, out_shard.shape[-1])
 
         # BUG 34c: the post-FF norm was missing here too. forward_tp_old went straight
         # from down_proj to the residual add, while the non-TP path applies
@@ -687,9 +709,14 @@ class ExLlamaV2MLP(ExLlamaV2Module):
         cfg = self.model.config
 
         if self.pre_layernorm is not None:
+            # SP: the input norm runs full-width on the allgathered residual (full weight).
             self.pre_layernorm.tp_load_rank(rank, BROADCAST_RS)
         if self.post_layernorm is not None:
-            self.post_layernorm.tp_load_rank(rank, BROADCAST_RS)
+            if self.model.tp_context.seqpar:
+                # SP: the post-FF norm runs on down_proj's output SHARD.
+                self.post_layernorm.tp_load_rank_sharded(rank, BROADCAST_RS)
+            else:
+                self.post_layernorm.tp_load_rank(rank, BROADCAST_RS)
 
         # down_proj first: it yields the permutation that gate/up must be remapped with.
         down_perm = self.down_proj.tp_load_rank(rank, BROADCAST_RS, unmap = True)

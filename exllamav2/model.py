@@ -601,6 +601,19 @@ class ExLlamaV2:
         # this rank from here on, and the loaders size their shards from it -- setting it
         # afterwards would make every module load the full split.
         self.tp_context.set_rank(rank)
+        # Sequence-parallel (hidden-sharded residual) mode. Must be decided BEFORE the
+        # scratch sizing and module loads below: it changes o_proj's parallel layout and
+        # the post-norm weight sharding. MP rank-local path only; requires the per-layer
+        # geometry TP scheme (Gemma-4's forward_tp_old), which is the only validated one.
+        # Default ON (user directive 2026-11-20 after results.md A/B): the hidden-sharded
+        # residual cuts prefill/long-context collective volume; EXL2_TP_SEQPAR=0 restores
+        # the replicated-residual path (slightly faster pure short-ctx decode).
+        self.tp_context.seqpar = os.environ.get("EXL2_TP_SEQPAR", "1") != "0"
+        if self.tp_context.seqpar:
+            assert bool(getattr(self.config.arch.lm, "tp_per_layer_geometry", False)), \
+                "EXL2_TP_SEQPAR requires the per-layer-geometry TP path (Gemma-4)"
+            print(f"[TP] rank {rank}: sequence-parallel residual mode (default ON; "
+                  f"EXL2_TP_SEQPAR=0 disables)", flush=True)
         # BUG 80: keep the CUDA-graph path. Graphs are worth 2.55x on decode in the
         # single-process path and are the largest single factor in the MP path too. Capture is
         # per-process and only touches the devices this process owns (TPContext.all_devices() is
@@ -989,6 +1002,7 @@ class ExLlamaV2:
         last_id_only: bool = False,
         loras: list[ExLlamaV2Lora] | None = None,
         return_last_state: bool = False,
+        return_row_states: bool = False,
         position_offsets: torch.Tensor | None = None,
         abort_event: threading.Event | None = None,
         cpu_logits: bool = False,
@@ -1065,6 +1079,7 @@ class ExLlamaV2:
                 last_id_only = last_id_only,
                 loras = loras,
                 return_last_state = return_last_state,
+                return_row_states = return_row_states,
                 position_offsets = position_offsets,
                 abort_event = abort_event,
                 **kwargs
@@ -1072,7 +1087,9 @@ class ExLlamaV2:
 
             if abort_event and abort_event.is_set(): return
 
-            if "last_state" in result:
+            if "row_states" in result:
+                return result.get("logits"), result["row_states"]
+            elif "last_state" in result:
                 return result.get("logits"), result["last_state"]
             else:
                 return result.get("logits")
@@ -1086,6 +1103,8 @@ class ExLlamaV2:
 
         result = None
         last_state = None
+        row_states = None
+        _prefill_trace = os.environ.get("EXL2_PREFILL_TRACE", "1") != "0"
 
         chunk_begin = 0
         while chunk_begin < q_len:
@@ -1149,6 +1168,13 @@ class ExLlamaV2:
             _last_id_only = last_id_only
             _preprocess_only = preprocess_only or (chunk_end < q_len and last_id_only)
 
+            # Long-prefill progress visibility (EXL2_PREFILL_TRACE=0 disables): an 80k
+            # prompt is dozens of chunks over PCIe TP -- without this it looks hung.
+            _trace = _prefill_trace and q_len > 64
+            if _trace:
+                import time as _time
+                _chunk_t0 = _time.perf_counter()
+
             r = self.forward_chunk(
                 input_ids = input_ids[:, chunk_begin : chunk_end],
                 cache = cache,
@@ -1157,12 +1183,17 @@ class ExLlamaV2:
                 last_id_only = _last_id_only,
                 loras = loras,
                 return_last_state = return_last_state and remaining_q_len <= chunk_size,
+                return_row_states = return_row_states and remaining_q_len <= chunk_size,
                 position_offsets = position_offsets,
                 abort_event = abort_event,
                 **kwargs
             )
 
             if abort_event and abort_event.is_set(): return
+
+            if _trace:
+                print(f"[prefill] {chunk_end}/{q_len} "
+                      f"({1000 * (_time.perf_counter() - _chunk_t0):.0f} ms/chunk)", flush=True)
 
             if not _preprocess_only:
                 if cpu_logits:
@@ -1172,7 +1203,11 @@ class ExLlamaV2:
             chunk_begin = chunk_end
             remaining_q_len -= chunk_size
             last_state = r.get("last_state")
+            if r.get("row_states") is not None:
+                row_states = r["row_states"]
 
+        if return_row_states:
+            return result, row_states
         if last_state is None:
             return result
         else:
@@ -1189,14 +1224,19 @@ class ExLlamaV2:
         layer's captured run(). After planning, order dev0's replay launch after every
         device's plan work so no replayed run() reads a half-written plan.
 
-        BUG 109: the graphed MTP verify window (q_len > 1) is served by q_len FI DECODE
-        wrappers -- one per query row i, planned to that row's causal prefix
-        kv_len_i = past_len + i + 1 (ring-relative for SWA). The decode wrapper is
-        graph-safe (BUG 103: use_cuda_graph=True freezes its buffers) and reads ONLY the
-        valid prefix -- unlike a full-160k-depth matmul (slow, BUG 108) or the FI
-        paged-prefill wrapper (re-plan reallocates captured buffers -> segfault). Each
-        unique (device, geometry, row) wrapper is planned ONCE per replay; layers sharing
-        a geometry reuse it (this also removes the old per-layer redundant re-plans).
+        Single-pass verify (2026-11-20): the graphed MTP verify window (q_len > 1) is
+        served by ONE FI paged-PREFILL wrapper per (device, geometry, q_len), reading the
+        KV prefix ONCE for all rows instead of q_len per-row decode passes (BUG 109).
+        fa2 causal=True aligns query row i to the last kv_len - q_len + i + 1 keys =
+        base + i + 1 -- exactly the verify geometry. FI 0.7.4's prefill wrapper honors
+        the same graph contract as the BUG 103 decode fix (use_cuda_graph=True + fixed
+        qo_indptr/indptr/indices/last_page_len buffers; plan() refreshes metadata in
+        place, backend pinned to fa2), verified against the installed source. The
+        BUG 107 segfault was the pre-graph-buffer re-plan pattern; fi_prefill_plan uses
+        the fixed-buffer pattern. EXL2_VERIFY_PREFILL=0 forces the per-row decode path,
+        which remains the automatic fallback whenever the prefill plan cannot serve a
+        shape (e.g. SWA base+q_len beyond the ring depth would misalign causal rows).
+        q_len == 1 (decode/bonus) keeps the single FI decode wrapper per geometry.
         """
         from exllamav2.attn import use_flashinfer
         from exllamav2.tensor_p import BROADCAST_KV
@@ -1205,6 +1245,7 @@ class ExLlamaV2:
         ctx = self.tp_context
         if not use_flashinfer(cfg) or cfg.attn_logit_softcapping:
             return
+        verify_prefill = os.environ.get("EXL2_VERIFY_PREFILL", "1") != "0"
         planned = False
         seen = set()
         past_len = kv_len - q_len
@@ -1227,6 +1268,14 @@ class ExLlamaV2:
             for idx, (dev, a, b) in enumerate(split):
                 nq = (b - a) * m.num_key_value_groups
                 nkv = b - a
+                if q_len > 1 and verify_prefill:
+                    pf_key = (dev, nq, nkv, m.head_dim, m.scaling, window_left, q_len)
+                    if pf_key not in seen:
+                        seen.add(pf_key)
+                        if ctx.fi_prefill_plan(pf_key, base + q_len, k_cache[idx]):
+                            planned = True
+                    if pf_key in ctx.fi_prefill:
+                        continue   # single-pass plan ready; skip the per-row wrappers
                 for i in range(q_len):
                     row_kv = base + i + 1
                     if ring_depth:
@@ -1256,11 +1305,13 @@ class ExLlamaV2:
         batch_size: int,
         seq_len: int,
         last_id_only: bool,
-        return_last_state: bool = False
+        return_last_state: bool = False,
+        return_row_states: bool = False
     ):
         """
         Run one graphed step -- decode, MTP bonus commit (return_last_state), or the MTP
-        verify window (seq_len > 1) -- capturing it on first use.
+        verify window (seq_len > 1, optionally with per-row states) -- capturing it on
+        first use.
 
         Returns the runner on success, or None to fall back to the eager path. Falling back is
         always safe: the eager path is unchanged and still correct.
@@ -1276,6 +1327,12 @@ class ExLlamaV2:
         BUG 44 failure mode generalized to multiple runners.
         """
         ctx = self.tp_context
+
+        # Graph state mode: 0 = logits only (decode / plain verify), 1 = last row's
+        # pre-final-norm state (bonus-commit fallback), 2 = EVERY row's pre-final-norm
+        # state (bonus-eliminated verify: the driver seeds the next round's drafter from
+        # the last accepted draft's state, so no separate bonus forward is needed).
+        state_mode = 2 if return_row_states else (1 if return_last_state else 0)
 
         # The embedding module holds its weight on the CPU (embedding.py:55 keeps it there
         # deliberately), so the token lookup runs on the host and produces a host tensor. Host work
@@ -1313,7 +1370,7 @@ class ExLlamaV2:
         # BUG 47: pass the cache so a runner captured against a different KV cache is
         # rejected instead of replayed against freed buffers.
         runner = self.tp_graph.get(batch_size, seq_len, cache,
-                                   state = return_last_state, last_id_only = last_id_only)
+                                   state = state_mode, last_id_only = last_id_only)
 
         def stage_inputs(input_buf):
             # Write every dynamic input on dev0's TP stream, ordered before the graph launch.
@@ -1340,8 +1397,11 @@ class ExLlamaV2:
             # The bonus graph also returns the pre-final-norm hidden state. The copy into this
             # static buffer is recorded INSIDE the graph, so every replay refreshes it.
             state_buf = None
-            if return_last_state:
+            if state_mode == 1:
                 state_buf = torch.empty((batch_size, 1, self.config.hidden_size),
+                                        dtype = _h0.dtype, device = ctx.device)
+            elif state_mode == 2:
+                state_buf = torch.empty((batch_size, seq_len, self.config.hidden_size),
                                         dtype = _h0.dtype, device = ctx.device)
             out = {}
 
@@ -1349,6 +1409,10 @@ class ExLlamaV2:
                 # Start from the static embedded-input buffer; the embedding itself is host work
                 # and therefore outside the graph (see the note above).
                 x = input_buf
+                # Sequence-parallel: the residual stream runs as this rank's hidden shard;
+                # slice the replicated embedding locally (no collective).
+                if ctx.seqpar:
+                    x = ctx.shard_residual(x)
                 for idx, module in enumerate(self.modules):
                     if idx < first_module:
                         continue
@@ -1357,10 +1421,19 @@ class ExLlamaV2:
                     # "Layer model.language_model.lm_head has no data" and graphs get disabled.
                     if idx == self.head_layer_idx and not getattr(self, "_tp_has_head", True):
                         break
-                    # MTP bonus state: capture BEFORE the final norm (module head_layer_idx - 1)
-                    # runs -- the same point forward_chunk's eager extract_state_indices clones at.
-                    if return_last_state and idx == self.head_layer_idx - 1:
-                        state_buf.copy_(x)
+                    # Sequence-parallel: reassemble the full hidden width before the final
+                    # norm / head / state extraction (the only full-width consumers left).
+                    if ctx.seqpar and idx == self.head_layer_idx - 1:
+                        x = ctx.gather_residual(x)
+                    # MTP state: capture BEFORE the final norm (module head_layer_idx - 1)
+                    # runs -- the same point forward_chunk's eager extract_state_indices clones
+                    # at. Mode 1 keeps the last row (bonus commit); mode 2 keeps every row
+                    # (bonus-eliminated verify).
+                    if state_mode and idx == self.head_layer_idx - 1:
+                        if state_mode == 1:
+                            state_buf.copy_(x.narrow(-2, -1, 1))
+                        else:
+                            state_buf.copy_(x)
                     if idx == self.head_layer_idx and last_id_only:
                         x = x.narrow(-2, -1, 1)
                     # No safe_move_tensor here: in graph mode the residual stream stays on the
@@ -1395,7 +1468,7 @@ class ExLlamaV2:
             _capture_err = None
             for _attempt in range(2):
                 runner = TPGraphRunner(step_fn, ctx.device,
-                                       (batch_size, seq_len, return_last_state, last_id_only),
+                                       (batch_size, seq_len, state_mode, last_id_only),
                                        tp_context = ctx)
                 # Let capture() restore the KV cache position after its warmup iterations. The
                 # warmup runs the real step, which advances current_seq_len and writes KV rows.
@@ -1431,7 +1504,7 @@ class ExLlamaV2:
             ctx.graph_mode = False
             runner.logits = out["logits"]
             self.tp_graph.add(batch_size, seq_len, runner,
-                              state = return_last_state, last_id_only = last_id_only)
+                              state = state_mode, last_id_only = last_id_only)
 
             # Capture only *records* the work; it does not execute it. Replay once so this first
             # decode step actually produces logits. Without this the caller reads the
@@ -1498,6 +1571,7 @@ class ExLlamaV2:
         last_id_only: bool = False,
         loras: list[ExLlamaV2Lora] | None = None,
         return_last_state: bool = False,
+        return_row_states: bool = False,
         position_offsets: torch.Tensor | None = None,
         abort_event: threading.Event | None = None,
         attn_params: ExLlamaV2Attention.Params | ExLlamaV2Attention.PagedParams | None = None,
@@ -1530,7 +1604,7 @@ class ExLlamaV2:
 
         r = {}
         extract_state_indices = set(extract_state_indices or [])
-        if return_last_state:
+        if return_last_state or return_row_states:
             extract_state_indices.add(self.head_layer_idx - 1)
         if extract_state_indices:
             r["states"] = {}
@@ -1560,7 +1634,8 @@ class ExLlamaV2:
         #  * verify window: a fixed W-token forward marked explicitly by the caller
         #    (graph_verify), so arbitrary prefill chunks are never captured.
         graph_verify = kwargs.pop("graph_verify", False)
-        graph_state = return_last_state and extract_state_indices == {self.head_layer_idx - 1}
+        graph_state = (return_last_state or return_row_states) \
+            and extract_state_indices == {self.head_layer_idx - 1}
         if (
             self.tp_context is not None
             and cache is not None
@@ -1575,18 +1650,28 @@ class ExLlamaV2:
         ):
             graph_runner = self._tp_graph_step(
                 input_ids, cache, attn_params, past_len, batch_size, seq_len, last_id_only,
-                return_last_state = graph_state
+                return_last_state = graph_state and return_last_state,
+                return_row_states = graph_state and return_row_states
             )
             if graph_runner is not None:
                 # The graph wrote its logits into the runner's static buffer; hand it back.
                 x = graph_runner.logits
                 if graph_state:
                     r["states"][self.head_layer_idx - 1] = graph_runner.state_buf
-                    r["last_state"] = graph_runner.state_buf
+                    if return_row_states:
+                        r["row_states"] = graph_runner.state_buf
+                    else:
+                        r["last_state"] = graph_runner.state_buf
 
         if graph_runner is None:
 
             for idx, module in enumerate(self.modules):
+
+                # Sequence-parallel: reassemble the full hidden width before the final
+                # norm / head / state extraction (mirrors the graphed step_fn).
+                if self.tp_context is not None and self.tp_context.seqpar \
+                        and idx == self.head_layer_idx - 1:
+                    x = self.tp_context.gather_residual(x)
 
                 if idx == self.head_layer_idx and last_id_only:
                     x = x.narrow(-2, -1, 1)
@@ -1594,7 +1679,10 @@ class ExLlamaV2:
                 if idx in extract_state_indices:
                     r["states"][idx] = x.clone()
                     if idx == self.head_layer_idx - 1:
-                        r["last_state"] = r["states"][idx]
+                        if return_row_states:
+                            r["row_states"] = r["states"][idx]
+                        else:
+                            r["last_state"] = r["states"][idx]
 
                 # Respect abort signal
 
@@ -1613,6 +1701,11 @@ class ExLlamaV2:
                     break
 
                 x = module.forward(x, cache = cache, attn_params = attn_params, past_len = past_len, loras = loras, **kwargs)
+
+                # Sequence-parallel: the replicated embedding output enters the block
+                # stack as this rank's hidden shard (pure local slice, no collective).
+                if idx == 0 and self.tp_context is not None and self.tp_context.seqpar:
+                    x = self.tp_context.shard_residual(x)
 
                 if os.environ.get("EXL2_TRACE_X") and not isinstance(x, torch.Tensor):
                     print(f"[TRACE] module {idx} {type(module).__name__} key={getattr(module, 'key', '?')} "
