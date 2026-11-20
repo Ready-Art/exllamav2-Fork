@@ -19,6 +19,7 @@ void p2p_allgather
     int64_t shard_ptr,
     int64_t slot_off,
     int64_t shard_bytes,
+    int64_t row_bytes,
     int64_t world,
     int64_t rank,
     int64_t flags_off,

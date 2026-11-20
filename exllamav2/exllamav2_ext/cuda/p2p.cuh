@@ -27,6 +27,9 @@
 // collectives at once, ranks skew, and one-sided writes clobbered pending data --
 // eager execution never hit it because host dispatch paced the ranks.)
 
+// row_bytes = one row of the caller's (rows, width) shard (shard_bytes for a
+// 1-D shard). The output slot uses the NCCL all_gather(dim=1) layout: row i =
+// [rank0_row_i | ... | rank(W-1)_row_i], rank r's row i at (i*world+r)*row_bytes.
 void p2p_allgather_cuda
 (
     char* arena,
@@ -34,6 +37,7 @@ void p2p_allgather_cuda
     const char* shard,
     int slot_off,
     int shard_bytes,
+    int row_bytes,
     int world,
     int rank,
     int flags_off,

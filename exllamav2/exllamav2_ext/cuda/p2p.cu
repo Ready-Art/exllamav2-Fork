@@ -20,6 +20,7 @@ __global__ void p2p_allgather_kernel
     const char* shard,
     int slot_off,
     int shard_bytes,
+    int row_bytes,
     int world,
     int rank,
     int flags_off,
@@ -33,23 +34,32 @@ __global__ void p2p_allgather_kernel
     __syncthreads();
     unsigned long long r = round;
 
-    // One-sided writes: my shard into every peer's output slot (self included).
-    int n16 = shard_bytes / 16;
-    const int4* src = (const int4*)shard;
+    // One-sided writes: my shard into every peer's output slot (self included),
+    // in the NCCL all_gather(dim=1) layout: slot row i is the interleaving
+    // [rank0_row_i | rank1_row_i | ... | rank(W-1)_row_i], so rank r's row i
+    // lands at (i*world + r)*row_bytes. A rank-major block layout (rank r's
+    // whole shard at r*shard_bytes) only coincides with this for rows == 1:
+    // decode was coherent, but the MTP verify window (rows = W+1) reshaped the
+    // slot to (rows, world*width) and read every row scrambled -> gibberish.
+    int rows = shard_bytes / row_bytes;
+    int n16 = row_bytes / 16;
     for (int p = 0; p < world; p++)
     {
-        int4* dst = (int4*)((char*)peer_ptrs[p] + slot_off + rank * shard_bytes);
-        for (int i = threadIdx.x; i < n16; i += blockDim.x)
-            dst[i] = src[i];
+        char* peer = (char*)peer_ptrs[p] + slot_off;
+        for (int i = 0; i < rows; i++)
+        {
+            char* dst = peer + (i * world + rank) * row_bytes;
+            const char* src = shard + i * row_bytes;
+            for (int j = threadIdx.x; j < n16; j += blockDim.x)
+                ((int4*)dst)[j] = ((const int4*)src)[j];
+            for (int t = n16 * 16 + threadIdx.x; t < row_bytes; t += blockDim.x)
+                dst[t] = src[t];
+        }
     }
-    for (int i = n16 * 16 + threadIdx.x; i < shard_bytes; i += blockDim.x)
-    {
-        char b = shard[i];
-        for (int p = 0; p < world; p++)
-            *((char*)peer_ptrs[p] + slot_off + rank * shard_bytes + i) = b;
-    }
-    __syncthreads();
+    // Fence every thread's writes, THEN barrier, THEN signal: thread 0's flag
+    // must not outrun the other threads' system-scope visibility.
     __threadfence_system();
+    __syncthreads();
 
     if (threadIdx.x == 0)
     {
@@ -110,8 +120,9 @@ __global__ void p2p_allreduce_kernel
         for (int i = threadIdx.x; i < elems; i += blockDim.x)
             dst[i] = data[i];
     }
-    __syncthreads();
+    // Fence every thread's writes, THEN barrier, THEN signal (see allgather).
     __threadfence_system();
+    __syncthreads();
 
     if (threadIdx.x == 0)
     {
@@ -161,6 +172,7 @@ void p2p_allgather_cuda
     const char* shard,
     int slot_off,
     int shard_bytes,
+    int row_bytes,
     int world,
     int rank,
     int flags_off,
@@ -170,7 +182,7 @@ void p2p_allgather_cuda
 )
 {
     p2p_allgather_kernel<<<1, P2P_THREADS, 0, stream>>>
-        (arena, peer_ptrs, shard, slot_off, shard_bytes, world, rank,
+        (arena, peer_ptrs, shard, slot_off, shard_bytes, row_bytes, world, rank,
          flags_off, acks_off, counter_off);
 }
 

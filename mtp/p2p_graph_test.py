@@ -65,6 +65,61 @@ def main():
         fails.append(("EAGER_AR", -1, t[:4].tolist(), float(world)))
     log(rank, f"[p2p-test] eager: {'FAIL ' + str(fails) if fails else 'PASS'}")
 
+    # ---- 1b) MULTI-ROW allgather (the MTP verify shape) ----
+    # The 1-D patterns above cannot catch a rank-major vs row-major slot layout
+    # bug: for rows == 1 the two layouts coincide. A (rows, width) shard must
+    # gather to out[i, p*width:(p+1)*width] == shard_p[i] (NCCL dim=1 semantics).
+    if not fails:
+        R, W = 7, 64
+        mr_shard = torch.empty((R, W), dtype=torch.half, device=dev)
+        for i in range(R):
+            mr_shard[i].fill_(float((rank + 1) * 100 + i))
+
+        def mr_expect(mult):
+            e = torch.empty((R, W * world), dtype=torch.half, device=dev)
+            for p in range(world):
+                for i in range(R):
+                    e[i, p * W:(p + 1) * W].fill_(float((p + 1) * 100 + i) * mult)
+            return e
+
+        out = p2p.allgather(mr_shard, ("mr_eager",), (R, W * world))
+        torch.cuda.synchronize(dev)
+        if out is None or not torch.equal(out, mr_expect(1.0)):
+            fails.append(("MULTIROW_EAGER", -1,
+                          None if out is None else out[0, :8].tolist(),
+                          mr_expect(1.0)[0, :8].tolist()))
+        else:
+            # Graphed multi-row: static shard, replays with changing values.
+            def mr_step():
+                return p2p._ag_raw(mr_shard, ("mr_graph",), (R, W * world))
+            for _ in range(3):
+                mr_step()
+            torch.cuda.synchronize(dev)
+            gg = torch.cuda.CUDAGraph()
+            ss = torch.cuda.Stream(device=dev)
+            ss.wait_stream(torch.cuda.current_stream(dev))
+            with torch.cuda.stream(ss):
+                mr_view = mr_step()
+            torch.cuda.current_stream(dev).wait_stream(ss)
+            torch.cuda.synchronize(dev)
+            with torch.cuda.graph(gg):
+                mr_view = mr_step()
+            for it in range(5):
+                mult = float(it + 1)
+                for i in range(R):
+                    mr_shard[i].fill_(float((rank + 1) * 100 + i) * mult)
+                gg.replay()
+                torch.cuda.synchronize(dev)
+                if mr_view is None or not torch.equal(mr_view, mr_expect(mult)):
+                    fails.append(("MULTIROW_GRAPH", it,
+                                  None if mr_view is None else mr_view[0, :8].tolist(),
+                                  mr_expect(mult)[0, :8].tolist()))
+                    break
+        if fails:
+            log(rank, f"[p2p-test] multi-row: FAIL {fails[-1]}")
+        else:
+            log(rank, "[p2p-test] multi-row: PASS (eager + 5 graph replays, 7x64 shards)")
+
     # ---- 2) GRAPHED allgather + allreduce, many replays, changing inputs ----
     # Static input tensors (graph-safe). Capture a small "step" of several collectives
     # with distinct keys (exercises slot allocation + alternation + counter evolution).

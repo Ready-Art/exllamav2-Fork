@@ -204,9 +204,19 @@ class P2PComm:
             return None
         if not shard.is_contiguous():
             shard = shard.contiguous()
+        # NCCL all_gather(dim=1) layout: result row i interleaves the ranks' row i
+        # ([rank0_row_i | rank1_row_i | ...]). row_bytes is one row of this rank's
+        # (rows, width) shard; the kernel scatters it at (i*world + rank)*row_bytes.
+        # A 1-D shard (the probe) is a single row. rows == 1 reduces to the old
+        # contiguous rank-block write, so decode is byte-identical; multi-row
+        # verify windows were row-scrambled by the rank-block layout (gibberish).
+        rows = full_shape[0] if len(full_shape) > 1 else 1
+        if rows < 1 or shard_bytes % rows != 0:
+            return None
+        row_bytes = shard_bytes // rows
         ext_c.p2p_allgather(
             self.arena.data_ptr(), self.peer_ptrs_dev.data_ptr(), shard.data_ptr(),
-            slot * self.SLOT_BYTES, shard_bytes, self.world, self.rank,
+            slot * self.SLOT_BYTES, shard_bytes, row_bytes, self.world, self.rank,
             self.flags_off, self.acks_off, self.counter_off)
         off = slot * self.SLOT_BYTES
         nbytes = full_numel * shard.element_size()
