@@ -179,6 +179,20 @@ def mp_worker(conn, device, world_size, rank, init_method, uuid_hex, model_dir, 
                 # MTP gather batching: both drafter source layers' K/V deltas packed
                 # into one pinned CPU tensor (see _worker_kv_pack).
                 conn.send(("ok", _worker_kv_pack(ctx, *args)))
+            elif cmd == "ring-snapshot":
+                # Prompt-boundary prompt cache: save this rank's SWA ring + bookkeeping.
+                ctx["ring_backup"] = _clone_swa_ring(ctx["cache"])
+                ctx["ring_backup_wb"] = ctx["cache"].window_beg
+                conn.send(("ok", None))
+            elif cmd == "ring-restore":
+                # Restore the saved ring and rewind to the snapshot position. Exact:
+                # the ring content IS the state the original prefill left at that
+                # position -- no recompute (SWA K/V cannot be recomputed from a
+                # truncated start: attention windows would regress to the sequence
+                # start). Full-layer K/V above the position is ignored via seq_len.
+                _restore_swa_ring(ctx["cache"], ctx["ring_backup"], args,
+                                  ctx["ring_backup_wb"])
+                conn.send(("ok", None))
             elif cmd == "sync":
                 torch.cuda.synchronize()
                 conn.send(("ok", None))
@@ -245,6 +259,22 @@ def _worker_kv_slice(ctx, layer_idx, start, end):
     k = cache.key_states[layer_idx][0, start:end].detach().cpu()
     v = cache.value_states[layer_idx][0, start:end].detach().cpu()
     return (k, v)
+
+
+def _clone_swa_ring(cache):
+    """Device-side copy of every SWA layer's ring (the ring-depth buffers)."""
+    ring = cache.kv_state_size
+    return {l: (cache.key_states[l].detach().clone(), cache.value_states[l].detach().clone())
+            for l in range(len(cache.key_states))
+            if cache.key_states[l].shape[1] == ring}
+
+
+def _restore_swa_ring(cache, backup, seq, wb):
+    for l, (k, v) in backup.items():
+        cache.key_states[l].copy_(k)
+        cache.value_states[l].copy_(v)
+    cache.current_seq_len = seq
+    cache.window_beg = wb
 
 
 def _worker_kv_pack(ctx, lf, fl0, fl1, ls, sl0, sl1):
@@ -418,6 +448,12 @@ class TPProcessGroup:
         # model.forward at every prefill chunk boundary on the master rank and
         # broadcast to the workers with a MAX all_reduce (same-boundary abort).
         self.abort_flag = multiprocessing.Event()
+        # Prompt-boundary ring snapshot (prompt cache restore path): every rank's
+        # SWA ring at the end of the lineage's first prompt, ~ring x kv heads x hd
+        # x 2 x 2B x n_swa_layers per rank (~262 MB for Gemma-4 on 4 GPUs).
+        self._ring_backup_local = None
+        self._ring_backup_seq = -1
+        self._ring_backup_wb = 0
 
     def start(self):
         port = _find_free_port()
@@ -555,6 +591,35 @@ class TPProcessGroup:
             w.send("set-seqlen", (n,))
             w.recv()
         self.cache.current_seq_len = n
+
+    def snapshot_prompt_ring(self):
+        """Save every rank's SWA ring + window_beg at the current position (the end
+        of a fresh prompt prefill). Enables exact restore to this prompt boundary
+        when a later request re-renders the generated history differently (e.g. a
+        client stripping thought channels): the full-layer K/V prefix stays live,
+        the ring is copied back, and only the re-rendered tail is prefilled."""
+        seq = self.cache.current_seq_len
+        for device, w in sorted(self.workers.items()):
+            w.send("ring-snapshot", None)
+        self._ring_backup_local = _clone_swa_ring(self.cache)
+        self._ring_backup_wb = self.cache.window_beg
+        for device, w in sorted(self.workers.items()):
+            w.recv()
+        self._ring_backup_seq = seq
+
+    def restore_prompt_ring(self, seq):
+        """Rewind every rank to the snapshot position and copy the saved rings back.
+        Returns False if no snapshot exists for exactly this position."""
+        if self._ring_backup_local is None or self._ring_backup_seq != seq:
+            return False
+        for device, w in sorted(self.workers.items()):
+            w.send("ring-restore", seq)
+        _restore_swa_ring(self.cache, self._ring_backup_local, seq, self._ring_backup_wb)
+        for device, w in sorted(self.workers.items()):
+            w.recv()
+        # the drafter's incremental gather shadow is stale after a rewind
+        self._mtp_kv = None
+        return True
 
     def mtp_reset_cache(self):
         """Distributed full cache reset (current_seq_len = window_beg = 0 on every rank).
