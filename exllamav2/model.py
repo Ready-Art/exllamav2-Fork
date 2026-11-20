@@ -622,6 +622,10 @@ class ExLlamaV2:
         # post-norm stat all_reduces); prefill chunks keep the seqpar shard flow.
         self.tp_context.decode_repl = self.tp_context.seqpar and \
             os.environ.get("EXL2_TP_DECODE_REPLICATED", "1") != "0"
+        # PCIe P2P small-collective fast path (probed + agreed across ranks; any
+        # failure falls back to NCCL). EXL2_TP_P2P=0 forces NCCL.
+        from exllamav2.p2p_comm import P2PComm
+        self.tp_context.p2p = P2PComm(rank, self.tp_context.num_devices)
         if self.tp_context.seqpar:
             assert bool(getattr(self.config.arch.lm, "tp_per_layer_geometry", False)), \
                 "EXL2_TP_SEQPAR requires the per-layer-geometry TP path (Gemma-4)"

@@ -204,6 +204,8 @@ class TPContext:
         self.seqpar = False
         # Set by load_tp_rank (MP rank-local path only); single-process TP keeps False.
         self.decode_repl = False
+        # PCIe P2P small-collective fast path (P2PComm); None = NCCL everywhere.
+        self.p2p = None
 
         # FlashInfer paged decode wrappers for head_dim > 256 layers in CUDA-graph mode
         # (Gemma-4's hd512 global layers). One wrapper per (device, geometry): all such
@@ -1142,6 +1144,19 @@ class TPContext:
 
         rows = local.shape[0]
         dtype = local.dtype
+
+        # PCIe P2P fast path: small equal-split gathers (decode/verify sizes) run as
+        # one-sided P2P writes + flag spins (~10-20 us vs NCCL's ~70 us). Large
+        # prefill gathers and uneven splits stay on NCCL below. Symmetric decision
+        # on every rank (same shapes, same enabled flag agreed at init).
+        _p2p = self.p2p
+        if _p2p is not None and _p2p.enabled and not self.graph_mode \
+                and len(set(widths)) == 1 and widths[0] == local.shape[1]:
+            _out = _p2p.allgather(local, (tag, broadcast_type, widths[0], dtype),
+                                  (rows, world * widths[0]))
+            if _out is not None:
+                return _out
+
         if self._ag_cache is None:
             self._ag_cache = {}
 
