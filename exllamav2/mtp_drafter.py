@@ -143,7 +143,7 @@ class Gemma4AssistantDrafter:
         #   * kv layers  : last full (59) and last sliding (58) target attention layers
         self.t_embed = target.modules[0]
         # The drafter indexes the target table with ARBITRARY token ids directly
-        # (_target_embed / _stage_emb bypass the shard-aware forward). With the
+        # (_target_embed / the graph's GPU table bypass the shard-aware forward). With the
         # vocab-sharded embedding (EXL2_TP_VOCAB_EMBED) the rank-local table holds
         # only this rank's rows -> out-of-bounds CUDA assert. Keep a full CPU copy
         # for the drafter: host RAM is plentiful, the per-token H2D is ~10 KB, and
@@ -185,21 +185,24 @@ class Gemma4AssistantDrafter:
         # sliding). Cached per device.
         self._rope = None
 
-        # Change98: CUDA-graph draft window (MP backend). The eager drafter is
-        # host-launch-bound (~23 ms for 6 steps x 4 layers of small torch ops); one
-        # per-step graph replayed `window` times cuts it to ~7 ms. The graph reads the
-        # FULL-DEPTH gather buffers (stable addresses) with device-side valid-length
-        # masks, so it is position- and length-agnostic across rounds. The embedding
-        # lookup stays host-side (CPU table) and is staged into a static buffer between
-        # replays; the argmax id is read back per step to feed the next embedding.
+        # CUDA-graph draft window (MP backend, EXL2_MTP_DRAFT_GRAPH=1). The eager
+        # drafter is host-dispatch-bound (~2.2 ms/step after the fused-norm fix, GPU
+        # floor ~0.5 ms). The WHOLE W-step window is captured into one graph: embed
+        # index_select from a GPU-resident table, argmax -> next step's index, and the
+        # post-projected state all chain on-device -- zero host round trips per round.
+        # Attention is FI paged decode (fa2) over the persistent MTP shadows, reading
+        # only the valid prefix; kv_len is constant within a window (the drafter writes
+        # no KV), so one host-side plan per round outside the graph serves every step
+        # (the target's proven BUG 103 fixed-buffer graph contract).
         self._draft_graph = None
         self._graph_failed = False
-        self._g_emb = None          # (1,1,backbone) static embedded-token input
-        self._g_state = None        # (1,1,backbone) state in/out (aliased next_state)
-        self._g_id = None           # (1,1) int64 static argmax output
+        self._gpu_embed = None      # (vocab, backbone) fp16 device table, scale folded in
+        self._g_state = None        # (1,1,backbone) final-normed base state input
+        self._g_id_in = None        # (1,1) int64 base token input
+        self._g_ids = None          # (1,W) int64 drafted ids output
         self._g_pos = None          # (1,) int32 device frontier position (RoPE)
-        self._g_kvfull_len = None   # (1,) int32 device valid full-layer length
-        self._g_kvswa_len = None    # (1,) int32 device valid SWA prefix length
+        self._g_full = None         # FI paged-decode wrapper entry (full hd512 source)
+        self._g_swa = None          # FI paged-decode wrapper entry (SWA hd256 source)
         self._kf_base = None        # full-depth (max_seq_len, kvh, hd) gather buffers
         self._vf_base = None
         self._ks_base = None        # ring-depth (ring, kvh, hd)
@@ -464,60 +467,9 @@ class Gemma4AssistantDrafter:
         out = out.view(1, 1, nq * hd)
         return out @ layer.o_proj.t()                    # (1,1,hidden)
 
-    def _cross_attn_graph(self, layer: _DrafterLayer, x_norm: torch.Tensor) -> torch.Tensor:
-        """
-        CUDA-graph-compatible cross-attention (Change98). Same math as _cross_attn but
-        capturable: FlashInfer's single_decode bakes kv_len (the prefix slice shape), so
-        the graph path instead attends over the FULL-DEPTH gather buffer with an additive
-        mask built on-device from the dynamic valid length -- exactly the trick the target
-        TP graph uses (BUG 43). RoPE reads the frontier position from a device tensor
-        (past_len = -1). sm_scale stays 1.0 to match the FI call above.
-        """
-        hd = layer.head_dim
-        nq = layer.num_q_heads
-        q = x_norm @ layer.q_proj.t()                    # (1,1,nq*hd)
-        q = q.view(1, 1, nq, hd)
-        q = _head_rmsnorm(q, layer.q_norm, self.rms_norm_eps)
-        sin, cos = self._get_rope()[layer.rope_index]
-        ext_c.rope_(q, sin, cos, -1, nq, hd, self._g_pos, True)
-
-        if layer.is_full:
-            k, v = self._kf_base, self._vf_base          # (Df, nkv, hd)
-            kv_len = self._g_kvfull_len
-            window = 0
-        else:
-            k, v = self._ks_base, self._vs_base          # (Ds, nkv, hd)
-            kv_len = self._g_kvswa_len
-            window = self.sliding_window
-
-        nkv = k.shape[1]
-        g = nq // nkv                                    # query heads per kv head
-        D = k.shape[0]
-        # Change98: attention math in fp32 to match FlashInfer (which accumulates scores and
-        # softmaxes in fp32). An fp16 score matmul rounds scores BEFORE softmax; at long
-        # context (many near-tied keys) that shifted the attention output enough to change
-        # drafts and drop acceptance (32k filler acc 3.18 -> 2.45). fp32 scores restore it.
-        qg = q.view(nkv, g, hd).float()                  # GQA grouping: head h -> kv h//g
-        scores = torch.matmul(qg, k.permute(1, 2, 0).float())   # (nkv, g, D) fp32
-        ki = torch.arange(D, device = k.device).view(1, 1, D)
-        kl = kv_len.view(1, 1, 1)
-        ok = ki < kl
-        if window:
-            ok = ok & (ki >= kl - window)
-        # SELECT masked scores, don't add a mask: the matmul reads the full-depth gather
-        # buffer whose unwritten tail rows can be NaN/inf garbage; an additive mask leaves
-        # NaN+(-65504)=NaN, poisoning the softmax row. torch.where replaces masked positions
-        # outright. (Buffers are also zero-initialized now; this is belt-and-suspenders.)
-        scores = torch.where(ok, scores, torch.full_like(scores, -65504.0))
-        probs = torch.softmax(scores, dim = -1)          # fp32
-        out = torch.matmul(probs, v.permute(1, 0, 2).float())   # (nkv, g, hd) fp32
-        out = out.reshape(1, 1, nq * hd).to(torch.half)
-        return out @ layer.o_proj.t()                    # (1,1,hidden)
-
     # ------------------------------------------------------------------ block
 
-    def _block(self, layer: _DrafterLayer, x: torch.Tensor, pos: int,
-               graph: bool = False) -> torch.Tensor:
+    def _block(self, layer: _DrafterLayer, x: torch.Tensor, pos: int) -> torch.Tensor:
         """
         One drafter transformer block (Gemma-4 post-norm convention, matching the
         exllamav3 reference and the EXL2 target):
@@ -529,7 +481,7 @@ class Gemma4AssistantDrafter:
         h = self.hidden_size
         # Attention branch
         y = _rmsnorm(x, layer.input_ln, self.rms_norm_eps)
-        a = self._cross_attn_graph(layer, y) if graph else self._cross_attn(layer, y, pos)
+        a = self._cross_attn(layer, y, pos)
         a = _rmsnorm(a, layer.post_attn_ln, self.rms_norm_eps)
         x = x + a
         # MLP branch
@@ -604,6 +556,7 @@ class Gemma4AssistantDrafter:
         # must use the eager path, which returns (ids, logits). Otherwise the sampling caller
         # would unpack a single ids tensor and crash.
         if (self._kf_base is not None and not self._graph_failed and not return_logits
+                and window == self.num_draft_tokens
                 and os.environ.get("EXL2_MTP_DRAFT_GRAPH", "0") == "1"):
             self._ensure_draft_graph()
             if self._draft_graph is not None:
@@ -802,99 +755,205 @@ class Gemma4AssistantDrafter:
             tok = nxt
         return torch.cat(ids, dim = -1).cpu()            # (B, window)
 
-    # ------------------------------------------------------------------ draft graph
+    # ------------------------------------------------------------------ draft graph (FI)
+
+    def _ensure_gpu_embed(self):
+        """GPU-resident copy of the target embedding table (scale folded in once).
+
+        The captured window indexes it on-device (no host round trip per step). Mirrors
+        _target_embed's sources exactly: the full CPU copy when the target table is
+        vocab-sharded (scale_emb already folded into it at load), else the module table;
+        normalize_embeddings' sqrt(hidden) scale is folded here with an in-place fp16 mul
+        (no fp32 transient of the 2.8 GB table).
+        """
+        if self._gpu_embed is not None:
+            return
+        w = self._t_embed_full if self._t_embed_full is not None \
+            else self.t_embed.embedding.weight
+        with torch.inference_mode(False):
+            t = w.to(self.dev, dtype = torch.half)
+            if getattr(self.t_embed.archparams, "normalize_embeddings", False):
+                t.mul_(self.backbone_hidden_size ** 0.5)
+        self._gpu_embed = t
+        print(f"[mtp-drafter] GPU embed table: {t.shape[0]}x{t.shape[1]} fp16 "
+              f"= {t.numel() * 2 / 2**20:.0f} MiB on cuda:{self.device}", flush = True)
+
+    def _graph_kv_plan(self, full_len, swa_len):
+        """Host-side per-round plan of the two drafter FI wrappers (OUTSIDE the graph).
+
+        kv_len is constant within a draft window (the drafter writes no K/V), so one
+        plan serves every captured step. Fixed indptr/indices/last_page_len buffers keep
+        the captured run()'s addresses stable (the target's BUG 103 graph contract).
+        """
+        page = 128
+        for ent, l, nkv, hd, window in (
+            (self._g_full, full_len, self.num_global_kv_heads, self.global_head_dim, -1),
+            (self._g_swa, swa_len, self.num_kv_heads, self.head_dim, self.sliding_window - 1),
+        ):
+            pv = (l + page - 1) // page
+            ent["indptr"][1].fill_(pv)
+            ent["indices"][:pv].copy_(ent["page_ids"][:pv])
+            ent["lpl"][0].fill_(l - (pv - 1) * page)
+            ent["wrapper"].plan(
+                indptr = ent["indptr"],
+                indices = ent["indices"][:pv],
+                last_page_len = ent["lpl"],
+                num_qo_heads = self.num_q_heads,
+                num_kv_heads = nkv,
+                head_dim = hd,
+                page_size = page,
+                pos_encoding_mode = "NONE",
+                window_left = window,
+                logits_soft_cap = None,
+                sm_scale = 1.0,
+                q_data_type = torch.half,
+                kv_data_type = torch.half,
+            )
+
+    def _block_graph_fi(self, layer: _DrafterLayer, x: torch.Tensor) -> torch.Tensor:
+        """One drafter block for the captured window: same math as _block, but attention
+        is a graph-safe FI paged-decode run over the persistent shadow (valid prefix only,
+        fa2 fp16 with fp32 softmax -- the eager single_decode numerics family), and RoPE
+        reads the frontier position from the device tensor."""
+        hd = layer.head_dim
+        nq = layer.num_q_heads
+        y = _rmsnorm(x, layer.input_ln, self.rms_norm_eps)
+        q = y @ layer.q_proj.t()
+        q = q.view(1, 1, nq, hd)
+        q = _head_rmsnorm(q, layer.q_norm, self.rms_norm_eps)
+        sin, cos = self._get_rope()[layer.rope_index]
+        ext_c.rope_(q, sin, cos, -1, nq, hd, self._g_pos, True)
+        if layer.is_full:
+            ent, pages = self._g_full, (self._g_kf_pages, self._g_vf_pages)
+        else:
+            ent, pages = self._g_swa, (self._g_ks_pages, self._g_vs_pages)
+        # run() needs 3-D q (batch, heads, dim); 2-D is misread as q_len_per_req.
+        out = ent["wrapper"].run(q.view(1, nq, hd), pages)
+        a = out.view(1, 1, nq * hd) @ layer.o_proj.t()
+        a = _rmsnorm(a, layer.post_attn_ln, self.rms_norm_eps)
+        x = x + a
+        y = _rmsnorm(x, layer.pre_ff_ln, self.rms_norm_eps)
+        gate = y @ layer.gate.t()
+        up = y @ layer.up.t()
+        y = _gelu_tanh(gate) * up
+        y = y @ layer.down.t()
+        y = _rmsnorm(y, layer.post_ff_ln, self.rms_norm_eps)
+        x = x + y
+        return x * layer.layer_scalar
 
     def _ensure_draft_graph(self):
-        """Capture one draft step (all 4 blocks + head + argmax) into a CUDA graph.
+        """Capture the WHOLE draft window (W steps x 4 blocks + head + argmax) into one
+        CUDA graph, lazily after the first gather. All chaining is device-side: embed
+        index_select from the GPU table, argmax -> next step's index, post-projected
+        state -> next step's input. Per round only the base token/state are copied in,
+        the two FI wrappers are re-planned at the round's kv lengths, and the drafted
+        ids are read out once -- zero per-step host round trips.
 
-        Called lazily after the first gather (the graph reads the full-depth gather
-        buffers, whose addresses are stable for the run). The step is position- and
-        length-agnostic: RoPE reads ``_g_pos`` and attention masks read ``_g_kv*_len``
-        from device memory, refreshed per round. ``_g_state`` is aliased: the step reads
-        it as input and overwrites it with the post-projected next state, so consecutive
-        replays chain without a copy. The embedding stays host-side (CPU table) and is
-        staged into ``_g_emb`` between replays.
+        Every buffer the graph touches is process-lifetime-held on self (inputs, shadow
+        page views, FI metadata) or allocated inside capture (graph-private pool), per
+        the BUG 110/121 contract. Capture failure falls back to the eager path.
         """
         if self._draft_graph is not None or self._graph_failed:
             return
         if self._kf_base is None:
             return
         try:
+            import flashinfer
+            from exllamav2 import attn_backend
             dev = self.dev
             H = self.backbone_hidden_size
-            self._g_emb = torch.empty((1, 1, H), dtype = torch.half, device = dev)
-            self._g_state = torch.empty((1, 1, H), dtype = torch.half, device = dev)
-            self._g_id = torch.empty((1, 1), dtype = torch.long, device = dev)
-            self._g_pos = torch.zeros((1,), dtype = torch.int32, device = dev)
-            self._g_kvfull_len = torch.zeros((1,), dtype = torch.int32, device = dev)
-            self._g_kvswa_len = torch.zeros((1,), dtype = torch.int32, device = dev)
-            # Valid (non-degenerate) inputs for warmup/capture: zero emb/state is safe
-            # (RMSNorm eps guards), lengths >= 1 avoid an all-masked softmax.
-            self._g_emb.zero_()
-            self._g_state.zero_()
-            self._g_pos.fill_(1)
-            self._g_kvfull_len.fill_(max(1, self.kv_full_len))
-            self._g_kvswa_len.fill_(max(1, self.kv_swa_len))
+            W = self.num_draft_tokens
+            page = 128
+            self._ensure_gpu_embed()
+            kf, vf = self._kf_base, self._vf_base
+            ks, vs = self._ks_base, self._vs_base
+            if kf.shape[0] % page or ks.shape[0] % page:
+                raise RuntimeError(f"shadow depth not page-aligned: {kf.shape[0]}/{ks.shape[0]}")
+            self._g_kf_pages = kf.view(-1, page, kf.shape[1], kf.shape[2])
+            self._g_vf_pages = vf.view(-1, page, vf.shape[1], vf.shape[2])
+            self._g_ks_pages = ks.view(-1, page, ks.shape[1], ks.shape[2])
+            self._g_vs_pages = vs.view(-1, page, vs.shape[1], vs.shape[2])
 
-            def step_fn():
-                y = torch.cat((self._g_emb, self._g_state), dim = -1)
-                x = y @ self.pre_projection.t()
-                for layer in self.layers:
-                    x = self._block(layer, x, 0, graph = True)
-                x = _rmsnorm(x, self.final_norm, self.rms_norm_eps)
-                self._g_state.copy_(x @ self.post_projection.t())
-                logits = x @ self.head.t()
-                self._g_id.copy_(logits.argmax(dim = -1))
+            workspace = attn_backend.FlashInferPaged._get_workspace(dev)
+
+            def mk_entry(npages):
+                indptr = torch.zeros(2, dtype = torch.int32, device = dev)
+                indices = torch.empty(npages, dtype = torch.int32, device = dev)
+                lpl = torch.zeros(1, dtype = torch.int32, device = dev)
+                return {
+                    "wrapper": flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+                        workspace, "NHD",
+                        use_cuda_graph = True,
+                        backend = "fa2",
+                        paged_kv_indptr_buffer = indptr,
+                        paged_kv_indices_buffer = indices,
+                        paged_kv_last_page_len_buffer = lpl,
+                    ),
+                    "indptr": indptr, "indices": indices, "lpl": lpl,
+                    "page_ids": torch.arange(npages, dtype = torch.int32, device = dev),
+                }
+
+            with torch.inference_mode(False):
+                self._g_full = mk_entry(kf.shape[0] // page)
+                self._g_swa = mk_entry(ks.shape[0] // page)
+                self._g_state = torch.empty((1, 1, H), dtype = torch.half, device = dev)
+                self._g_id_in = torch.empty((1, 1), dtype = torch.long, device = dev)
+                self._g_ids = torch.empty((1, W), dtype = torch.long, device = dev)
+                self._g_pos = torch.zeros((1,), dtype = torch.int32, device = dev)
+                # Valid (non-degenerate) capture inputs: token 0's embed row, zero state
+                # (RMSNorm eps guards), lengths >= 1 avoid an all-masked softmax.
+                self._g_id_in.zero_()
+                self._g_state.zero_()
+                self._g_pos.fill_(1)
+            self._graph_kv_plan(max(1, self.kv_full_len), max(1, self.kv_swa_len))
+
+            def window_fn():
+                tok = self._g_id_in
+                state = self._g_state
+                for k in range(W):
+                    emb = self._gpu_embed[tok.view(-1)].view(1, 1, H)
+                    y = torch.cat((emb, state), dim = -1)
+                    x = y @ self.pre_projection.t()
+                    for layer in self.layers:
+                        x = self._block_graph_fi(layer, x)
+                    x = _rmsnorm(x, self.final_norm, self.rms_norm_eps)
+                    state = x @ self.post_projection.t()
+                    logits = x @ self.head.t()
+                    tok = logits.argmax(dim = -1)
+                    self._g_ids[:, k:k + 1].copy_(tok)
 
             with torch.cuda.device(dev):
                 s = torch.cuda.Stream(dev)
                 s.wait_stream(torch.cuda.current_stream(dev))
                 with torch.cuda.stream(s):
                     for _ in range(3):
-                        step_fn()
+                        window_fn()
                 torch.cuda.current_stream(dev).wait_stream(s)
                 g = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(g, pool = torch.cuda.graph_pool_handle()):
-                    step_fn()
+                    window_fn()
             self._draft_graph = g
+            print(f"[mtp-drafter] captured {W}-step draft window graph "
+                  f"(FI paged decode, GPU embed)", flush = True)
         except Exception as e:
             self._graph_failed = True
             self._draft_graph = None
+            self._gpu_embed = None   # don't hold 2.7 GB for a path that won't be used
             print(f"[mtp-drafter] graph capture failed ({type(e).__name__}: {e}); "
                   f"eager fallback", flush = True)
 
-    def _stage_emb(self, tok_id: int):
-        """Host embedding lookup (CPU table) staged into the graph's static input.
-
-        Mirrors _target_embed exactly, including the normalize_embeddings sqrt(hidden)
-        scale; copy_ does the H2D move and fp16 cast in one op on the current stream.
-        """
-        w = self._t_embed_full if self._t_embed_full is not None \
-            else self.t_embed.embedding.weight
-        e = w[tok_id]                                    # (backbone,) on CPU
-        ap = self.t_embed.archparams
-        if getattr(ap, "normalize_embeddings", False):
-            e = e * (self.backbone_hidden_size ** 0.5)
-        self._g_emb[0, 0].copy_(e)
-
     def _draft_window_graph(self, last_token, last_state, pos, window):
         self._g_pos.fill_(pos)
-        self._g_kvfull_len.fill_(self.kv_full_len)
-        self._g_kvswa_len.fill_(self.kv_swa_len)
+        self._graph_kv_plan(max(1, self.kv_full_len), max(1, self.kv_swa_len))
+        self._g_id_in.copy_(last_token.to(self.dev, non_blocking = True))
         state = last_state.to(self.dev, non_blocking = True).half()
         if state.dim() == 1:
             state = state.view(1, 1, -1)
-        # First step consumes the target's FINAL-NORMED state (eager, outside the graph);
-        # later steps consume the aliased post-projected state the graph itself writes.
+        # First step consumes the target's FINAL-NORMED state; later steps consume the
+        # post-projected state the graph itself chains on-device.
         self._g_state.copy_(self._target_final_norm(state))
-        tok = int(last_token.item())
-        ids = []
-        for _ in range(window):
-            self._stage_emb(tok)
-            self._draft_graph.replay()
-            tok = int(self._g_id.item())
-            ids.append(tok)
-        return torch.tensor([ids], dtype = torch.long)   # (1, window) on CPU
+        self._draft_graph.replay()
+        return self._g_ids.cpu()                         # (1, window)
 
     # ------------------------------------------------------------------ helpers
 

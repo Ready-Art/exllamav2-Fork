@@ -62,6 +62,8 @@ def main():
 
     settings = ExLlamaV2Sampler.Settings()
     settings.temperature = 1.0
+    if os.environ.get("BENCH_GREEDY"):
+        settings = None
 
     torch.cuda.synchronize()
     t0 = time.perf_counter()
