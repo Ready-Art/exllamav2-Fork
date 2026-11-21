@@ -178,6 +178,13 @@ def mp_worker(conn, device, world_size, rank, init_method, uuid_hex, model_dir, 
                 m = ctx["model"]
                 head = m.modules[m.head_layer_idx]
                 conn.send(("ok", head.linear.weight.detach().cpu()))
+            elif cmd == "rope-tables":
+                # MTP drafter on this worker's GPU: lend the parent our RoPE tables
+                # (CUDA IPC, zero-copy). They stay alive in this rank's persistent
+                # device context; the parent caches the mapped tensors in a shim.
+                m = ctx["model"]
+                dc = m.get_device_context(ctx["rank"], scratch = False)
+                conn.send(("ok", (dc.sin, dc.cos)))
             elif cmd == "set-seqlen":
                 # MTP: distributed rewind. All ranks must move current_seq_len together
                 # (the SWA ring shift is a deterministic function of it -- BUG 94).
@@ -702,6 +709,8 @@ class TPProcessGroup:
         self.mtp_drafter = None
         self.num_speculative_tokens = 6
         self._mtp_kv = None
+        # RoPE-table shims for drafters on NON-master devices (get_device_context).
+        self._rope_ctx_shims = {}
         self._init_method = None
         self._world_size = len(gpu_split)
         # Client-disconnect abort: set by the API layer (job.cancel), polled by
@@ -788,7 +797,25 @@ class TPProcessGroup:
         return self.model.head_layer_idx
 
     def get_device_context(self, device_idx, scratch = True):
-        return self.model.get_device_context(device_idx, scratch)
+        if device_idx == -1:
+            return None
+        if device_idx == self.master_device:
+            return self.model.get_device_context(device_idx, scratch)
+        # Drafter on a WORKER GPU (draft_device != master): the master model's
+        # device_context list is [None] * devs with a real context only at its own
+        # rank (load_tp_rank), so forwarding would return None (fix.txt crash).
+        # The only consumer is the MTP drafter's _get_rope (scratch=False), which
+        # needs ctx.sin/cos on the drafter device. Borrow the owning worker's
+        # tables via CUDA IPC -- zero-copy (the fork already pipes CUDA tensors
+        # for states); they live in the worker's persistent device context, so
+        # the mappings stay valid for the group's lifetime. No extra VRAM.
+        shim = self._rope_ctx_shims.get(device_idx)
+        if shim is None:
+            import types
+            sin, cos = self.workers[device_idx].call("rope-tables")
+            shim = types.SimpleNamespace(sin = sin, cos = cos, ready = True)
+            self._rope_ctx_shims[device_idx] = shim
+        return shim
 
     def enable_mtp(self, drafter, num_draft_tokens = 6):
         """Attach the MTP drafter so :meth:`forward_state` / :meth:`gather_kv_mtp`
