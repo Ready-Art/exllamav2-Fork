@@ -4,7 +4,8 @@
 #include "quant/qdq_4.cuh"
 
 #define GPTQ_BLOCK_KN_SIZE 128
-#define GPTQ_BLOCK_M_SIZE_MAX MAX_Q_GEMM_ROWS_KERNEL
+// GPTQ comp_units instantiate m1..4 only; keep this cap independent of the EXL2 cap
+#define GPTQ_BLOCK_M_SIZE_MAX 4
 #define GPTQ_MAX_GROUPS_IN_BLOCK (GPTQ_BLOCK_KN_SIZE / 32)
 
 __forceinline__ __device__ half2 dot22_8(half2(&dq)[4], const half* a_ptr, const half2 g_result)

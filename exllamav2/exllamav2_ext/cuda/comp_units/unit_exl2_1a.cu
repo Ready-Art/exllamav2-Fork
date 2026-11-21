@@ -8,6 +8,10 @@ fp_gemm_half_q_half_kernel pick_gemm_half_q_half_kernel_1a(const int max_m, cons
         if (max_m == 2) return map_m_count_exl2_a<2, false, false>::pick_gemm_half_q_half_kernel(perm, kn_size);
         if (max_m == 3) return map_m_count_exl2_a<3, false, false>::pick_gemm_half_q_half_kernel(perm, kn_size);
         if (max_m == 4) return map_m_count_exl2_a<4, false, false>::pick_gemm_half_q_half_kernel(perm, kn_size);
+        if (max_m == 5) return map_m_count_exl2_a<5, false, false>::pick_gemm_half_q_half_kernel(perm, kn_size);
+        if (max_m == 6) return map_m_count_exl2_a<6, false, false>::pick_gemm_half_q_half_kernel(perm, kn_size);
+        if (max_m == 7) return map_m_count_exl2_a<7, false, false>::pick_gemm_half_q_half_kernel(perm, kn_size);
+        if (max_m == 8) return map_m_count_exl2_a<8, false, false>::pick_gemm_half_q_half_kernel(perm, kn_size);
     }
     return NULL;
 }

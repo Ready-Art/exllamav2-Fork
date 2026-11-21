@@ -2,8 +2,8 @@
 #define _config_h
 
 #define MAX_Q_GEMM_ROWS 32
-#define MAX_Q_GEMM_ROWS_KERNEL 4
-#define MAX_Q_GEMM_WEIGHTS 4  // must be <= MAX_Q_GEMM_ROWS_KERNEL
+#define MAX_Q_GEMM_ROWS_KERNEL 8
+#define MAX_Q_GEMM_WEIGHTS 4  // GPTQ m-cap / fused-MoE LoRA row cap; EXL2 weights array is m_count-sized
 
 #define QMODE_2BIT 1
 #define QMODE_3BIT 1

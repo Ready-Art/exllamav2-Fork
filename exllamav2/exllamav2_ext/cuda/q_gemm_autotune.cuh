@@ -36,7 +36,7 @@ AT_Result* at_get(int device, int size_m, int size_k, int size_n)
 
 AT_Result* at_get_top(int device, int size_k, int size_n)
 {
-    for (int size_m = EXL2_BLOCK_M_SIZE_MAX; size_m >= 1; --size_m)
+    for (int size_m = EXL2_BLOCK_M_SIZE_AUTOTUNE; size_m >= 1; --size_m)
     {
         uint64_t hash = AT_SHAPEHASH(device, size_m, size_k, size_n);
         auto it = at_results.find(hash);

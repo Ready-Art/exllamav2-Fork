@@ -47,9 +47,9 @@ void gemm_half_q_half_cuda_part
         }
         else
         {
-            // Only autotune up to EXL2_BLOCK_M_SIZE_MAX
+            // Only autotune up to EXL2_BLOCK_M_SIZE_AUTOTUNE
 
-            if (size_m > EXL2_BLOCK_M_SIZE_MAX)
+            if (size_m > EXL2_BLOCK_M_SIZE_AUTOTUNE)
             {
                 atr = at_get_top(b->device, size_k, size_n);
                 if (atr && atr->best) block_kn_size = atr->best;

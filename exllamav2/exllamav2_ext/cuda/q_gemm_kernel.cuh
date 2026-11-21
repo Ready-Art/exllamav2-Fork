@@ -9,6 +9,8 @@
 #include "quant/qdq_8.cuh"
 
 #define EXL2_BLOCK_M_SIZE_MAX MAX_Q_GEMM_ROWS_KERNEL
+// Autotune measurement stays at the legacy m<=4 envelope; larger m reuses at_get_top
+#define EXL2_BLOCK_M_SIZE_AUTOTUNE 4
 
 //#define EXL2_BLOCK_KN_SIZE 32
 //#define EXL2_MAX_GROUPS_IN_BLOCK (EXL2_BLOCK_KN_SIZE / 32)
@@ -185,7 +187,7 @@ __global__ void gemm_half_q_half_kernel
 
     // Read weights
 
-    half_uint16 weights[MAX_Q_GEMM_WEIGHTS];
+    half_uint16 weights[m_count];
     if constexpr (use_r_weights)
     {
         uint16_t any_w = 0;
