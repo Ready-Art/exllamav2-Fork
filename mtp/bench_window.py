@@ -41,7 +41,10 @@ def build_prompt(tok, nprefill):
 
 
 def main():
-    maxseq = CTX + NGEN + NWARM + 256
+    # Page-align: full-attention KV depth = max_seq_len, and the FI verify plan guards
+    # require depth % 128 == 0 (unaligned depths silently fall back to torch SDPA).
+    # tabby sets max_seq_len = cache_size (page-aligned); mirror that here.
+    maxseq = ((CTX + NGEN + NWARM + 256 + 127) // 128) * 128
     c = ExLlamaV2Config(); c.model_dir = MD; c.prepare(); c.arch_compat_overrides()
     c.max_seq_len = maxseq
     tok = ExLlamaV2Tokenizer(c)
