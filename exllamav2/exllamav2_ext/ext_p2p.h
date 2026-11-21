@@ -24,7 +24,18 @@ void p2p_allgather
     int64_t rank,
     int64_t flags_off,
     int64_t acks_off,
-    int64_t counter_off
+    int64_t counter_off,
+    int64_t wait_ack
+);
+
+void p2p_barrier
+(
+    int64_t arena_ptr,
+    int64_t peer_ptrs_ptr,
+    int64_t acks_off,
+    int64_t counter_off,
+    int64_t world,
+    int64_t rank
 );
 
 void p2p_allreduce

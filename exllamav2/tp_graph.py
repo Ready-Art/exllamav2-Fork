@@ -123,6 +123,17 @@ class TPGraphRunner:
         # priority -100 in device.py), which is what torch's capture API requires.
         self.capture_stream = ctx.streams_dev[dev0]
 
+        # Deferred-ack P2P protocol: graphed allgathers skip the per-op ack spin, so
+        # every execution of the step (warmup iterations AND the captured body) must
+        # start with the barrier that waits for all peers' acks of the previous round.
+        _p2p = getattr(ctx, "p2p", None)
+        if _p2p is not None and _p2p.enabled:
+            _inner = self.step_fn
+            def _barried_step():
+                _p2p.barrier()
+                _inner()
+            self.step_fn = _barried_step
+
         # The warmup below runs the real step, which advances the KV cache position and writes
         # KV rows. Save the position so it can be restored afterwards: the caller expects the
         # cache to be exactly where it was, and a stale position makes every replay write KV at

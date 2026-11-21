@@ -25,7 +25,8 @@ __global__ void p2p_allgather_kernel
     int rank,
     int flags_off,
     int acks_off,
-    int counter_off
+    int counter_off,
+    int wait_ack
 )
 {
     __shared__ unsigned long long round;
@@ -74,18 +75,54 @@ __global__ void p2p_allgather_kernel
         unsigned long long* myf = (unsigned long long*)(arena + flags_off);
         for (int p = 0; p < world; p++)
             while (atomicAdd_system(&myf[p], 0ULL) < r) {}
-        // BUG 116 rendezvous: ack round r and wait for every peer's ack before
-        // returning, so no rank can start round r+1 writes while a slower rank
-        // is still consuming round r data.
+        // BUG 116 rendezvous, deferred-ack form: every op still acks round r (the
+        // graph-start barrier waits on these), but only EAGER ops (wait_ack=1) spin
+        // for peer acks here. Inside a graph the per-op ack spin is redundant: slots
+        // are double-buffered per key (reuse distance 2), each op's flag wait already
+        // proves every peer STARTED the previous op, and a rank's consumers of an
+        // older slot are stream-ordered before its next op kernel -- so a write to a
+        // reused slot can never outrun a peer's read of it. The cross-replay hazard
+        // (first op of replay r+1 aliasing a late slot of replay r) is covered by the
+        // p2p_barrier_kernel at the graph start, which waits for ALL peers' acks of
+        // the previous round before any write. Dropping 119 of 120 ack spins saves
+        // ~35 us/op of PCIe atomic round trips on the verify path.
         for (int p = 0; p < world; p++)
         {
             unsigned long long* a =
                 (unsigned long long*)((char*)peer_ptrs[p] + acks_off) + rank;
             atomicExch_system(a, r);
         }
+        if (wait_ack)
+        {
+            unsigned long long* mya = (unsigned long long*)(arena + acks_off);
+            for (int p = 0; p < world; p++)
+                while (atomicAdd_system(&mya[p], 0ULL) < r) {}
+        }
+    }
+    __syncthreads();
+}
+
+// Graph-start barrier: wait until every peer has acked the round counter's current
+// value (the last collective of the previous replay / eager op) BEFORE this replay's
+// first one-sided write. Reads the device counter at replay time, so one captured
+// node serves every replay. See the deferred-ack comment in p2p_allgather_kernel.
+__global__ void p2p_barrier_kernel
+(
+    char* arena,
+    const int64_t* peer_ptrs,
+    int acks_off,
+    int counter_off,
+    int world,
+    int rank
+)
+{
+    if (threadIdx.x == 0)
+    {
+        unsigned long long c =
+            atomicAdd((unsigned long long*)(arena + counter_off), 0ULL);
         unsigned long long* mya = (unsigned long long*)(arena + acks_off);
         for (int p = 0; p < world; p++)
-            while (atomicAdd_system(&mya[p], 0ULL) < r) {}
+            while (atomicAdd_system(&mya[p], 0ULL) < c) {}
     }
     __syncthreads();
 }
@@ -178,12 +215,28 @@ void p2p_allgather_cuda
     int flags_off,
     int acks_off,
     int counter_off,
+    int wait_ack,
     cudaStream_t stream
 )
 {
     p2p_allgather_kernel<<<1, P2P_THREADS, 0, stream>>>
         (arena, peer_ptrs, shard, slot_off, shard_bytes, row_bytes, world, rank,
-         flags_off, acks_off, counter_off);
+         flags_off, acks_off, counter_off, wait_ack);
+}
+
+void p2p_barrier_cuda
+(
+    char* arena,
+    const int64_t* peer_ptrs,
+    int acks_off,
+    int counter_off,
+    int world,
+    int rank,
+    cudaStream_t stream
+)
+{
+    p2p_barrier_kernel<<<1, 32, 0, stream>>>
+        (arena, peer_ptrs, acks_off, counter_off, world, rank);
 }
 
 void p2p_allreduce_cuda

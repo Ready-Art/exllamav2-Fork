@@ -59,7 +59,8 @@ void p2p_allgather
     int64_t rank,
     int64_t flags_off,
     int64_t acks_off,
-    int64_t counter_off
+    int64_t counter_off,
+    int64_t wait_ack
 )
 {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -76,6 +77,30 @@ void p2p_allgather
         (int)flags_off,
         (int)acks_off,
         (int)counter_off,
+        (int)wait_ack,
+        stream
+    );
+}
+
+void p2p_barrier
+(
+    int64_t arena_ptr,
+    int64_t peer_ptrs_ptr,
+    int64_t acks_off,
+    int64_t counter_off,
+    int64_t world,
+    int64_t rank
+)
+{
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    p2p_barrier_cuda
+    (
+        (char*)arena_ptr,
+        (const int64_t*)peer_ptrs_ptr,
+        (int)acks_off,
+        (int)counter_off,
+        (int)world,
+        (int)rank,
         stream
     );
 }

@@ -91,7 +91,9 @@ def main():
         else:
             # Graphed multi-row: static shard, replays with changing values.
             def mr_step():
+                p2p.barrier()
                 return p2p._ag_raw(mr_shard, ("mr_graph",), (R, W * world))
+            p2p.begin_graph()
             for _ in range(3):
                 mr_step()
             torch.cuda.synchronize(dev)
@@ -104,6 +106,7 @@ def main():
             torch.cuda.synchronize(dev)
             with torch.cuda.graph(gg):
                 mr_view = mr_step()
+            p2p.end_graph()
             for it in range(5):
                 mult = float(it + 1)
                 for i in range(R):
@@ -129,12 +132,14 @@ def main():
     g_views = []
 
     def step():
+        p2p.barrier()
         g_views.clear()
         for i, sh in enumerate(g_shards):
             g_views.append(p2p._ag_raw(sh, (f"graph_ag_{i}",), (n * world,)))
         p2p._ar_raw(g_ar)
 
     # warmup (eager) so allocator/JIT settle, like the real capture path
+    p2p.begin_graph()
     for _ in range(3):
         step()
     torch.cuda.synchronize(dev)
@@ -153,6 +158,7 @@ def main():
         log(rank, f"[p2p-test] GRAPH CAPTURE FAILED: {type(e).__name__}: {e}")
         dist.destroy_process_group()
         return
+    p2p.end_graph()
 
     REPLAYS = 20
     for it in range(REPLAYS):
@@ -200,12 +206,14 @@ def main():
 
             def make_step(sh=sh, vv=vv, name=name):
                 def step():
+                    p2p.barrier()
                     vv.clear()
                     for i, s in enumerate(sh):
                         vv.append(p2p._ag_raw(s, (f"mg_{name}_{i}",), (n * world,)))
                 return step
 
             st = make_step()
+            p2p.begin_graph()
             for _ in range(3):
                 st()
             torch.cuda.synchronize(dev)
@@ -218,6 +226,7 @@ def main():
             torch.cuda.synchronize(dev)
             with torch.cuda.graph(gg):
                 st()
+            p2p.end_graph()
             graphs[name] = gg
             views[name] = vv
 

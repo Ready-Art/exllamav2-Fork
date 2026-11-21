@@ -19,13 +19,16 @@
 //   [counter_off, +8)                       u64 round counter (device-incremented)
 //   [ptrs_off, +world*8)                    i64 peer arena base pointers
 //
-// Two-phase rendezvous (BUG 116): phase 1 flags = "my round-r data is in your
-// buffer"; phase 2 acks = "I have finished round r". No rank returns from round r
-// until EVERY rank acks r, so a fast rank under graph replay can never lap a slow
-// rank and overwrite a slot/scratch the slow rank has not consumed yet. (The
-// single-phase protocol corrupted graphed decode: a replay launches ~240
-// collectives at once, ranks skew, and one-sided writes clobbered pending data --
-// eager execution never hit it because host dispatch paced the ranks.)
+// Two-phase rendezvous (BUG 116), deferred-ack form: phase 1 flags = "my round-r
+// data is in your buffer" (every op waits for all peers' flags); phase 2 acks =
+// "I have finished round r" (every op WRITES its ack, but only eager ops spin for
+// peer acks per-op). Graphed ops rely on p2p_barrier_kernel at the graph start
+// (waits all peers' acks of the previous round before any write) plus the per-op
+// flag waits + double-buffered slots + stream-ordered consumers for intra-replay
+// safety. (The original single-phase protocol corrupted graphed decode: a replay
+// launches ~240 collectives at once, ranks skew, and one-sided writes clobbered
+// pending data -- eager execution never hit it because host dispatch paced the
+// ranks. The allreduce keeps full per-op acks: its scratch is shared, not slotted.)
 
 // row_bytes = one row of the caller's (rows, width) shard (shard_bytes for a
 // 1-D shard). The output slot uses the NCCL all_gather(dim=1) layout: row i =
@@ -43,6 +46,20 @@ void p2p_allgather_cuda
     int flags_off,
     int acks_off,
     int counter_off,
+    int wait_ack,
+    cudaStream_t stream
+);
+
+// Graph-start barrier: wait for all peers' acks of the current round counter value
+// before the replay's first write. Captured as the graph's first P2P node.
+void p2p_barrier_cuda
+(
+    char* arena,
+    const int64_t* peer_ptrs,
+    int acks_off,
+    int counter_off,
+    int world,
+    int rank,
     cudaStream_t stream
 );
 

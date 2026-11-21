@@ -66,6 +66,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("p2p_ipc_handle", &p2p_ipc_handle, "p2p_ipc_handle");
     m.def("p2p_ipc_open", &p2p_ipc_open, "p2p_ipc_open");
     m.def("p2p_allgather", &p2p_allgather, "p2p_allgather");
+    m.def("p2p_barrier", &p2p_barrier, "p2p_barrier");
     m.def("p2p_allreduce", &p2p_allreduce, "p2p_allreduce");
     m.def("reconstruct", &reconstruct, "reconstruct");
     m.def("gemm_half_q_half", &gemm_half_q_half, "gemm_half_q_half");

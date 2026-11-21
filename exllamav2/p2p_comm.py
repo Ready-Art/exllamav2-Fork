@@ -185,6 +185,18 @@ class P2PComm:
                   f"expect {float(self.world)}", flush = True)
         return ok
 
+    def barrier(self):
+        """Graph-start rendezvous of the deferred-ack protocol: wait until every peer
+        has acked the round counter's current value (the previous replay's last
+        collective) before this replay's first one-sided write. Captured as the first
+        P2P node of every graph and run before each warmup iteration; reads the device
+        counter at replay time, so one captured node serves every replay."""
+        if not self.enabled:
+            return
+        from exllamav2.ext import exllamav2_ext as ext_c
+        ext_c.p2p_barrier(self.arena.data_ptr(), self.peer_ptrs_dev.data_ptr(),
+                          self.acks_off, self.counter_off, self.world, self.rank)
+
     def allgather(self, shard: torch.Tensor, key, full_shape):
         """
         Equal-split allgather of ``shard`` (this rank's contiguous slice) into a
@@ -219,10 +231,14 @@ class P2PComm:
         if rows < 1 or shard_bytes % rows != 0:
             return None
         row_bytes = shard_bytes // rows
+        # Eager ops (epoch 0) keep the full per-op ack rendezvous; graphed ops skip
+        # the ack spin -- the graph-start barrier() covers the cross-replay hazard
+        # (see the deferred-ack comment in p2p.cu).
         ext_c.p2p_allgather(
             self.arena.data_ptr(), self.peer_ptrs_dev.data_ptr(), shard.data_ptr(),
             slot * self.SLOT_BYTES, shard_bytes, row_bytes, self.world, self.rank,
-            self.flags_off, self.acks_off, self.counter_off)
+            self.flags_off, self.acks_off, self.counter_off,
+            1 if self._epoch == 0 else 0)
         off = slot * self.SLOT_BYTES
         nbytes = full_numel * shard.element_size()
         return self.arena[off:off + nbytes].view(shard.dtype).reshape(full_shape)
