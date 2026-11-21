@@ -127,12 +127,15 @@ class Gemma4AssistantDrafter:
         draft_dir: str,
         device: int = 0,
         num_draft_tokens: int = 6,
+        sparse_head_columns: int = 0,
     ):
         self.target = target
         self.tcfg = target.config
         self.device = device
         self.dev = torch.device("cuda", device)
         self.num_draft_tokens = num_draft_tokens
+        self.sparse_head_columns = int(sparse_head_columns or
+                                       os.environ.get("EXL2_SPARSE_DRAFT_HEAD", "0"))
 
         # Drafter geometry from its own config.json (fall back to the known defaults).
         self._read_config(draft_dir)
@@ -172,6 +175,16 @@ class Gemma4AssistantDrafter:
 
         # Drafter weights (fp16 on self.device).
         self._load_weights(draft_dir)
+
+        # Sparse draft head (opt-in): frequency-subset vocab columns for the draft
+        # argmax; verification keeps the full head. None = full head always.
+        self.sparse = None
+        if self.sparse_head_columns > 0:
+            from exllamav2.sparse_head import SparseHead, stats_key_for
+            self.sparse = SparseHead(
+                self.head, self.sparse_head_columns,
+                stats_key_for(getattr(self.tcfg, "model_dir", "model"), self.head.shape[0]),
+                self.vocab_size, self.dev)
 
         # Per-round gathered target K/V (None until gather_target runs).
         self.kv_full = None   # (1, L, num_global_kv_heads, global_head_dim)
@@ -498,11 +511,14 @@ class Gemma4AssistantDrafter:
 
     # ------------------------------------------------------------------ one step
 
-    def _step(self, token_id: torch.Tensor, state: torch.Tensor, pos: int, first: bool):
+    def _step(self, token_id: torch.Tensor, state: torch.Tensor, pos: int, first: bool,
+              use_sparse: bool = False, probe: bool = False):
         """
-        One draft step. Returns (logits (1,1,vocab), next_state (1,1,backbone)).
+        One draft step. Returns (logits (1,1,vocab or subset), next_state (1,1,backbone)).
         ``state`` is the backbone-width input state (pre-final-norm on the first
-        step, already post-projected afterwards).
+        step, already post-projected afterwards). ``use_sparse``: logits over the
+        sparse head's column subset (caller maps argmax back via sparse.map_ids).
+        ``probe``: measure full-vs-sparse argmax agreement on this state (miss gate).
         """
         if first:
             state = self._target_final_norm(state)
@@ -513,7 +529,12 @@ class Gemma4AssistantDrafter:
             x = self._block(layer, x, pos)
         x = _rmsnorm(x, self.final_norm, self.rms_norm_eps)
         next_state = x @ self.post_projection.t()        # (1,1,backbone)
-        logits = x @ self.head.t()                       # (1,1,vocab)
+        if probe and self.sparse is not None:
+            self.sparse.probe(x)
+        if use_sparse and self.sparse is not None and self.sparse.active:
+            logits = self.sparse.logits(x)               # (1,1,columns)
+        else:
+            logits = x @ self.head.t()                   # (1,1,vocab)
         return logits, next_state
 
     # ------------------------------------------------------------------ draft window
@@ -525,16 +546,20 @@ class Gemma4AssistantDrafter:
         ``last_token`` / ``last_state``.
 
         The drafter reads the target's K/V, which ends at position ``pos - 1`` (the target
-        has ``pos`` tokens in cache). Its query therefore sits at the frontier position
-        ``pos`` for EVERY draft step -- it does not advance, because the drafter writes no
-        K/V of its own. This matches the exllamav3 reference (``params["positions"] =
-        kv_seqlens``, held constant across the draft loop).
+        has ``pos`` tokens in cache). Its query sits at ``pos`` -- the INPUT token's own
+        absolute position -- for EVERY draft step; it does not advance, because the
+        drafter writes no K/V of its own. This matches the exllamav3 reference
+        (``params["positions"] = kv_seqlens``, held constant across the draft loop; the
+        input bonus sits exactly at kv_seqlens). A query one position ahead (the old
+        mode-B pos+1) shifts every query-key relative distance and collapses long-context
+        acceptance.
 
-        :param last_token: (1,1) id of the last accepted target token (the drafter's
-            first input).
-        :param last_state: (1,1,backbone) target pre-final-norm hidden state of that
-            token (the round's first state input).
-        :param pos: the target's current sequence length (number of cached tokens).
+        :param last_token: (1,1) id of the round's input token (the pending bonus in
+            mode B, the last committed token in mode A).
+        :param last_state: (1,1,backbone) target pre-final-norm hidden state of the
+            token PRECEDING the input (the round's first state input).
+        :param pos: the input token's absolute position (== number of cached tokens in
+            mode B).
         :param window: number of draft tokens to produce (default num_draft_tokens).
         :return: (1, window) tensor of drafted token ids.
         """
@@ -567,9 +592,16 @@ class Gemma4AssistantDrafter:
         state = last_state.to(self.dev, non_blocking = True).half()
         if state.dim() == 1:                      # tolerate a flattened (H,) state
             state = state.view(1, 1, -1)
+        # Sparse head: subset logits + id map for the greedy draft; return_logits
+        # callers need the FULL distribution, so they always take the full head.
+        use_sparse = (self.sparse is not None and self.sparse.active and not return_logits)
+        probe = use_sparse and self.sparse.should_probe()
         for k in range(window):
-            logits, state = self._step(tok, state, pos, first = (k == 0))
+            logits, state = self._step(tok, state, pos, first = (k == 0),
+                                       use_sparse = use_sparse, probe = (probe and k == 0))
             nxt = torch.argmax(logits, dim = -1)         # (1,1)
+            if use_sparse:
+                nxt = self.sparse.map_ids(nxt)
             ids.append(nxt)
             logits_list.append(logits.float())
             tok = nxt
@@ -907,6 +939,10 @@ class Gemma4AssistantDrafter:
                 self._g_pos.fill_(1)
             self._graph_kv_plan(max(1, self.kv_full_len), max(1, self.kv_swa_len))
 
+            # Sparse head baked at capture; a rebuild/disable invalidates the graph
+            # (refresh_sparse_head / the probe gate), so the subset is stable here.
+            sparse_at_capture = self.sparse is not None and self.sparse.active
+
             def window_fn():
                 tok = self._g_id_in
                 state = self._g_state
@@ -918,8 +954,10 @@ class Gemma4AssistantDrafter:
                         x = self._block_graph_fi(layer, x)
                     x = _rmsnorm(x, self.final_norm, self.rms_norm_eps)
                     state = x @ self.post_projection.t()
-                    logits = x @ self.head.t()
-                    tok = logits.argmax(dim = -1)
+                    if sparse_at_capture:
+                        tok = self.sparse.ids[(x @ self.sparse.subset.t()).argmax(dim = -1)]
+                    else:
+                        tok = (x @ self.head.t()).argmax(dim = -1)
                     self._g_ids[:, k:k + 1].copy_(tok)
 
             with torch.cuda.device(dev):
@@ -943,6 +981,14 @@ class Gemma4AssistantDrafter:
                   f"eager fallback", flush = True)
 
     def _draft_window_graph(self, last_token, last_state, pos, window):
+        # Miss-rate probe (every _PROBE_EVERY windows): one eager first step, dual
+        # argmax. If the gate trips, drop the graph and re-enter draft_window, which
+        # recaptures with the full head.
+        if self.sparse is not None and self.sparse.should_probe():
+            self.sparse.probe(self._probe_hidden(last_token, last_state, pos))
+            if self.sparse.disabled:
+                self.invalidate_draft_graph()
+                return self.draft_window(last_token, last_state, pos, window)[0]
         self._g_pos.fill_(pos)
         self._graph_kv_plan(max(1, self.kv_full_len), max(1, self.kv_swa_len))
         self._g_id_in.copy_(last_token.to(self.dev, non_blocking = True))
@@ -954,6 +1000,36 @@ class Gemma4AssistantDrafter:
         self._g_state.copy_(self._target_final_norm(state))
         self._draft_graph.replay()
         return self._g_ids.cpu()                         # (1, window)
+
+    def _probe_hidden(self, last_token, last_state, pos):
+        """Eager first-step final-norm hidden state for the sparse-head probe."""
+        tok = last_token.to(self.dev, non_blocking = True)
+        s = last_state.to(self.dev, non_blocking = True).half()
+        if s.dim() == 1:
+            s = s.view(1, 1, -1)
+        s = self._target_final_norm(s)
+        emb = self._target_embed(tok)
+        x = torch.cat((emb, s), dim = -1) @ self.pre_projection.t()
+        for layer in self.layers:
+            x = self._block(layer, x, pos)
+        return _rmsnorm(x, self.final_norm, self.rms_norm_eps)
+
+    # ------------------------------------------------------------------ sparse head lifecycle
+
+    def observe_tokens(self, ids):
+        """Feed prompt/generated token ids into the sparse head's frequency stats."""
+        if self.sparse is not None:
+            self.sparse.observe(ids)
+
+    def refresh_sparse_head(self):
+        """Job-boundary subset rebuild; a changed subset invalidates the draft graph."""
+        if self.sparse is not None and self.sparse.rebuild():
+            self.invalidate_draft_graph()
+            print(f"[mtp-drafter] sparse draft head rebuilt: "
+                  f"{self.sparse.subset.shape[0]} columns", flush = True)
+
+    def invalidate_draft_graph(self):
+        self._draft_graph = None
 
     # ------------------------------------------------------------------ helpers
 

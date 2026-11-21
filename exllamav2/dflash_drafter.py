@@ -137,11 +137,15 @@ class DFlashDrafter:
         draft_dir: str,
         device: int = 0,
         num_draft_tokens: int | None = None,
+        sparse_head_columns: int = 0,
     ):
         self.target = target
         self.tcfg = target.config
         self.device = device
         self.dev = torch.device("cuda", device)
+        self.sparse_head_columns = int(sparse_head_columns or
+                                       os.environ.get("EXL2_SPARSE_DRAFT_HEAD", "0"))
+        self.sparse = None   # built in set_head (the head arrives at enable time)
 
         self._read_config(draft_dir)
 
@@ -294,6 +298,12 @@ class DFlashDrafter:
         Supplied by TPProcessGroup.enable_mtp (gathered vocab shards)."""
         self.head = weight.to(self.dev, dtype = torch.half).contiguous()
         self.head_padding = int(padding)
+        if self.sparse_head_columns > 0:
+            from exllamav2.sparse_head import SparseHead, stats_key_for
+            self.sparse = SparseHead(
+                self.head, self.sparse_head_columns,
+                stats_key_for(getattr(self.tcfg, "model_dir", "model"), self.vocab_size),
+                self.vocab_size, self.dev)
 
     # ------------------------------------------------------------------ KV cache / rope
 
@@ -537,14 +547,38 @@ class DFlashDrafter:
             x = x + (F.silu(y @ layer.gate.t()) * (y @ layer.up.t())) @ layer.down.t()
 
         x = _rmsnorm(x, self.final_norm, self.rms_norm_eps)
-        logits = x @ self.head.t()                    # (1, q_len, vocab)
-        if self.softcap:
-            ext_c.softcap_(logits, float(self.softcap))
-        if self.head_padding > 0:
-            logits[:, :, -self.head_padding:] = -65504.
+        # Sparse head probe (miss gate) on the last mask row's hidden state.
+        if self.sparse is not None and self.sparse.should_probe():
+            self.sparse.probe(x[:, -1:, :])
+        use_sparse = self.sparse is not None and self.sparse.active
+        if use_sparse:
+            # Subset logits: softcap is monotonic (argmax-invariant) and the subset
+            # excludes padding rows, so neither post-processing step is needed.
+            logits = self.sparse.logits(x)            # (1, q_len, columns)
+        else:
+            logits = x @ self.head.t()                # (1, q_len, vocab)
+            if self.softcap:
+                ext_c.softcap_(logits, float(self.softcap))
+            if self.head_padding > 0:
+                logits[:, :, -self.head_padding:] = -65504.
         # Mask positions only: row 0 is the anchor (already decided).
         draft = logits[0, 1:, :].argmax(dim = -1).view(1, window)
+        if use_sparse:
+            draft = self.sparse.map_ids(draft)
         return draft.cpu(), None
+
+    # ------------------------------------------------------------------ sparse head lifecycle
+
+    def observe_tokens(self, ids):
+        """Feed prompt/generated token ids into the sparse head's frequency stats."""
+        if self.sparse is not None:
+            self.sparse.observe(ids)
+
+    def refresh_sparse_head(self):
+        """Job-boundary subset rebuild (DFlash drafts eagerly -- no graph to drop)."""
+        if self.sparse is not None and self.sparse.rebuild():
+            print(f"[dflash] sparse draft head rebuilt: "
+                  f"{self.sparse.subset.shape[0]} columns", flush = True)
 
     # ------------------------------------------------------------------ helpers
 

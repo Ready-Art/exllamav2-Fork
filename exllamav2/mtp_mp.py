@@ -128,6 +128,11 @@ class MTPMPDriver:
         if self._dflash:
             assert aux is not None, "DFlash begin() requires the prefill aux states"
             self.d.feed_context(aux, aux_p0)
+        # Sparse draft head: count the prompt's tokens and rebuild the subset at this
+        # job boundary (never mid-round -- captured draft graphs stay valid).
+        if hasattr(self.d, "observe_tokens"):
+            self.d.observe_tokens(prompt_ids)
+            self.d.refresh_sparse_head()
         self.tokens = prompt_ids[0].tolist()
         n = len(self.tokens)
         # prefill_state is (1, n_prompt, H): the state is captured before the
@@ -200,6 +205,22 @@ class MTPMPDriver:
         (row 0) under bonus-forward elimination (or by the legacy bonus forward).
         """
         if not self.pending_tokens:
+            # MTP (bonus-elim): decide the first bonus from the base logits so EVERY
+            # round is mode B -- the exl3 reference always drafts from an uncommitted
+            # bonus with the query at its position. (DFlash keeps mode A: its block
+            # anchor must be a context-committed token.) Same distribution as the old
+            # mode-A first round: the bonus is drawn from the target's base logits.
+            if (not self._dflash and self._bonus_elim
+                    and self.pending_bonus is None and self.base_logits is not None):
+                if settings is None:
+                    self.pending_bonus = int(self.base_logits[0, 0].argmax())
+                else:
+                    import random as _random
+                    if sequence_ids is None:
+                        sequence_ids = torch.tensor([self.tokens], dtype=torch.long)
+                    p = self._dense_probs(self.base_logits, settings, tokenizer,
+                                          sequence_ids, ban_tokens)
+                    self.pending_bonus = self._sample_from(p, _random.random())
             self._round(settings, tokenizer, sequence_ids, ban_tokens)
         tok = self.pending_tokens.pop(0)
         self.tokens.append(tok)
@@ -283,23 +304,26 @@ class MTPMPDriver:
         _t = self._time.perf_counter()
 
         # 2. draft a greedy window.
-        # Mode A (no pending bonus: first round / re-commit fallback): aligned base
-        #   (token at pos-1, its own state), predicting pos..pos+W-1, query at pos.
-        # Mode B (bonus eliminated): the pending bonus sits at pos (decided, emitted,
-        #   KV not yet written). The drafter seeds from (bonus, last-committed state) --
-        #   the state is one position stale by design -- and predicts pos+1..pos+W with
-        #   its query at pos+1 over the gathered KV (which ends at pos-1).
+        # QUERY POSITION RULE (exl3 reference, generator.py: positions = kv_seqlens):
+        # RoPE attention scores depend on RELATIVE query-key distances. exl3 inputs the
+        # UNCOMMITTED bonus at pos over KV [0, pos-1] with the query at pos -> distances
+        # [1, pos]. Mode B matches that exactly (query at pos). The old pos+1 shifted
+        # every distance by +1: mild local damage, catastrophic long-context acceptance
+        # (the 82k collapse -- long-range key matching needs exact relative positions).
+        # Mode A inputs the last COMMITTED token at pos-1 (its key IS in the KV):
+        #   MTP legacy: query at pos keeps distances [1, pos] (the +1 compensates the
+        #     committed input key, exactly like the SP streaming path).
+        #   DFlash: the anchor self-attends by design -> query at pos-1 (distance 0).
+        # MTP (bonus-elim) no longer enters mode A: step() decides the first bonus from
+        # the base logits so every round is mode B, like exl3.
         if mode_b:
             base_tok = torch.tensor([[self.pending_bonus]], dtype=torch.long)
-            # DFlash: the anchor IS the pending bonus at pos (its context K/V is
-            # not committed yet); MTP's query sits one position later at pos+1.
-            dpos = pos if self._dflash else pos + 1
+            dpos = pos
             draft, _ = self.d.draft_window(base_tok, self.last_state, dpos, self.window)
             draft = draft.cpu()                                    # cat with CPU bonus; pipe needs CPU
             verify_ids = torch.cat([base_tok, draft], dim=-1)      # (1, W+1)
         else:
             base_tok, base_state, base_pos = self.state
-            # DFlash mode A: the anchor is the last COMMITTED token at pos-1.
             dpos = pos - 1 if self._dflash else pos
             draft, _ = self.d.draft_window(base_tok, base_state, dpos, self.window)
             draft = draft.cpu()
@@ -422,6 +446,9 @@ class MTPMPDriver:
         self.t_rewind += self._time.perf_counter() - _t
         _t = self._time.perf_counter()
         self.pending_tokens = draft_flat[:m_acc] + [bonus_id]
+        # Sparse draft head: count the round's committed tokens (accepted drafts + bonus).
+        if hasattr(self.d, "observe_tokens"):
+            self.d.observe_tokens(torch.tensor([self.pending_tokens], dtype=torch.long))
         # Mode B's first pending token (draft[0]) sits at pos+1 -- the bonus at pos was
         # already emitted at the end of the previous round.
         self.pending_pos = pos + 1 if mode_b else pos
@@ -626,15 +653,15 @@ class MTPMPBatchDriver:
         pos = [cache.seq_lens[r] for r in rows]
 
         # Batched gather + draft. Mode-B seed per row: (pending bonus, state of the last
-        # COMMITTED token), query at pos+1 over KV ending at pos-1 -- the scalar driver's
-        # steady-state geometry, which keeps long-context acceptance.
+        # COMMITTED token), query at the bonus's OWN position pos over KV ending at
+        # pos-1 (exl3: positions = kv_seqlens) -- the scalar driver's geometry.
         pg.gather_kv_mtp_batch(rows)
         self.drafter.gather_target_batch(rows)
         base_tok = torch.tensor([[self.rows[r]["pending_bonus"]] for r in rows],
                                 dtype=torch.long)
         base_state = torch.cat([self.rows[r]["last_state"] for r in rows], dim=0)
         draft = self.drafter.draft_window_batch(
-            base_tok, base_state, [p + 1 for p in pos], W)      # (B, W) CPU
+            base_tok, base_state, list(pos), W)                 # (B, W) CPU
 
         # Batched verify: [bonus, drafts] per row. Row 0 commits the bonus KV; rows
         # 1..W write the drafts. vlogits[k] predicts the token after verify row k.
