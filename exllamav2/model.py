@@ -1386,10 +1386,11 @@ class ExLlamaV2:
                 nkv = b - a
                 base_key = (dev, nq, nkv, m.head_dim, m.scaling, window_left)
                 # SWA layers stay on windowed DECODE wrappers (the path verified
-                # 2026-11-19): per-row fi_decode at B == 1, one batched B*q_len-request
-                # fi_decode_rows wrapper at B > 1. The windowed paged-PREFILL verify
-                # wrapper under CUDA graphs was never validated (debug5.txt). Full hd512
-                # layers keep the single-pass prefill verify at every batch size.
+                # 2026-11-19): one batched B*q_len-request fi_decode_rows wrapper at
+                # every batch size (B == 1 included -- one run per layer instead of
+                # q_len per-row runs). The windowed paged-PREFILL verify wrapper under
+                # CUDA graphs was never validated (debug5.txt). Full hd512 layers keep
+                # the single-pass prefill verify at every batch size.
                 if q_len > 1 and verify_prefill and not m.sliding_window:
                     pf_key = base_key + (q_len, B)
                     if pf_key not in seen:
@@ -1399,7 +1400,7 @@ class ExLlamaV2:
                             planned = True
                     if pf_key in ctx.fi_prefill:
                         continue   # single-pass plan ready; skip the per-row wrappers
-                if q_len > 1 and m.sliding_window and B > 1:
+                if q_len > 1 and m.sliding_window:
                     rows_key = base_key + (q_len, B)
                     if rows_key not in seen:
                         seen.add(rows_key)

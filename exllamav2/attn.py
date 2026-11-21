@@ -2276,6 +2276,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                                 _fi_key + (q_len, batch_size), q[idx], k_cache[idx], v_cache[idx]
                             )
                         elif (q_len > 1 and batch_size == 1 and _fi_hd
+                                and (_fi_key + (q_len, batch_size)) not in _ctx.fi_decode_rows
                                 and all((_fi_key + (i, 1)) in _ctx.fi_decode
                                         for i in range(q_len))):
                             # BUG 109 fallback: graph-safe MTP verify via per-row FI DECODE.
@@ -2295,11 +2296,12 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                                     k_cache[idx], v_cache[idx]
                                 ))
                             attn_output = torch.cat(_rows, dim = 1)   # (1, q_len, nq*hd)
-                        elif (q_len > 1 and batch_size > 1 and _fi_hd
+                        elif (q_len > 1 and _fi_hd
                                 and (_fi_key + (q_len, batch_size)) in _ctx.fi_decode_rows):
-                            # Multi-batch SWA verify: one batched windowed-decode run over
-                            # B*q_len per-row requests (the B==1 per-row path above,
-                            # generalized). Planned outside the graph per replay.
+                            # SWA verify: one batched windowed-decode run over B*q_len
+                            # per-row requests, at every batch size (at B==1 this replaces
+                            # the q_len per-row runs above with a single launch per layer).
+                            # Planned outside the graph per replay.
                             attn_output = _ctx.fi_decode_rows_run(
                                 _fi_key + (q_len, batch_size), q[idx], k_cache[idx], v_cache[idx]
                             )

@@ -378,6 +378,13 @@ class ExLlamaV2Cache_SWA(ExLlamaV2Cache):
         cfg = model.config
 
         self.page_size = page_size
+        # Full-attention KV depth must be a whole number of pages: the graphed FI verify
+        # wrappers guard depth % page == 0 and silently fall back to torch attention on
+        # unaligned depths. The ring depth is already page-rounded below; round the full
+        # depth here too (<= page-1 extra rows, negligible VRAM).
+        if max_seq_len == -1:
+            max_seq_len = cfg.max_seq_len
+        max_seq_len = ((max_seq_len + page_size - 1) // page_size) * page_size
         self.sliding_window = cfg.sliding_window
 
         overp = cfg.sliding_window_overp

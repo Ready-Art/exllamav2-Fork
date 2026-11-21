@@ -917,6 +917,9 @@ class TPProcessGroup:
         d = self.mtp_drafter
         mc = self.cache
         dev = d.dev
+        # Page-align the full-layer shadow depth: the drafter's graphed FI attention
+        # page-views these buffers (depth % 128 == 0 required, same as the cache).
+        sdepth = ((self.max_seq_len + 127) // 128) * 128
         # inference_mode(FALSE): enable_mtp runs under the loader's InferenceMode, but
         # gather_kv_mtp mutates these buffers IN PLACE on the job thread OUTSIDE it
         # (ring-shift mirror copy_, delta H2D copy_). Inference tensors forbid that
@@ -933,9 +936,9 @@ class TPProcessGroup:
                     "fls": [0] * B,              # per-row full-layer gather frontier
                     "sls": [0] * B,              # per-row absolute seq_len at last SWA gather
                     "wbs": [0] * B,              # per-row window_beg at last SWA gather
-                    "kf": torch.zeros((B, self.max_seq_len, d.num_global_kv_heads, d.global_head_dim),
+                    "kf": torch.zeros((B, sdepth, d.num_global_kv_heads, d.global_head_dim),
                                       dtype = torch.half, device = dev),
-                    "vf": torch.zeros((B, self.max_seq_len, d.num_global_kv_heads, d.global_head_dim),
+                    "vf": torch.zeros((B, sdepth, d.num_global_kv_heads, d.global_head_dim),
                                       dtype = torch.half, device = dev),
                     "ks": torch.zeros((B, mc.kv_state_size, d.num_kv_heads, d.head_dim),
                                       dtype = torch.half, device = dev),
@@ -948,9 +951,9 @@ class TPProcessGroup:
                     "sl": 0,      # absolute seq_len at the last SWA gather
                     "wb": 0,      # window_beg at the last SWA gather
                     # 3-D (S, kvh, hd) -- identical layout to the single-process drafter.
-                    "kf": torch.zeros((self.max_seq_len, d.num_global_kv_heads, d.global_head_dim),
+                    "kf": torch.zeros((sdepth, d.num_global_kv_heads, d.global_head_dim),
                                       dtype = torch.half, device = dev),
-                    "vf": torch.zeros((self.max_seq_len, d.num_global_kv_heads, d.global_head_dim),
+                    "vf": torch.zeros((sdepth, d.num_global_kv_heads, d.global_head_dim),
                                       dtype = torch.half, device = dev),
                     "ks": torch.zeros((mc.kv_state_size, d.num_kv_heads, d.head_dim),
                                       dtype = torch.half, device = dev),
