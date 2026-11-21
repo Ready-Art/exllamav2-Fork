@@ -63,7 +63,8 @@ def prefill_trace_coll_ms() -> float:
     return ms
 
 
-def tp_reuse_buffers(cache: dict, specs: list, key_rows: bool = False):
+def tp_reuse_buffers(cache: dict, specs: list, key_rows: bool = False,
+                     eager_large_ok: bool = False):
     """
     Return reusable output buffers for a TP module.
 
@@ -75,9 +76,24 @@ def tp_reuse_buffers(cache: dict, specs: list, key_rows: bool = False):
     shapes get DISTINCT, never-reallocated entries. Required for graph-mode collectives:
     a captured graph bakes the buffer address into its nodes, and reallocating it for another
     shape (bonus q_len=1 vs verify q_len=W) frees that address -> cuGraphLaunch segfault.
+
+    BUG 120: with ``eager_large_ok=True`` (callers pass ``not graph_mode``), prefill-sized
+    shapes (rows > 32, the MAX_Q_GEMM_ROWS / decode_repl envelope) get FRESH uncached
+    buffers instead of replacing the module's cached entry. The per-module cache otherwise
+    pins a (chunk_rows x shard_cols) buffer for EVERY projection/norm of EVERY layer for
+    the whole prefill -- ~150 MiB/layer at world=2, ~9 GB over 60 layers, which OOMed the
+    master mid-prefill on a 2-GPU 22 GB split (debug.txt; at world=4 the half-width shards
+    fit the larger headroom, hiding it). Fresh buffers are consumed within the layer and
+    freed, so the caching allocator recycles one layer's worth (~200 MiB). Decode/graph
+    shapes (rows <= 32, or any rows under graph_mode) keep the cached stable-address
+    behavior exactly; large fresh blocks also can't alias the small baked graph buffers
+    (separate allocator size pools).
     """
     out = []
     for dev, rows, cols, dtype in specs:
+        if eager_large_ok and not key_rows and rows > 32:
+            out.append(torch.empty((rows, cols), device = dev, dtype = dtype))
+            continue
         key = (dev, rows, cols, dtype) if key_rows else (dev, cols, dtype)
         ent = cache.get(key)
         if ent is None or ent[0] != rows:
@@ -1326,7 +1342,7 @@ class TPContext:
         else:
             if self._bc_cache is None:
                 self._bc_cache = {}
-            bc_tensors = tp_reuse_buffers(self._bc_cache, _specs)
+            bc_tensors = tp_reuse_buffers(self._bc_cache, _specs, eager_large_ok = True)
 
         ext_c.tp_broadcast(
             self.ext_tp_context,

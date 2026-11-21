@@ -452,7 +452,8 @@ class ExLlamaV2Linear(ExLlamaV2Module):
         outputs = tp_reuse_buffers(
             _cache,
             [(hs.device, hs.shape[0], (b - a) * dim, hs.dtype)
-             for hs, (dev, a, b) in zip(hidden_states, split)]
+             for hs, (dev, a, b) in zip(hidden_states, split)],
+            eager_large_ok = not ctx.graph_mode
         )
 
         # BUG 66: C++ takes Sequence[int]; a rank-local worker has a scalar handle.

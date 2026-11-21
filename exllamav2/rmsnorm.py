@@ -214,7 +214,8 @@ class ExLlamaV2RMSNorm(ExLlamaV2Module):
             self._tp_out_cache = _cache
         outputs = tp_reuse_buffers(
             _cache,
-            [(hs.device, hs.shape[0], hs.shape[1], hs.dtype) for hs in hidden_states]
+            [(hs.device, hs.shape[0], hs.shape[1], hs.dtype) for hs in hidden_states],
+            eager_large_ok = not self.model.tp_context.graph_mode
         )
         # BUG 73: C++ takes Sequence[Tensor] for the weights. A rank-local worker has a
         # single-device Parameter, not a per-device list.
