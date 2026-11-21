@@ -197,6 +197,18 @@ class Gemma4AssistantDrafter:
         self._ks_base = None        # ring-depth (ring, kvh, hd)
         self._vs_base = None
 
+        # Multi-batch drafting (MP slot scheduler): the gathered shadows are 4-D
+        # (max_batch, depth, kvh, hd); one eager FlashInfer batch-decode wrapper per
+        # source geometry serves all active rows. The drafter writes no K/V, so the
+        # per-row kv lengths are FIXED within a round: plan once, run per draft step.
+        self._b_st = None           # target._mtp_kv (4-D shadows)
+        self._b_rows = None         # cache rows of the active batch
+        self._b_full_lens = None
+        self._b_swa_lens = None
+        self._b_wrap_full = None
+        self._b_wrap_swa = None
+        self._b_pos = None          # (max_batch,) int32 device frontier positions
+
     # ------------------------------------------------------------------ config
 
     def _read_config(self, draft_dir: str):
@@ -605,6 +617,180 @@ class Gemma4AssistantDrafter:
         if return_logits:
             return ids_t, torch.cat(logits_list, dim = 1)
         return ids_t, None
+
+    # ------------------------------------------------------------------ batched drafting
+
+    def gather_target_batch(self, rows):
+        """
+        Multi-batch counterpart of gather_target: the target's joined K/V shadows are
+        already per-row (TPProcessGroup._mtp_kv, 4-D), so this only records which rows
+        are active and their valid lengths. Call after gather_kv_mtp_batch(rows).
+        """
+        st = getattr(self.target, "_mtp_kv", None)
+        assert st is not None and st["kf"].dim() == 4, \
+            "batched drafting requires the multi-batch MTP shadows (max_batch > 1)"
+        self._b_st = st
+        self._b_rows = list(rows)
+        cache = self.target.cache
+        self._b_full_lens = [cache.seq_lens[r] for r in rows]
+        ring = st["ks"].shape[1]
+        self._b_swa_lens = [min(cache.seq_lens[r] - cache.window_begs[r], ring)
+                            for r in rows]
+
+    def _b_ensure_wrappers(self):
+        import flashinfer
+        from exllamav2 import attn_backend
+        if self._b_wrap_full is not None:
+            return
+        ws = attn_backend.FlashInferPaged._get_workspace(self.dev)
+        # Eager wrappers (no CUDA graph): plan() once per round refreshes the scheduling
+        # for the current per-row lengths; run() is one batched kernel per draft step.
+        self._b_wrap_full = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            ws, "NHD", backend = "fa2")
+        self._b_wrap_swa = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            ws, "NHD", backend = "fa2")
+
+    def _b_plan(self):
+        st = self._b_st
+        page = 128
+        for wrap, tensor, lens, nkv, hd, window in (
+            (self._b_wrap_full, st["kf"], self._b_full_lens,
+             self.num_global_kv_heads, self.global_head_dim, -1),
+            (self._b_wrap_swa, st["ks"], self._b_swa_lens,
+             self.num_kv_heads, self.head_dim, self.sliding_window - 1),
+        ):
+            depth = tensor.shape[1]
+            npages = depth // page
+            indptr = [0]
+            indices = []
+            lpl = []
+            for r, l in zip(self._b_rows, lens):
+                l = max(1, l)
+                pv = (l + page - 1) // page
+                base = r * npages
+                indices.extend(range(base, base + pv))
+                indptr.append(indptr[-1] + pv)
+                lpl.append(l - (pv - 1) * page)
+            wrap.plan(
+                indptr = torch.tensor(indptr, dtype = torch.int32, device = self.dev),
+                indices = torch.tensor(indices, dtype = torch.int32, device = self.dev),
+                last_page_len = torch.tensor(lpl, dtype = torch.int32, device = self.dev),
+                num_qo_heads = self.num_q_heads,
+                num_kv_heads = nkv,
+                head_dim = hd,
+                page_size = page,
+                pos_encoding_mode = "NONE",
+                window_left = window,
+                logits_soft_cap = None,
+                sm_scale = 1.0,
+                q_data_type = torch.half,
+                kv_data_type = tensor.dtype,
+            )
+
+    def _cross_attn_batch(self, layer: _DrafterLayer, x_norm: torch.Tensor,
+                          pos_t: torch.Tensor) -> torch.Tensor:
+        """Batched cross-attention: (B,1,hidden) queries over the per-row target K/V.
+        Same math as _cross_attn (RoPE at the per-row frontier, sm_scale 1.0, inclusive
+        window_left = W-1), one FlashInfer batch-decode run for all rows."""
+        hd = layer.head_dim
+        nq = layer.num_q_heads
+        B = x_norm.shape[0]
+        q = x_norm @ layer.q_proj.t()                    # (B,1,nq*hd)
+        q = q.view(B, 1, nq, hd)
+        q = _head_rmsnorm(q, layer.q_norm, self.rms_norm_eps)
+        sin, cos = self._get_rope()[layer.rope_index]
+        ext_c.rope_(q, sin, cos, -1, nq, hd, pos_t, True)
+        st = self._b_st
+        page = 128
+        if layer.is_full:
+            k, v = st["kf"], st["vf"]
+            wrap = self._b_wrap_full
+            nkv = self.num_global_kv_heads
+        else:
+            k, v = st["ks"], st["vs"]
+            wrap = self._b_wrap_swa
+            nkv = self.num_kv_heads
+        k_pages = k.view(-1, page, nkv, hd)
+        v_pages = v.view(-1, page, nkv, hd)
+        out = wrap.run(q.view(B, nq, hd), (k_pages, v_pages))   # (B, nq, hd)
+        return out.view(B, 1, nq * hd) @ layer.o_proj.t()
+
+    def _block_batch(self, layer: _DrafterLayer, x: torch.Tensor,
+                     pos_t: torch.Tensor) -> torch.Tensor:
+        y = _rmsnorm(x, layer.input_ln, self.rms_norm_eps)
+        a = self._cross_attn_batch(layer, y, pos_t)
+        a = _rmsnorm(a, layer.post_attn_ln, self.rms_norm_eps)
+        x = x + a
+        y = _rmsnorm(x, layer.pre_ff_ln, self.rms_norm_eps)
+        gate = y @ layer.gate.t()
+        up = y @ layer.up.t()
+        y = _gelu_tanh(gate) * up
+        y = y @ layer.down.t()
+        y = _rmsnorm(y, layer.post_ff_ln, self.rms_norm_eps)
+        x = x + y
+        return x * layer.layer_scalar
+
+    def _step_batch(self, tok: torch.Tensor, state: torch.Tensor,
+                    pos_t: torch.Tensor, first: bool):
+        """One batched draft step. tok (B,1) device ids, state (B,1,backbone)."""
+        if first:
+            w = self.t_final_norm.weight
+            if w.device != self.dev:
+                w = w.to(self.dev, non_blocking = True)
+            state = _rmsnorm(state, w, self.t_final_norm.variance_epsilon)
+        tid = tok.to("cpu", non_blocking = False).long()
+        w = self._t_embed_full if self._t_embed_full is not None \
+            else self.t_embed.embedding.weight
+        emb = w[tid]                                     # (B,1,backbone) CPU
+        ap = self.t_embed.archparams
+        if getattr(ap, "normalize_embeddings", False):
+            emb = emb * (self.backbone_hidden_size ** 0.5)
+        emb = emb.to(self.dev, non_blocking = True).half()
+        y = torch.cat((emb, state), dim = -1)
+        x = y @ self.pre_projection.t()
+        for layer in self.layers:
+            x = self._block_batch(layer, x, pos_t)
+        x = _rmsnorm(x, self.final_norm, self.rms_norm_eps)
+        next_state = x @ self.post_projection.t()
+        logits = x @ self.head.t()
+        return logits, next_state
+
+    def draft_window_batch(self, base_tok: torch.Tensor, base_state: torch.Tensor,
+                           pos: list, window: int | None = None) -> torch.Tensor:
+        """
+        Batched greedy draft window: (B, window) CPU ids for the active rows.
+
+        ``base_tok`` (B,1) is each row's last decided token (the pending bonus),
+        ``base_state`` (B,1,backbone) the target pre-final-norm state of each row's last
+        COMMITTED token (the mode-B seed, one position stale exactly as in the scalar
+        path), and ``pos[b]`` the row's frontier query position. Call
+        gather_target_batch(rows) first; the per-row K/V lengths are fixed for the round.
+        """
+        assert self._b_st is not None, "call gather_target_batch(rows) first"
+        window = self.num_draft_tokens if window is None else window
+        B = len(self._b_rows)
+        # NORMAL tensors: the first call may run inside the loader's InferenceMode
+        # (load-time batch warmup), but these wrappers/buffers persist and are mutated
+        # in place by every later plan()/fill from the scheduler thread OUTSIDE it.
+        # Inference tensors would raise on those later in-place updates.
+        with torch.inference_mode(False):
+            self._b_ensure_wrappers()
+            self._b_plan()
+            if self._b_pos is None or self._b_pos.numel() < B:
+                self._b_pos = torch.zeros(max(B, getattr(self.target, "max_batch", B)),
+                                          dtype = torch.int32, device = self.dev)
+            self._b_pos[:B].copy_(torch.tensor(pos, dtype = torch.int32))
+        tok = base_tok.to(self.dev, non_blocking = True).long()
+        state = base_state.to(self.dev, non_blocking = True).half()
+        if state.dim() == 2:
+            state = state.view(B, 1, -1)
+        ids = []
+        for k in range(window):
+            logits, state = self._step_batch(tok, state, self._b_pos[:B], first = (k == 0))
+            nxt = torch.argmax(logits, dim = -1)         # (B,1)
+            ids.append(nxt)
+            tok = nxt
+        return torch.cat(ids, dim = -1).cpu()            # (B, window)
 
     # ------------------------------------------------------------------ draft graph
 

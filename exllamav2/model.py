@@ -552,7 +552,8 @@ class ExLlamaV2:
         expect_cache_tokens: int = 0,
         expect_cache_base: type = None,
         load_head: bool | None = None,
-        callback: Callable[[int, int], None] | None = None
+        callback: Callable[[int, int], None] | None = None,
+        max_batch: int = 1
     ):
         """
         Load only the shard of the model owned by device ``rank``.
@@ -613,7 +614,8 @@ class ExLlamaV2:
         # The fused single-device graph path assumes one device.
         self.config.no_graphs = True
 
-        self.tp_context = TPContext(self, gpu_split, expect_cache_tokens, expect_cache_base)
+        self.tp_context = TPContext(self, gpu_split, expect_cache_tokens, expect_cache_base,
+                                    max_batch = max_batch)
         # BUG 58: enter multiprocess mode BEFORE any module loads. get_split() filters to
         # this rank from here on, and the loaders size their shards from it -- setting it
         # afterwards would make every module load the full split.
@@ -633,7 +635,8 @@ class ExLlamaV2:
         # PCIe P2P small-collective fast path (probed + agreed across ranks; any
         # failure falls back to NCCL). EXL2_TP_P2P=0 forces NCCL.
         from exllamav2.p2p_comm import P2PComm
-        self.tp_context.p2p = P2PComm(rank, self.tp_context.num_devices)
+        self.tp_context.p2p = P2PComm(rank, self.tp_context.num_devices,
+                                      n_slots = 128 if max_batch > 1 else 64)
         if self.tp_context.seqpar:
             assert bool(getattr(self.config.arch.lm, "tp_per_layer_geometry", False)), \
                 "EXL2_TP_SEQPAR requires the per-layer-geometry TP path (Gemma-4)"
@@ -1340,6 +1343,17 @@ class ExLlamaV2:
         shape (e.g. SWA base+q_len beyond the ring depth would misalign causal rows).
         q_len == 1 (decode/bonus) keeps the single FI decode wrapper per geometry.
         """
+        return self._fi_tp_graph_plan_batch(
+            cache, [kv_len - q_len], [getattr(cache, "window_beg", 0)], q_len, [0])
+
+    def _fi_tp_graph_plan_batch(self, cache, seq_lens, window_begs, q_len, row_map):
+        """
+        Multi-batch generalization of _fi_tp_graph_plan: one plan per (geometry, wrapper
+        kind, batch size) covering every active row. ``seq_lens[b]`` / ``window_begs[b]``
+        are row b's absolute position / SWA ring origin; ``row_map[b]`` is its cache row.
+        The scalar path delegates here with single-element lists (B == 1), which produces
+        exactly the legacy wrapper shapes and plans.
+        """
         from exllamav2.attn import use_flashinfer
         from exllamav2.tensor_p import BROADCAST_KV
 
@@ -1350,19 +1364,19 @@ class ExLlamaV2:
         verify_prefill = os.environ.get("EXL2_VERIFY_PREFILL", "1") != "0"
         planned = False
         seen = set()
-        past_len = kv_len - q_len
+        B = len(seq_lens)
         for m in self.modules:
             if not isinstance(m, ExLlamaV2Attention):
                 continue
             # SWA layers keep K/V in a ring: row i's valid length is ring-relative
-            # (past_len - window_beg + i + 1), clamped to the ring depth. Full layers use
-            # the absolute causal prefix past_len + i + 1.
+            # (seq_len - window_beg + i + 1), clamped to the ring depth. Full layers use
+            # the absolute causal prefix seq_len + i + 1.
             window_left = m.sliding_window if m.sliding_window else -1
             if m.sliding_window:
-                base = past_len - getattr(cache, "window_beg", 0)
+                bases = [p - wb for p, wb in zip(seq_lens, window_begs)]
                 ring_depth = getattr(cache, "kv_state_size", None)
             else:
-                base = past_len
+                bases = list(seq_lens)
                 ring_depth = None
             ctx.set_geometry(m.layer_idx)
             split = ctx.get_split(BROADCAST_KV)
@@ -1370,36 +1384,53 @@ class ExLlamaV2:
             for idx, (dev, a, b) in enumerate(split):
                 nq = (b - a) * m.num_key_value_groups
                 nkv = b - a
-                # SWA layers stay on the per-row windowed DECODE wrappers below (the
-                # path verified 2026-11-19). The windowed paged-PREFILL verify wrapper
-                # under CUDA graphs was never validated: with the old 1280 ring it was
-                # almost always skipped (base+q_len > depth), but the deeper prefill
-                # ring made it plan every round and corrupted acceptance/generation
-                # (debug5.txt). Full hd512 layers keep the single-pass prefill verify.
+                base_key = (dev, nq, nkv, m.head_dim, m.scaling, window_left)
+                # SWA layers stay on windowed DECODE wrappers (the path verified
+                # 2026-11-19): per-row fi_decode at B == 1, one batched B*q_len-request
+                # fi_decode_rows wrapper at B > 1. The windowed paged-PREFILL verify
+                # wrapper under CUDA graphs was never validated (debug5.txt). Full hd512
+                # layers keep the single-pass prefill verify at every batch size.
                 if q_len > 1 and verify_prefill and not m.sliding_window:
-                    pf_key = (dev, nq, nkv, m.head_dim, m.scaling, window_left, q_len)
+                    pf_key = base_key + (q_len, B)
                     if pf_key not in seen:
                         seen.add(pf_key)
-                        if ctx.fi_prefill_plan(pf_key, base + q_len, k_cache[idx]):
+                        if ctx.fi_prefill_plan(pf_key, [base + q_len for base in bases],
+                                               k_cache[idx], row_map):
                             planned = True
                     if pf_key in ctx.fi_prefill:
                         continue   # single-pass plan ready; skip the per-row wrappers
-                for i in range(q_len):
-                    row_kv = base + i + 1
-                    if ring_depth:
-                        row_kv = min(row_kv, ring_depth)
-                    if row_kv < 1:
+                if q_len > 1 and m.sliding_window and B > 1:
+                    rows_key = base_key + (q_len, B)
+                    if rows_key not in seen:
+                        seen.add(rows_key)
+                        kv_lens, rows = [], []
+                        for bi, base in enumerate(bases):
+                            for i in range(q_len):
+                                kv_lens.append(min(base + i + 1, ring_depth))
+                                rows.append(row_map[bi])
+                        if ctx.fi_decode_rows_plan(rows_key, kv_lens, rows, k_cache[idx]):
+                            planned = True
+                    if rows_key in ctx.fi_decode_rows:
                         continue
-                    # q_len == 1 keeps the legacy 6-tuple key (attn decode branch); the
-                    # verify rows append the row index so each row gets its own plan.
+                for i in range(q_len):
+                    # Per-row decode wrappers serve B == 1 (decode + legacy SWA verify).
+                    # At B > 1 multi-token steps are served by the rows wrapper above;
+                    # if it could not plan, the attn torch-mask fallback takes over.
+                    if B > 1 and q_len > 1:
+                        break
+                    row_kvs = [base + i + 1 for base in bases]
+                    if ring_depth:
+                        row_kvs = [min(l, ring_depth) for l in row_kvs]
+                    if any(l < 1 for l in row_kvs):
+                        continue
                     if q_len == 1:
-                        key = (dev, nq, nkv, m.head_dim, m.scaling, window_left)
+                        key = base_key + (B,)
                     else:
-                        key = (dev, nq, nkv, m.head_dim, m.scaling, window_left, i)
+                        key = base_key + (i, B)
                     if key in seen:
                         continue
                     seen.add(key)
-                    if ctx.fi_decode_plan(key, row_kv, k_cache[idx]):
+                    if ctx.fi_decode_plan(key, row_kvs, k_cache[idx], row_map):
                         planned = True
         if planned:
             ctx.fi_decode_order_before_replay()
@@ -1414,12 +1445,20 @@ class ExLlamaV2:
         seq_len: int,
         last_id_only: bool,
         return_last_state: bool = False,
-        return_row_states: bool = False
+        return_row_states: bool = False,
+        row_map = None,
+        window_begs = None
     ):
         """
         Run one graphed step -- decode, MTP bonus commit (return_last_state), or the MTP
         verify window (seq_len > 1, optionally with per-row states) -- capturing it on
         first use.
+
+        ``past_len`` is an int for the single-sequence path, or a per-batch-row list for
+        a multi-batch step (with ``window_begs`` the matching SWA ring origins and
+        ``row_map`` the cache row each batch row writes). The graph is position-agnostic:
+        every per-row value lives in device tensors refreshed before each replay, so one
+        captured (batch, q_len) graph serves any active slot subset of that size.
 
         Returns the runner on success, or None to fall back to the eager path. Falling back is
         always safe: the eager path is unchanged and still correct.
@@ -1488,8 +1527,15 @@ class ExLlamaV2:
         # the capture envelope. This fires on large context jumps (a new job after a long
         # prefill, or a cache reset), not per token: normal generation grows kv by a few
         # hundred tokens, well inside the envelope, so the amortized recapture cost is tiny.
+        # Per-row positions: scalar legacy path vs multi-batch lists.
+        _batched = isinstance(past_len, (list, tuple))
+        _pos_list = list(past_len) if _batched else None
+        _wb_list = list(window_begs) if _batched else None
+        _rmap = list(row_map) if row_map is not None else list(range(batch_size))
+        _max_past = max(_pos_list) if _batched else past_len
+
         if runner is not None:
-            _kv = past_len + seq_len
+            _kv = _max_past + seq_len
             _cap_kv = getattr(runner, "capture_kv", 0)
             if _kv > _cap_kv + TP_GRAPH_KV_ENVELOPE or _kv < _cap_kv - TP_GRAPH_KV_ENVELOPE:
                 # Context-regime change: rebuild EVERY graph and FlashInfer graph wrapper at
@@ -1500,6 +1546,7 @@ class ExLlamaV2:
                 self.tp_graph.clear()
                 ctx.fi_decode.clear()
                 ctx.fi_prefill.clear()
+                ctx.fi_decode_rows.clear()
                 runner = None
 
         def stage_inputs(input_buf):
@@ -1514,7 +1561,11 @@ class ExLlamaV2:
                 _h0 = run_embedding(input_ids)
                 input_buf.copy_(_h0)
                 ctx.set_pos(past_len)
-                ctx.set_ring_pos(past_len - getattr(cache, "window_beg", 0))
+                if _batched:
+                    ctx.set_ring_pos([p - wb for p, wb in zip(_pos_list, _wb_list)])
+                else:
+                    ctx.set_ring_pos(past_len - getattr(cache, "window_beg", 0))
+                ctx.set_row_map(_rmap)
                 for _pl in ctx.past_len_tp.values():
                     ctx.fill_tp(_pl, past_len)
             finally:
@@ -1614,7 +1665,10 @@ class ExLlamaV2:
                 stage_inputs(input_buf)
                 # hd>256 FlashInfer decode plans must exist before warmup/capture: run() is
                 # captured, plan() is host work and cannot run inside the capture region.
-                self._fi_tp_graph_plan(cache, past_len + seq_len, q_len = seq_len)
+                if _batched:
+                    self._fi_tp_graph_plan_batch(cache, _pos_list, _wb_list, seq_len, _rmap)
+                else:
+                    self._fi_tp_graph_plan(cache, past_len + seq_len, q_len = seq_len)
                 ctx.graph_mode = True
                 # Per-graph P2P slot region: warmup + capture bake slots from a fresh
                 # permanent epoch so this graph never shares arena slots with another
@@ -1648,7 +1702,7 @@ class ExLlamaV2:
             runner.logits = out["logits"]
             # BUG 117: remember the kv length this graph was captured at, so a later step far
             # outside this envelope recaptures instead of replaying an invalid baked launch.
-            runner.capture_kv = past_len + seq_len
+            runner.capture_kv = _max_past + seq_len
             self.tp_graph.add(batch_size, seq_len, runner,
                               state = state_mode, last_id_only = last_id_only)
 
@@ -1691,23 +1745,135 @@ class ExLlamaV2:
                     _h0 = run_embedding(input_ids)
                     runner.input_buf.copy_(_h0)
                     ctx.set_pos(past_len)
-                    ctx.set_ring_pos(past_len - getattr(cache, "window_beg", 0))
+                    if _batched:
+                        ctx.set_ring_pos([p - wb for p, wb in zip(_pos_list, _wb_list)])
+                    else:
+                        ctx.set_ring_pos(past_len - getattr(cache, "window_beg", 0))
+                    ctx.set_row_map(_rmap)
                     for _pl in ctx.past_len_tp.values():
                         ctx.fill_tp(_pl, past_len)
                     # Refresh the hd>256 FlashInfer decode plans for this step's kv_len
                     # (host work, outside the graph) and order the replay after them.
-                    self._fi_tp_graph_plan(cache, past_len + seq_len, q_len = seq_len)
+                    if _batched:
+                        self._fi_tp_graph_plan_batch(cache, _pos_list, _wb_list, seq_len, _rmap)
+                    else:
+                        self._fi_tp_graph_plan(cache, past_len + seq_len, q_len = seq_len)
                     # Replay while dev0's stream is still current: CUDAGraph.replay() launches on
                     # the torch current stream, and the graph's nodes were captured on this one.
                     runner.replay()
                     # BUG 117: pinpoint whether a long-context graph replay is the one-shot
                     # writer that sprays the FI metadata buffers (guard syncs the device).
-                    self.tp_context._fi_guard(f"post-replay{runner.key}", past_len + seq_len, seq_len)
+                    self.tp_context._fi_guard(f"post-replay{runner.key}", _max_past + seq_len, seq_len)
                 finally:
                     torch.cuda.set_stream(prev_stream)
         finally:
             ctx.graph_mode = False
         return runner
+
+    @torch.inference_mode()
+    def forward_tp_batch(
+        self,
+        input_ids: torch.Tensor,
+        cache,
+        seq_lens: list,
+        window_begs: list,
+        row_map: list,
+        last_id_only: bool = True,
+        graph_verify: bool = False,
+        return_last_state: bool = False,
+        return_row_states: bool = False,
+    ):
+        """
+        One multi-batch TP step over independent cache rows (the MP slot scheduler).
+
+        ``input_ids`` is (B, q_len); batch row b belongs to cache row ``row_map[b]`` at
+        position ``seq_lens[b]`` with SWA ring origin ``window_begs[b]``. Every rank runs
+        the same per-row ring prep and the same graphed step, so the collectives stay in
+        lockstep. The step does NOT advance the bookkeeping: the caller (MTP driver or
+        streaming proxy) owns seq_lens, exactly as the scalar graph path leaves
+        current_seq_len to its caller.
+
+        Falls back to per-row scalar eager forwards (persistent row views, the verified
+        batch-1 path) if the batched capture fails -- always correct, just slower.
+        """
+        B, q_len = input_ids.shape
+        assert B == len(seq_lens) == len(window_begs) == len(row_map), \
+            "forward_tp_batch: per-row bookkeeping must match the batch"
+
+        # Per-row SWA ring prep: the decode-size fill cap and page-granular overflow
+        # shift from model.forward's chunk loop, scoped to each row so slots at different
+        # lengths shift independently. Deterministic in (seq_lens, window_begs, q_len), so
+        # every rank computes the same shifts with no communication (BUG 94 protocol).
+        _swa_p = self._swa_ring_params(cache)
+        if _swa_p is not None:
+            _ring, _page, _swa = _swa_p
+            _swa_win = getattr(cache, "sliding_window", None)
+            if not _swa_win:
+                for _c in getattr(cache, "caches", ()):
+                    if _c is not None:
+                        _swa_win = getattr(_c, "sliding_window", 0)
+                        break
+            _fill_cap = _ring
+            if _swa_win and q_len <= 2 * _page:
+                _fill_cap = min(_ring, _swa_win + 2 * _page)
+            for b in range(B):
+                r = row_map[b]
+                _cpos = seq_lens[b] - window_begs[b]
+                _overflow = _cpos + q_len - _fill_cap
+                if _overflow > 0:
+                    _shift = ((_overflow + _page - 1) // _page) * _page
+                    assert 0 < _shift <= _ring, \
+                        f"forward_tp_batch: bad SWA ring shift {_shift} (ring {_ring})"
+                    if _shift < _ring:
+                        for _li in range(len(_swa)):
+                            if _swa[_li]:
+                                cache.shift_ring_row(_li, r, _shift)
+                    window_begs[b] += _shift
+                    # Persist into the cache row (not just the per-batch list) so the
+                    # next round's gather/draft and the eager row-view fallback both
+                    # see the shifted origin. Other slots' rows are untouched.
+                    cache.window_begs[r] = window_begs[b]
+
+        attn_params = ExLlamaV2Attention.Params(B, q_len, seq_lens[0], None, None)
+        # Batch metadata for the EAGER warmup passes inside graph capture: the eager
+        # rope/KV-write path must use per-row positions and the slot row map, or the
+        # warmup would scribble dummy-position K/V into the wrong live cache rows.
+        attn_params.batch_seq_lens = list(seq_lens)
+        attn_params.batch_window_begs = list(window_begs)
+        attn_params.batch_row_map = list(row_map)
+        runner = self._tp_graph_step(
+            input_ids, cache, attn_params, list(seq_lens), B, q_len, last_id_only,
+            return_last_state = return_last_state,
+            return_row_states = return_row_states,
+            row_map = row_map, window_begs = window_begs,
+        )
+        if runner is not None:
+            if return_row_states or return_last_state:
+                return runner.logits, runner.state_buf
+            return runner.logits
+
+        # Eager fallback: run each row through the verified scalar path on its persistent
+        # row view. use_graphs=False keeps row-view captures out of the graph manager (a
+        # row view is a different cache identity than the batched graphs' full cache).
+        logits_rows, state_rows = [], []
+        for b in range(B):
+            rv = cache.row_view(row_map[b])
+            r = self.forward(
+                input_ids[b:b + 1], cache = rv, last_id_only = last_id_only,
+                return_last_state = return_last_state,
+                return_row_states = return_row_states,
+                use_graphs = False,
+            )
+            if return_row_states or return_last_state:
+                lg, st = r
+                state_rows.append(st)
+            else:
+                lg = r
+            logits_rows.append(lg)
+        logits = torch.cat(logits_rows, dim = 0)
+        if return_row_states or return_last_state:
+            return logits, torch.cat(state_rows, dim = 0)
+        return logits
 
     @torch.inference_mode()
     # @profile
@@ -1783,10 +1949,14 @@ class ExLlamaV2:
         #  * verify window: a fixed W-token forward marked explicitly by the caller
         #    (graph_verify), so arbitrary prefill chunks are never captured.
         graph_verify = kwargs.pop("graph_verify", False)
+        # use_graphs=False forces the eager path (row-view forwards in the multi-batch
+        # fallback: a row view is a different cache identity than the batched graphs').
+        use_graphs = kwargs.pop("use_graphs", True)
         graph_state = (return_last_state or return_row_states) \
             and extract_state_indices == {self.head_layer_idx - 1}
         if (
-            self.tp_context is not None
+            use_graphs
+            and self.tp_context is not None
             and cache is not None
             and (seq_len == 1 or graph_verify)
             and not preprocess_only

@@ -443,3 +443,227 @@ class MTPMPDriver:
                      + self.t_bonus + self.t_accept) / max(self.total_acc + self.total_rounds, 1) * 1000, 2),
             })
         return s
+
+
+class MTPMPBatchDriver:
+    """
+    Multi-batch MTP driver for the MP slot scheduler: one independent mode-B state
+    machine per cache row, advanced by shared batched rounds.
+
+    Every round is the scalar driver's mode B, generalized to B rows: the verify window
+    is [pending_bonus, draft_0 .. draft_{W-1}] (B, W+1) at each row's own position; row
+    0's logits predict draft_0, row k's predict draft_k, row m_acc's give the next bonus.
+    Acceptance, rewind and the bonus-elimination invariant are per-row; the KV rewrite,
+    the drafter and the acceptance bookkeeping never mix rows. The first round after
+    begin_row uses the bonus sampled from the prefill (heal) logits, so there is no
+    separate mode-A shape -- one (B, W+1) graph per batch size serves every round.
+
+    The target KV bookkeeping (cache.seq_lens / window_begs) is owned by this driver via
+    the distributed row setters; the batched forward itself never advances it.
+    """
+
+    def __init__(self, pg, drafter, window: int = 6, heal: bool = True):
+        self.pg = pg
+        self.drafter = drafter
+        self.W = window
+        self.heal = heal
+        self.rows = {}
+        self.mtp_rounds = 0
+        self.mtp_acc = 0
+        self.mtp_drafts = 0
+
+    # -- per-row lifecycle -------------------------------------------------
+
+    def begin_row(self, r: int, prompt_ids: torch.Tensor, logits, state,
+                  settings=None, tokenizer=None, seq_ids=None, ban_tokens=None):
+        """Arm row r after its prefill. ``logits``/``state`` are the prefill's last-row
+        outputs (None forces the heal recommit). The first bonus is decided here and
+        queued for emission; its KV is committed by the first verify round (mode B)."""
+        n_prompt = prompt_ids.shape[-1]
+        tokens = prompt_ids[0].tolist()
+        if logits is not None:
+            logits = logits[:, -1:, :].float().cpu()
+        if state is not None:
+            # Normalize to CPU float: rounds mix rows at different lifecycle stages
+            # (first-round GPU states vs later-round CPU copies) into one batch tensor.
+            state = state[:, -1:, :].float().cpu()
+        last_tok = int(tokens[-1])
+        self.pg.mtp_set_seq_len_row(r, n_prompt)
+        if self.heal or logits is None or state is None:
+            # Heal: recommit the last prompt token through the decode path (idempotent
+            # KV rewrite) for a fresh, decode-aligned state + logits (BUG 90a/93).
+            self.pg.mtp_set_seq_len_row(r, n_prompt - 1)
+            logits, state = self.pg.forward_state_row(
+                r, prompt_ids[:, -1:], last_id_only=True)
+            # Normalize the heal outputs too: rounds cat states across rows at
+            # different lifecycle stages, so every stored state must be CPU float.
+            logits = logits.float().cpu()
+            state = state.float().cpu()
+        bonus = self._first_bonus(logits, settings, tokenizer, seq_ids, ban_tokens)
+        self.rows[r] = {
+            "tokens": tokens,
+            "pending": [bonus],
+            "pending_bonus": bonus,
+            "last_state": state,
+            "expected_pos": n_prompt,
+            "base_logits": logits,
+            "base_tok": last_tok,
+        }
+
+    def finish_row(self, r: int):
+        self.rows.pop(r, None)
+
+    def _first_bonus(self, logits, settings, tokenizer, seq_ids, ban_tokens=None):
+        import random as _random
+        # settings is None -> greedy, exactly the scalar driver's contract. Any real
+        # settings object goes through the full sampler pipeline (_dense_probs handles
+        # temp/top_k/exotic modifiers/bans), so low-temperature + bias/DRY/etc. requests
+        # keep their exact semantics.
+        if settings is None:
+            return int(logits.argmax(dim=-1).item())
+        if seq_ids is None:
+            seq_ids = torch.zeros((1, 0), dtype=torch.long)
+        probs = MTPMPDriver._dense_probs(logits, settings, tokenizer, seq_ids, ban_tokens)
+        return MTPMPDriver._sample_from(probs, _random.random())
+
+    def _recommit_row(self, r, p, row, settings, tokenizer, seq_ids):
+        """The row's cache moved outside the driver (external trim): rebuild its base
+        with one solo decode-shaped forward, then re-arm a pending bonus (mode B)."""
+        assert 1 <= p <= len(row["tokens"]), "batch MTP recommit: invalid position"
+        base = row["tokens"][p - 1]
+        self.pg.mtp_set_seq_len_row(r, p - 1)
+        bl, st = self.pg.forward_state_row(
+            r, torch.tensor([[base]], dtype=torch.long), last_id_only=True)
+        bl = bl.float().cpu()
+        st = st.float().cpu()
+        bonus = self._first_bonus(bl, settings, tokenizer, seq_ids, None)
+        row["tokens"] = row["tokens"][:p]
+        row["last_state"] = st
+        row["base_logits"] = bl
+        row["base_tok"] = base
+        row["expected_pos"] = p
+        row["pending"] = [bonus]
+        row["pending_bonus"] = bonus
+
+    # -- round orchestration -----------------------------------------------
+
+    def step_batch(self, active, settings_map, tokenizer, seq_ids_map, ban_map=None):
+        """One scheduler step: pop one decided token per active row, running a shared
+        verify round for the rows whose pending queue ran dry. Returns {row: token}."""
+        need = [r for r in active if not self.rows[r]["pending"]]
+        if need:
+            self._round(need, settings_map, tokenizer, seq_ids_map, ban_map)
+        out = {}
+        for r in active:
+            row = self.rows[r]
+            if row["pending"]:
+                t = row["pending"].pop(0)
+                row["tokens"].append(t)
+                out[r] = t
+        return out
+
+    def _round(self, rows, settings_map, tokenizer, seq_ids_map, ban_map):
+        pg = self.pg
+        cache = pg.cache
+        W = self.W
+
+        for r in rows:
+            row = self.rows[r]
+            if cache.seq_lens[r] != row["expected_pos"]:
+                self._recommit_row(r, cache.seq_lens[r], row,
+                                   settings_map.get(r), tokenizer, seq_ids_map.get(r))
+
+        pos = [cache.seq_lens[r] for r in rows]
+
+        # Batched gather + draft. Mode-B seed per row: (pending bonus, state of the last
+        # COMMITTED token), query at pos+1 over KV ending at pos-1 -- the scalar driver's
+        # steady-state geometry, which keeps long-context acceptance.
+        pg.gather_kv_mtp_batch(rows)
+        self.drafter.gather_target_batch(rows)
+        base_tok = torch.tensor([[self.rows[r]["pending_bonus"]] for r in rows],
+                                dtype=torch.long)
+        base_state = torch.cat([self.rows[r]["last_state"] for r in rows], dim=0)
+        draft = self.drafter.draft_window_batch(
+            base_tok, base_state, [p + 1 for p in pos], W)      # (B, W) CPU
+
+        # Batched verify: [bonus, drafts] per row. Row 0 commits the bonus KV; rows
+        # 1..W write the drafts. vlogits[k] predicts the token after verify row k.
+        vids = torch.cat([base_tok, draft], dim=-1)             # (B, W+1)
+        vlogits, vstates = pg.forward_batch(
+            vids, pos, rows, last_id_only=False, graph_verify=True,
+            return_row_states=True)
+        vlogits = vlogits.float().cpu()
+
+        new_lens = list(cache.seq_lens)
+        for bi, r in enumerate(rows):
+            row = self.rows[r]
+            p = pos[bi]
+            settings = settings_map.get(r)
+            seq_ids = seq_ids_map.get(r)
+            ban = ban_map.get(r) if ban_map else None
+            d = draft[bi].tolist()
+            vl = vlogits[bi]                                    # (W+1, V)
+
+            if settings is None:
+                va = vl.argmax(dim=-1)
+                m_acc = 0
+                while m_acc < W and int(va[m_acc]) == d[m_acc]:
+                    m_acc += 1
+                bonus_id = int(va[m_acc])
+                last_state = vstates[bi, m_acc:m_acc + 1].float().cpu()
+            else:
+                # BUG 105/106: probabilistic acceptance against the TARGET distribution,
+                # per row -- the scalar mode-B math verbatim. The draft is greedy (point
+                # mass q_k on d[k]): accept with p_target_k(d[k]); on rejection resample
+                # the residual normalize(max(0, p - q_k)). Emitted distribution is exactly
+                # target-autoregressive; draft quality only affects the acceptance RATE.
+                import random as _random
+                m_acc = 0
+                bonus_id = None
+                last_state = None
+                seq = seq_ids if seq_ids is not None else torch.zeros((1, 0), dtype=torch.long)
+                for k in range(W):
+                    # (1,1,V) slice shape the sampler pipeline requires. NB: locals here
+                    # must NOT be named `row` (the per-slot state dict) or `p` (the row's
+                    # cache position) -- shadowing either corrupts the post-loop updates.
+                    lg_row = vl[k:k + 1].unsqueeze(0)
+                    probs = MTPMPDriver._dense_probs(lg_row, settings, tokenizer, seq, ban)
+                    dk = d[k]
+                    if _random.random() < float(probs[dk]):
+                        m_acc = k + 1
+                        seq = torch.cat([seq, torch.tensor([[dk]], dtype=torch.long)], dim=-1)
+                        continue
+                    resid = probs.clone()
+                    resid[dk] = 0.0
+                    s = float(resid.sum())
+                    resid = resid / s if s > 1e-12 else probs
+                    bonus_id = MTPMPDriver._sample_from(resid, _random.random())
+                    last_state = vstates[bi, k:k + 1].float().cpu()
+                    break
+                if bonus_id is None:
+                    pW = MTPMPDriver._dense_probs(vl[W:W + 1].unsqueeze(0), settings,
+                                                  tokenizer, seq, ban)
+                    bonus_id = MTPMPDriver._sample_from(pW, _random.random())
+                    last_state = vstates[bi, W:W + 1].float().cpu()
+
+            rewind = p + m_acc + 1
+            new_lens[r] = rewind
+            row["pending"] = d[:m_acc] + [bonus_id]
+            row["pending_bonus"] = bonus_id
+            row["last_state"] = last_state
+            row["expected_pos"] = rewind
+            self.mtp_acc += m_acc
+            self.mtp_drafts += W
+
+        # One distributed rewind for every row (full layers: bookkeeping only; SWA: the
+        # ring fill shrinks, slots beyond it are ignored until overwritten).
+        pg.mtp_set_seq_lens(new_lens)
+        self.mtp_rounds += 1
+
+    def stats(self):
+        return {
+            "mtp_rounds": self.mtp_rounds,
+            "mtp_draft_tokens": self.mtp_drafts,
+            "mtp_accepted_tokens": self.mtp_acc,
+            "mtp_acceptance_rate": (self.mtp_acc / self.mtp_drafts) if self.mtp_drafts else 0.0,
+        }

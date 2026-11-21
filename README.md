@@ -54,6 +54,10 @@ architectures are untested here — treat them as experimental and verify correc
   functional, but they receive far less optimization effort and **will not match the performance
   of the MP + CUDA graphs + MTP path** on the tested rig. Treat them as secondary paths.
 - Only **Gemma-4-31B-IT** has been built and tested end-to-end (see [Release status](#release-status--alphabeta-proof-of-concept)).
+- **Multi-batch (batch > 1) is experimental.** It is implemented and validated on the MP + CUDA
+  graphs + MTP path at `max_batch_size: 2` (short and 64k context, one prompt at a time); concurrent
+  multi-stream load is still being validated. The default remains batch size 1. See
+  [Multi-batch](#multi-batch-experimental-mp--mtp).
 
 ## Feedback & contributions
 
@@ -73,6 +77,7 @@ architectures are untested here — treat them as experimental and verify correc
 | **Multi-GPU tensor parallelism (TP)** | Shard one model across GPUs. Single-process TP (`load_tp`, `--gpu_split`) for simplicity. |
 | **Multiprocess backend (MP)** | One worker process per GPU (`TPProcessGroup`) so dispatch overlaps across devices — higher decode throughput than single-process TP. |
 | **MTP speculative decoding** | A Gemma-4 *assistant* drafter proposes a window of tokens; the target verifies them in one forward. Works **with TP and MP** (the drafter gathers the target's sharded K/V). |
+| **Multi-batch (experimental)** | Slot-based concurrency on the **MP + MTP** path (`TPProcessGroup(max_batch=N)` + `MTPMPBatchDriver`): one cache row per job, batched graphed verify rounds, per-slot append-only prompt caching. Opt-in; see [Multi-batch](#multi-batch-experimental-mp--mtp). |
 | **Gemma-4-31B-IT support** | Text-only. Handles the model's two attention geometries (head_dim 256 sliding / 512 full), `k_eq_v` layers, proportional RoPE and per-layer norms. |
 | **Sliding-window + TP KV cache** | `ExLlamaV2Cache_SWA` / `ExLlamaV2Cache_TP`: ring buffers for sliding layers make long context fit (≈22.5 GB instead of ≈236 GB at 256k for Gemma-4-31B). |
 | **TP CUDA graphs** | Whole-step decode graphs (`tp_graph`) remove per-op launch latency on the tensor-parallel path. |
@@ -196,6 +201,31 @@ token that deviates from the cached draft/bonus token triggers a rewind-and-reco
 target probability and deviating tokens are resampled from the target's residual distribution,
 avoiding the SP recommit cost. Greedy MTP matches plain autoregressive generation except for rare
 fp16 near-tie flips between the verify-window and single-token decode attention kernels on long prose.
+
+### Multi-batch (experimental, MP + MTP)
+
+**Status: experimental.** Validated on the tested rig at batch size 2 (short and 64k context,
+one prompt at a time, greedy and sampled); concurrent multi-stream load is still being validated.
+The default is batch size 1, which keeps the single-sequence path unchanged.
+
+The MP + MTP path can run several jobs concurrently with `TPProcessGroup(..., max_batch=N)` and
+`MTPMPBatchDriver` (`exllamav2/mtp_mp.py`). Each job owns one **cache row (slot)**:
+
+- Per-row sequence positions / SWA ring origins; the graphed verify window is batched
+  (`(B, W+1)` rows, one CUDA graph per batch size) with per-row acceptance, rewind and sampling —
+  the same target-autoregressive guarantees as the scalar driver.
+- The drafter cross-attends to all active rows in one batched FlashInfer decode per draft step.
+- **Per-slot append-only prompt cache**: a job reuses a slot's K/V only when its prompt strictly
+  extends that slot's own lineage (or restores its prompt-boundary ring snapshot); anything else
+  resets the row. Slots never share K/V, so concurrent conversations cannot cross-contaminate.
+- Prefill is serialized per slot (chunked, with decode rounds interleaved between chunks);
+  generation is capped so a verify window always fits inside the cache depth.
+
+VRAM scales linearly with `max_batch`: the KV cache and the joined MTP K/V shadow are allocated
+per row (~5 GB/row at 160k context for Gemma-4-31B on 4 GPUs). On 24 GB cards, batch size 2 fits
+at 160k cache; larger batches need a smaller `cache_size`. Through TabbyAPI, enable it with
+`model.max_batch_size` (see the TabbyAPI fork docs); the exllamav2-side knobs are
+`TPProcessGroup(max_batch=...)` and the `forward_batch` / `gather_kv_mtp_batch` protocol.
 
 ## Gemma-4-31B-IT
 

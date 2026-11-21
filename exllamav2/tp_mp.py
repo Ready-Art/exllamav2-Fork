@@ -86,7 +86,7 @@ def _parent_watchdog(parent_pid):
 
 
 def mp_worker(conn, device, world_size, rank, init_method, uuid_hex, model_dir, gpu_split,
-              max_seq_len, cache_tokens, cache_base_name):
+              max_seq_len, cache_tokens, cache_base_name, max_batch = 1):
     """
     Worker process entry point. Owns one GPU for the lifetime of the model.
 
@@ -117,13 +117,14 @@ def mp_worker(conn, device, world_size, rank, init_method, uuid_hex, model_dir, 
         model.load_tp_rank(rank, gpu_split,
                            expect_cache_tokens = cache_tokens,
                            expect_cache_base = ExLlamaV2Cache_SWA,
-                           load_head = (rank == 0))
+                           load_head = (rank == 0),
+                           max_batch = max_batch)
 
         # Per-rank KV cache: this rank's slice of the KV split, under each layer's own
         # geometry. ExLlamaV2Cache_TP would build all four devices' caches.
         from exllamav2.cache import tp_rank_cache
         cache = tp_rank_cache(model, rank, base = ExLlamaV2Cache_SWA,
-                              max_seq_len = max_seq_len)
+                              max_seq_len = max_seq_len, batch_size = max_batch)
 
         ctx["model"] = model
         ctx["cfg"] = cfg
@@ -197,6 +198,53 @@ def mp_worker(conn, device, world_size, rank, init_method, uuid_hex, model_dir, 
                 # start). Full-layer K/V above the position is ignored via seq_len.
                 _restore_swa_ring(ctx["cache"], ctx["ring_backup"], args,
                                   ctx["ring_backup_wb"])
+                conn.send(("ok", None))
+            elif cmd == "forward-batch":
+                # Multi-batch graphed step: (input_ids, seq_lens, window_begs, row_map,
+                # last_id_only, graph_verify, return_row_states). The per-row lists are
+                # the master's authoritative bookkeeping; the ring prep inside
+                # forward_tp_batch mutates window_begs identically on every rank.
+                result = _worker_forward_batch(ctx, *args)
+                conn.send(("ok", result))
+            elif cmd == "forward-row":
+                # Eager prefill chunk into ONE cache row (row view): (row, input_ids,
+                # last_id_only, preprocess_only).
+                result = _worker_forward_row(ctx, *args)
+                conn.send(("ok", result))
+            elif cmd == "forward-state-row":
+                # Solo decode-shaped forward on one row returning (logits, last_state):
+                # (row, input_ids, last_id_only). MTP heal / recommit fallback.
+                result = _worker_forward_state_row(ctx, *args)
+                conn.send(("ok", result))
+            elif cmd == "set-seqlens":
+                # Distributed per-row rewind: replace the whole seq_lens list.
+                ctx["cache"].seq_lens[:] = args[0]
+                conn.send(("ok", None))
+            elif cmd == "set-seqlen-row":
+                ctx["cache"].seq_lens[args[0]] = args[1]
+                conn.send(("ok", None))
+            elif cmd == "reset-row":
+                # Full reset of ONE slot (new lineage): position + ring origin zeroed.
+                # Ring content beyond the (zero) valid prefix is never read.
+                ctx["cache"].seq_lens[args[0]] = 0
+                ctx["cache"].window_begs[args[0]] = 0
+                conn.send(("ok", None))
+            elif cmd == "kv-pack-batch":
+                # Multi-batch MTP gather: per-row deltas of both drafter source layers,
+                # packed into one pinned CPU tensor (see _worker_kv_pack_batch).
+                conn.send(("ok", _worker_kv_pack_batch(ctx, *args)))
+            elif cmd == "ring-snapshot-row":
+                # Per-slot prompt-boundary ring snapshot (pinned CPU, row-scoped).
+                r = args[0]
+                backups = ctx.setdefault("ring_backup_rows", {})
+                backups[r] = _clone_swa_ring(ctx["cache"].row_view(r))
+                ctx.setdefault("ring_backup_rows_wb", {})[r] = ctx["cache"].window_begs[r]
+                conn.send(("ok", None))
+            elif cmd == "ring-restore-row":
+                r, seq = args
+                _restore_swa_ring(ctx["cache"].row_view(r),
+                                  ctx["ring_backup_rows"][r], seq,
+                                  ctx["ring_backup_rows_wb"][r])
                 conn.send(("ok", None))
             elif cmd == "sync":
                 torch.cuda.synchronize()
@@ -394,6 +442,109 @@ def _worker_forward(ctx, input_ids, past_len, seq_len, batch_size, last_id_only,
     return r
 
 
+def _worker_forward_batch(ctx, input_ids, seq_lens, window_begs, row_map,
+                          last_id_only, graph_verify, return_row_states):
+    """Multi-batch graphed step on this rank. The master's per-row bookkeeping is
+    authoritative: adopt it, then run the same deterministic ring prep + graphed step
+    every rank runs. Only rank 0 returns (logits[, row_states])."""
+    model = ctx["model"]
+    cache = ctx["cache"]
+    dev = ctx["device"]
+    if input_ids.device.index != dev:
+        input_ids = input_ids.to(dev)
+    # Per-BATCH-ROW lists (length B, the round's active subset): adopt them into the
+    # cache rows named by row_map, leaving every other slot's bookkeeping intact.
+    # forward_tp_batch persists its ring shifts back into cache.window_begs[r].
+    seq_lens = list(seq_lens)
+    wb = list(window_begs)
+    row_map = list(row_map)
+    for b, r in enumerate(row_map):
+        cache.seq_lens[r] = seq_lens[b]
+        cache.window_begs[r] = wb[b]
+    r = model.forward_tp_batch(
+        input_ids, cache, seq_lens, wb, row_map,
+        last_id_only = last_id_only, graph_verify = graph_verify,
+        return_row_states = return_row_states,
+    )
+    if ctx["rank"] != 0:
+        return None
+    return r
+
+
+def _worker_forward_row(ctx, row, input_ids, last_id_only, preprocess_only):
+    """Eager prefill chunk into one cache row via its persistent row view. The scalar
+    chunk loop / SWA ring protocol runs unchanged, scoped to the row. Graphs are
+    disabled: a row view is a different cache identity than the batched graphs' full
+    cache, and prefill is eager by design."""
+    model = ctx["model"]
+    cache = ctx["cache"]
+    dev = ctx["device"]
+    if input_ids.device.index != dev:
+        input_ids = input_ids.to(dev)
+    r = model.forward(input_ids, cache = cache.row_view(row),
+                      last_id_only = last_id_only, preprocess_only = preprocess_only,
+                      use_graphs = False)
+    if ctx["rank"] != 0:
+        return None
+    return r
+
+
+def _worker_forward_state_row(ctx, row, input_ids, last_id_only):
+    """Solo decode-shaped forward on one row returning (logits, last_state) on rank 0.
+    Eager (use_graphs=False): the heal/recommit path must not capture row-view graphs
+    that would thrash the batched graphs' cache identity."""
+    model = ctx["model"]
+    cache = ctx["cache"]
+    dev = ctx["device"]
+    if input_ids.device.index != dev:
+        input_ids = input_ids.to(dev)
+    r = model.forward(input_ids, cache = cache.row_view(row),
+                      last_id_only = last_id_only, return_last_state = True,
+                      cpu_logits = True, use_graphs = False)
+    if ctx["rank"] != 0:
+        return None
+    if isinstance(r, tuple):
+        return r
+    return (r, None)
+
+
+def _worker_kv_pack_batch(ctx, lf, ls, specs):
+    """Multi-batch MTP gather: this rank's per-row K/V deltas for both drafter source
+    layers in ONE pinned CPU tensor. ``specs`` is a list of (row, fl0, fl1, sl0, sl1)
+    in the parent's request order; the flat layout concatenates each row's
+    [K_full | V_full | K_swa | V_swa] block, so the parent unpacks zero-copy views
+    with the shapes it already knows."""
+    cache = ctx["cache"]
+
+    def clamp(layer, a, b):
+        width = cache.key_states[layer].shape[1]
+        a = max(0, min(a, width))
+        b = max(a, min(b, width))
+        return a, b
+
+    parts = []
+    n = 0
+    for row, fl0, fl1, sl0, sl1 in specs:
+        fl0, fl1 = clamp(lf, fl0, fl1)
+        sl0, sl1 = clamp(ls, sl0, sl1)
+        for t in (cache.key_states[lf][row, fl0:fl1],
+                  cache.value_states[lf][row, fl0:fl1],
+                  cache.key_states[ls][row, sl0:sl1],
+                  cache.value_states[ls][row, sl0:sl1]):
+            parts.append(t.detach())
+            n += t.numel()
+    stag = ctx.get("kv_pack_staging")
+    if stag is None or stag.numel() < n:
+        stag = ctx["kv_pack_staging"] = torch.empty(max(n, 1), dtype = torch.half,
+                                                    pin_memory = True)
+    o = 0
+    for t in parts:
+        stag[o:o + t.numel()].view(t.shape).copy_(t, non_blocking = True)
+        o += t.numel()
+    torch.cuda.current_stream().synchronize()
+    return stag[:n]
+
+
 # ---------------------------------------------------------------------------
 # Parent-side handle
 # ---------------------------------------------------------------------------
@@ -454,7 +605,7 @@ class TPProcessGroup:
     """
 
     def __init__(self, model_dir, gpu_split, max_seq_len, cache_tokens, cache_base_name,
-                 master_device = 0, verbose = False):
+                 master_device = 0, verbose = False, max_batch = 1):
         import multiprocessing
         multiprocessing.set_start_method("spawn", force = True)
         torch.multiprocessing.set_sharing_strategy("file_system")
@@ -466,6 +617,10 @@ class TPProcessGroup:
         self.cache_base_name = cache_base_name
         self.master_device = master_device
         self.verbose = verbose
+        # Multi-batch (slot scheduler): number of independent cache rows. The KV cache
+        # and the MTP shadows scale linearly with this; 1 keeps the verified single-
+        # sequence path untouched.
+        self.max_batch = max(1, int(max_batch))
         self.workers: dict[int, TPWorkerHandle] = {}
         self.master_ctx = None
         self.model = None
@@ -501,7 +656,8 @@ class TPProcessGroup:
                 target = mp_worker,
                 args = (child_conn, device, self._world_size, rank, self._init_method,
                         uuid_hex, self.model_dir, self.gpu_split, self.max_seq_len,
-                        self.cache_tokens, self.cache_base_name),
+                        self.cache_tokens * self.max_batch, self.cache_base_name,
+                        self.max_batch),
                 daemon = True,
             )
             proc.start()
@@ -524,11 +680,12 @@ class TPProcessGroup:
 
         model = ExLlamaV2(cfg)
         model.load_tp_rank(self.master_device, self.gpu_split,
-                           expect_cache_tokens = self.cache_tokens,
+                           expect_cache_tokens = self.cache_tokens * self.max_batch,
                            expect_cache_base = ExLlamaV2Cache_SWA,
-                           load_head = True)
+                           load_head = True,
+                           max_batch = self.max_batch)
         cache = tp_rank_cache(model, self.master_device, base = ExLlamaV2Cache_SWA,
-                              max_seq_len = self.max_seq_len)
+                              max_seq_len = self.max_seq_len, batch_size = self.max_batch)
 
         self.model = model
         self.cache = cache
@@ -592,11 +749,15 @@ class TPProcessGroup:
                 dummy = torch.tensor([[0, 0]], dtype = torch.long)
                 _logits, _state = self.forward_state(dummy, last_id_only = True,
                                                      cpu_logits = True)
-                drafter.gather_target(self)
-                # last_state is (1, q_len, H) from the eager multi-token prefill -- the
-                # drafter consumes only the LAST row (same slice mtp_mp.begin() applies).
-                drafter.draft_window(torch.tensor([[0]], dtype = torch.long),
-                                     _state[:, -1:, :].float().cpu(), 2, 1)
+                if self.max_batch == 1:
+                    drafter.gather_target(self)
+                    # last_state is (1, q_len, H) from the eager multi-token prefill -- the
+                    # drafter consumes only the LAST row (same slice mtp_mp.begin() applies).
+                    drafter.draft_window(torch.tensor([[0]], dtype = torch.long),
+                                         _state[:, -1:, :].float().cpu(), 2, 1)
+                # At max_batch > 1 the joined shadow is 4-D (per-row); the scalar
+                # gather/draft above assumes the 3-D layout. The batch warmup below
+                # compiles the drafter kernels through the batched path instead.
                 self.mtp_reset_cache()
                 print(f"[mtp] warmup done in {_time.perf_counter() - _t0:.1f}s", flush=True)
             except Exception as e:
@@ -604,6 +765,36 @@ class TPProcessGroup:
                       f"will pay FlashInfer JIT", flush=True)
                 try:
                     self.mtp_reset_cache()
+                except Exception:
+                    pass
+
+        # Multi-batch warmup: pre-capture the B=2 decode graph and JIT the batched
+        # drafter kernels at load, so the first concurrent request doesn't pay for them.
+        if self.max_batch > 1 and os.environ.get("EXL2_MTP_WARMUP", "1") != "0":
+            try:
+                import time as _time
+                _t0 = _time.perf_counter()
+                print("[mtp] batch warmup: pre-compiling multi-batch kernels...", flush=True)
+                B = min(2, self.max_batch)
+                dummy = torch.zeros((B, 1), dtype = torch.long)
+                self.forward_batch(dummy, [0] * B, list(range(B)), last_id_only = True)
+                self.mtp_set_seq_lens([1] * B + [0] * (self.max_batch - B))
+                self.gather_kv_mtp_batch(list(range(B)))
+                drafter.gather_target_batch(list(range(B)))
+                drafter.draft_window_batch(
+                    torch.zeros((B, 1), dtype = torch.long),
+                    torch.zeros((B, 1, drafter.backbone_hidden_size)),
+                    [1] * B, 1)
+                for r in range(B):
+                    self.mtp_reset_row(r)
+                print(f"[mtp] batch warmup done in {_time.perf_counter() - _t0:.1f}s",
+                      flush=True)
+            except Exception as e:
+                print(f"[mtp] batch warmup skipped ({type(e).__name__}: {e}); first "
+                      f"concurrent request will pay the capture/JIT", flush=True)
+                try:
+                    for r in range(self.max_batch):
+                        self.mtp_reset_row(r)
                 except Exception:
                     pass
 
@@ -732,20 +923,40 @@ class TPProcessGroup:
         # (debug11.txt); the old lazy allocation created them outside InferenceMode as
         # normal tensors -- preserve exactly that semantics here at load time.
         with torch.inference_mode(False):
-            self._mtp_kv = {
-                "fl": 0,
-                "sl": 0,      # absolute seq_len at the last SWA gather
-                "wb": 0,      # window_beg at the last SWA gather
-                # 3-D (S, kvh, hd) -- identical layout to the single-process drafter.
-                "kf": torch.zeros((self.max_seq_len, d.num_global_kv_heads, d.global_head_dim),
-                                  dtype = torch.half, device = dev),
-                "vf": torch.zeros((self.max_seq_len, d.num_global_kv_heads, d.global_head_dim),
-                                  dtype = torch.half, device = dev),
-                "ks": torch.zeros((mc.kv_state_size, d.num_kv_heads, d.head_dim),
-                                  dtype = torch.half, device = dev),
-                "vs": torch.zeros((mc.kv_state_size, d.num_kv_heads, d.head_dim),
-                                  dtype = torch.half, device = dev),
-            }
+            if self.max_batch > 1:
+                # Multi-batch: one shadow row per cache slot (4-D). VRAM scales linearly
+                # with max_batch (~1.25 GB/row at 160k for Gemma-4's joined source layers);
+                # preallocated here at load with a clean allocator, never lazily.
+                B = self.max_batch
+                self._mtp_kv = {
+                    "fl": 0, "sl": 0, "wb": 0,   # legacy scalar keys (unused at B > 1)
+                    "fls": [0] * B,              # per-row full-layer gather frontier
+                    "sls": [0] * B,              # per-row absolute seq_len at last SWA gather
+                    "wbs": [0] * B,              # per-row window_beg at last SWA gather
+                    "kf": torch.zeros((B, self.max_seq_len, d.num_global_kv_heads, d.global_head_dim),
+                                      dtype = torch.half, device = dev),
+                    "vf": torch.zeros((B, self.max_seq_len, d.num_global_kv_heads, d.global_head_dim),
+                                      dtype = torch.half, device = dev),
+                    "ks": torch.zeros((B, mc.kv_state_size, d.num_kv_heads, d.head_dim),
+                                      dtype = torch.half, device = dev),
+                    "vs": torch.zeros((B, mc.kv_state_size, d.num_kv_heads, d.head_dim),
+                                      dtype = torch.half, device = dev),
+                }
+            else:
+                self._mtp_kv = {
+                    "fl": 0,
+                    "sl": 0,      # absolute seq_len at the last SWA gather
+                    "wb": 0,      # window_beg at the last SWA gather
+                    # 3-D (S, kvh, hd) -- identical layout to the single-process drafter.
+                    "kf": torch.zeros((self.max_seq_len, d.num_global_kv_heads, d.global_head_dim),
+                                      dtype = torch.half, device = dev),
+                    "vf": torch.zeros((self.max_seq_len, d.num_global_kv_heads, d.global_head_dim),
+                                      dtype = torch.half, device = dev),
+                    "ks": torch.zeros((mc.kv_state_size, d.num_kv_heads, d.head_dim),
+                                      dtype = torch.half, device = dev),
+                    "vs": torch.zeros((mc.kv_state_size, d.num_kv_heads, d.head_dim),
+                                      dtype = torch.half, device = dev),
+                }
         return self._mtp_kv
 
     def _reset_mtp_kv(self):
@@ -762,6 +973,24 @@ class TPProcessGroup:
         st["fl"] = 0
         st["sl"] = 0
         st["wb"] = 0
+        if "fls" in st:
+            B = len(st["fls"])
+            st["fls"] = [0] * B
+            st["sls"] = [0] * B
+            st["wbs"] = [0] * B
+
+    def _reset_mtp_kv_row(self, r):
+        """Re-zero ONE slot's shadow rows + bookkeeping (slot lineage reset). Keeps the
+        buffers allocated; other slots' gathered K/V is untouched."""
+        st = self._mtp_kv
+        if st is None or "fls" not in st:
+            return
+        with torch.inference_mode():
+            for _k in ("kf", "vf", "ks", "vs"):
+                st[_k][r].zero_()
+        st["fls"][r] = 0
+        st["sls"][r] = 0
+        st["wbs"][r] = 0
 
     def gather_kv_mtp(self):
         """Give the drafter the target's last full (59) and sliding (58) K/V, joined
@@ -861,6 +1090,87 @@ class TPProcessGroup:
                 st["ks"][:swa_len], st["vs"][:swa_len],
                 seq_len, window_beg)
 
+    def gather_kv_mtp_batch(self, rows):
+        """Multi-batch incremental gather: refresh the joined shadow rows for ``rows``
+        (the active verify batch). Same delta protocol as gather_kv_mtp, per row: mirror
+        each row's SWA page shift on its shadow, pull only the new full/SWA rows, ONE
+        packed pipe message per worker covering every row. The drafter then reads the
+        4-D shadows directly (gather_target_batch)."""
+        assert self.mtp_drafter is not None, "call enable_mtp(drafter) first"
+        d = self.mtp_drafter
+        lf, ls = d.t_last_full, d.t_last_swa
+        mc = self.cache
+        st = self._mtp_kv
+        assert st is not None and st["kf"].dim() == 4, "batch gather needs max_batch > 1"
+        ring = mc.kv_state_size
+        world = len(self.workers) + 1
+        assert d.num_global_kv_heads % world == 0 and d.num_kv_heads % world == 0, \
+            "kv-pack-batch: kv heads must divide evenly across ranks"
+        fkh = d.num_global_kv_heads // world
+        skh = d.num_kv_heads // world
+
+        specs, meta = [], []
+        for r in rows:
+            seq_len = mc.seq_lens[r]
+            # Fail loudly at the source if a row ever runs past the cache depth: the
+            # worker's pack clamps to the buffer width while the parent's delta math
+            # doesn't, so an overflow desyncs the flat layout (cryptic view error).
+            assert seq_len <= mc.max_seq_len, \
+                f"gather_kv_mtp_batch: row {r} position {seq_len} exceeds cache depth " \
+                f"{mc.max_seq_len} (generation must be capped at admission)"
+            wb = mc.window_begs[r]
+            swa_len = max(0, min(seq_len - wb, ring))
+            swa_shift = wb - st["wbs"][r]
+            swa_start = max(st["sls"][r], wb) - wb
+            if swa_shift < 0 or seq_len < st["sls"][r] or swa_start > swa_len:
+                # Defensive full re-pull for this row (bookkeeping moved backwards).
+                swa_shift = 0
+                swa_start = 0
+            if 0 < swa_shift < ring:
+                st["ks"][r, :ring - swa_shift].copy_(st["ks"][r, swa_shift:].clone())
+                st["vs"][r, :ring - swa_shift].copy_(st["vs"][r, swa_shift:].clone())
+            df = seq_len - st["fls"][r]
+            ds = swa_len - swa_start
+            specs.append((r, st["fls"][r], seq_len, swa_start, swa_len))
+            meta.append((seq_len, swa_len, swa_start, df, ds))
+
+        for device, w in sorted(self.workers.items()):
+            w.send("kv-pack-batch", (lf, ls, specs))
+
+        parts = []
+        for (r, fl0, fl1, sl0, sl1) in specs:
+            parts.append([
+                [mc.key_states[lf][r, fl0:fl1].detach().cpu()],
+                [mc.value_states[lf][r, fl0:fl1].detach().cpu()],
+                [mc.key_states[ls][r, sl0:sl1].detach().cpu()],
+                [mc.value_states[ls][r, sl0:sl1].detach().cpu()],
+            ])
+        for device, w in sorted(self.workers.items()):
+            flat = w.recv()
+            o = 0
+            for bi in range(len(specs)):
+                df, ds = meta[bi][3], meta[bi][4]
+                for rows_n, kh, hd, acc in ((df, fkh, d.global_head_dim, parts[bi][0]),
+                                            (df, fkh, d.global_head_dim, parts[bi][1]),
+                                            (ds, skh, d.head_dim, parts[bi][2]),
+                                            (ds, skh, d.head_dim, parts[bi][3])):
+                    n = rows_n * kh * hd
+                    acc.append(flat[o:o + n].view(rows_n, kh, hd))
+                    o += n
+        for bi, r in enumerate(rows):
+            seq_len, swa_len, swa_start, df, ds = meta[bi]
+            fl0 = specs[bi][1]
+            if df > 0:
+                st["kf"][r, fl0:seq_len].copy_(torch.cat(parts[bi][0], dim = 1))
+                st["vf"][r, fl0:seq_len].copy_(torch.cat(parts[bi][1], dim = 1))
+            st["fls"][r] = seq_len
+            if ds > 0:
+                st["ks"][r, swa_start:swa_len].copy_(torch.cat(parts[bi][2], dim = 1))
+                st["vs"][r, swa_start:swa_len].copy_(torch.cat(parts[bi][3], dim = 1))
+            st["sls"][r] = seq_len
+            st["wbs"][r] = mc.window_begs[r]
+        return st
+
     def forward(self, input_ids, past_len, seq_len, batch_size, last_id_only,
                 graph_verify = False, return_row_states = False):
         """
@@ -892,6 +1202,114 @@ class TPProcessGroup:
             w.recv()
 
         return logits
+
+    # ------------------------------------------------------------------ multi-batch
+
+    def row_view(self, row):
+        """Persistent row-scoped cache facade (eager prefill / solo streaming runs)."""
+        return self.cache.row_view(row)
+
+    def forward_batch(self, input_ids, seq_lens, row_map, last_id_only = True,
+                      graph_verify = False, return_row_states = False):
+        """One graphed multi-batch step. ``seq_lens``/``row_map`` are per-BATCH-ROW
+        (length B = the round's active subset, which may be smaller than max_batch);
+        ``row_map[b]`` names batch row b's cache row. Every rank adopts the values into
+        those cache rows only -- other slots' bookkeeping is untouched. The ring prep
+        inside forward_tp_batch persists its shifts into cache.window_begs[r] on every
+        rank (deterministic, no extra traffic). Returns the master's logits (and
+        row_states when requested); workers return None."""
+        seq_lens = list(seq_lens)
+        row_map = list(row_map)
+        wb_rows = [self.cache.window_begs[r] for r in row_map]
+        for b, r in enumerate(row_map):
+            self.cache.seq_lens[r] = seq_lens[b]
+        for device, w in sorted(self.workers.items()):
+            w.send("forward-batch", (input_ids, seq_lens, list(wb_rows), row_map,
+                                     last_id_only, graph_verify, return_row_states))
+        out = _worker_forward_batch(self.master_ctx, input_ids, seq_lens,
+                                    wb_rows, row_map,
+                                    last_id_only, graph_verify, return_row_states)
+        for device, w in sorted(self.workers.items()):
+            w.recv()
+        return out
+
+    def forward_row(self, row, input_ids, last_id_only = True, preprocess_only = False):
+        """Eager prefill chunk into one cache row (the scheduler drives the chunk loop
+        so decode rounds can interleave between chunks). Returns the master's logits
+        (None when preprocess_only)."""
+        for device, w in sorted(self.workers.items()):
+            w.send("forward-row", (row, input_ids, last_id_only, preprocess_only))
+        out = _worker_forward_row(self.master_ctx, row, input_ids, last_id_only,
+                                  preprocess_only)
+        for device, w in sorted(self.workers.items()):
+            w.recv()
+        return out
+
+    def forward_state_row(self, row, input_ids, last_id_only = True):
+        """Solo decode-shaped forward on one row returning (logits, last_state) — the
+        MTP heal / recommit path. Eager on every rank (no row-view graph captures)."""
+        for device, w in sorted(self.workers.items()):
+            w.send("forward-state-row", (row, input_ids, last_id_only))
+        out = _worker_forward_state_row(self.master_ctx, row, input_ids, last_id_only)
+        for device, w in sorted(self.workers.items()):
+            w.recv()
+        return out
+
+    def mtp_set_seq_lens(self, seq_lens):
+        """Distributed per-row rewind: replace every rank's seq_lens list at once."""
+        seq_lens = list(seq_lens)
+        for device, w in sorted(self.workers.items()):
+            w.send("set-seqlens", (seq_lens,))
+            w.recv()
+        self.cache.seq_lens[:] = seq_lens
+
+    def mtp_set_seq_len_row(self, row, n):
+        for device, w in sorted(self.workers.items()):
+            w.send("set-seqlen-row", (row, n))
+            w.recv()
+        self.cache.seq_lens[row] = n
+
+    def mtp_reset_row(self, row):
+        """Full reset of one slot (new lineage): position + ring origin + shadow row.
+        Other slots are untouched; a stale disconnect abort must not leak across jobs."""
+        for device, w in sorted(self.workers.items()):
+            w.send("reset-row", (row,))
+            w.recv()
+        self.cache.seq_lens[row] = 0
+        self.cache.window_begs[row] = 0
+        self._reset_mtp_kv_row(row)
+        self.abort_flag.clear()
+
+    def snapshot_prompt_ring_row(self, row):
+        """Per-slot prompt-boundary ring snapshot (pinned CPU on every rank)."""
+        seq = self.cache.seq_lens[row]
+        for device, w in sorted(self.workers.items()):
+            w.send("ring-snapshot-row", (row,))
+        backups = getattr(self, "_ring_backup_rows", None)
+        if backups is None:
+            backups = self._ring_backup_rows = {}
+            self._ring_backup_rows_wb = {}
+            self._ring_backup_rows_seq = {}
+        backups[row] = _clone_swa_ring(self.row_view(row))
+        self._ring_backup_rows_wb[row] = self.cache.window_begs[row]
+        for device, w in sorted(self.workers.items()):
+            w.recv()
+        self._ring_backup_rows_seq[row] = seq
+
+    def restore_prompt_ring_row(self, row, seq):
+        """Restore slot ``row`` to its snapshot position (exact ring copy-back).
+        Returns False if no snapshot exists for exactly this position."""
+        backups = getattr(self, "_ring_backup_rows", None)
+        if backups is None or row not in backups or self._ring_backup_rows_seq[row] != seq:
+            return False
+        for device, w in sorted(self.workers.items()):
+            w.send("ring-restore-row", (row, seq))
+        _restore_swa_ring(self.row_view(row), backups[row], seq,
+                          self._ring_backup_rows_wb[row])
+        for device, w in sorted(self.workers.items()):
+            w.recv()
+        self._reset_mtp_kv_row(row)
+        return True
 
     def close(self):
         # Stop any in-flight prefill at its next chunk boundary so workers reach the

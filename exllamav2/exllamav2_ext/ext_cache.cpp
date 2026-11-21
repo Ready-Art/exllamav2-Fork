@@ -28,7 +28,8 @@ void kv_write
     int batch_size,
     int q_len,
     int kv_heads,
-    int head_dim
+    int head_dim,
+    torch::Tensor row_map
 )
 {
     TORCH_CHECK_DTYPE(src_k, kHalf);
@@ -43,6 +44,15 @@ void kv_write
     // cache is [batch, cache_len, kv_heads, head_dim]
     int cache_len = (int) cache_k.size(1);
 
+    // Optional per-sequence cache-row mapping (multi-batch slot graphs). An undefined
+    // or empty tensor means identity (sequence b writes cache row b), the original path.
+    const int32_t* row_map_ptr = NULL;
+    if (row_map.defined() && row_map.numel() > 0)
+    {
+        TORCH_CHECK_DTYPE(row_map, kInt);
+        row_map_ptr = (const int32_t*) row_map.data_ptr();
+    }
+
     kv_write_cuda
     (
         stream,
@@ -51,6 +61,7 @@ void kv_write
         (half*) cache_k.data_ptr(),
         (half*) cache_v.data_ptr(),
         (const int32_t*) pos.data_ptr(),
+        row_map_ptr,
         batch_size,
         q_len,
         kv_heads,

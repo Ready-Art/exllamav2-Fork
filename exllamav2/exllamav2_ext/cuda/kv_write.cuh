@@ -22,7 +22,8 @@ void kv_write_cuda
     const half* src_v,
     half* cache_k,
     half* cache_v,
-    const int32_t* pos,      // device pointer, position of the first new token
+    const int32_t* pos,      // device pointer, per-sequence position of the first new token
+    const int32_t* row_map,  // device pointer, cache row per sequence (NULL = identity)
     int batch_size,
     int q_len,
     int kv_heads,

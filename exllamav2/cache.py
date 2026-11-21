@@ -539,6 +539,29 @@ class ExLlamaV2Cache_SWA(ExLlamaV2Cache):
         v[:, :n - shift_tokens].copy_(v[:, shift_tokens:].clone())
 
     @torch.inference_mode()
+    def shift_ring_row(self, layer_idx: int, row: int, shift_tokens: int):
+        """Multi-batch: shift ONE sequence's ring (batch row ``row``) left by a whole
+        number of pages. Same contract as shift_ring, scoped to a single row so slots
+        at different sequence lengths shift independently. Every TP rank computes the
+        same per-row shift from the shared (seq_lens, window_begs) bookkeeping, so the
+        rings stay in lockstep with no cross-rank communication (BUG 94 protocol)."""
+
+        assert self.is_swa_layer[layer_idx], f"Layer {layer_idx} is not a sliding layer"
+        assert shift_tokens > 0, "shift_tokens must be positive"
+        assert shift_tokens % self.page_size == 0, \
+            f"Ring shift must be a whole number of pages, got {shift_tokens} tokens " \
+            f"with page_size {self.page_size}"
+        assert shift_tokens < self.kv_state_size, \
+            f"Cannot shift the ring by {shift_tokens} of {self.kv_state_size} tokens"
+
+        k = self.key_states[layer_idx][row]
+        v = self.value_states[layer_idx][row]
+
+        n = self.kv_state_size
+        k[:n - shift_tokens].copy_(k[shift_tokens:].clone())
+        v[:n - shift_tokens].copy_(v[shift_tokens:].clone())
+
+    @torch.inference_mode()
     def reset_rings(self):
         """Clear every ring. Called on sequence reset. PLAN.md §4.3 Phase 3E item 3."""
         for i in range(self.num_hidden_layers):
@@ -1014,6 +1037,12 @@ class _RankCacheView(ExLlamaV2CacheBase):
 
     def __init__(self, cache):
         self._cache = cache
+        # Multi-batch bookkeeping (MP slot scheduler): per-row sequence length and SWA
+        # ring origin. The scalar current_seq_len / window_beg fields remain for the
+        # verified batch-1 path; batched forwards read these lists instead.
+        cache.seq_lens = [0] * cache.batch_size
+        cache.window_begs = [0] * cache.batch_size
+        cache._row_views = {}
 
     def __getattr__(self, name):
         return getattr(self._cache, name)
@@ -1023,6 +1052,77 @@ class _RankCacheView(ExLlamaV2CacheBase):
         k, v = self._cache.get_kv_state(layer_idx, batch_size, offset, width,
                                         page_size, cache_seqlens, block_table)
         return [k], [v]
+
+    def row_view(self, row: int):
+        """Persistent row-scoped facade (stable identity for graph-cache checks)."""
+        v = self._row_views.get(row)
+        if v is None:
+            v = self._row_views[row] = _RowCacheView(self, row)
+        return v
+
+
+class _RowCacheView(ExLlamaV2CacheBase):
+    """
+    One batch row of a rank cache, presented as a batch-1 cache.
+
+    The verified scalar paths (eager prefill chunk loop, streaming generator, ring
+    snapshot/restore) read ``current_seq_len`` / ``window_beg`` and slice KV with
+    ``[:batch_size]``. Narrowing every state tensor to row ``r`` and mapping the
+    bookkeeping to ``seq_lens[r]`` / ``window_begs[r]`` lets all of that code run
+    unchanged on a single slot of a multi-batch cache, with zero cross-slot writes:
+    every view shares storage with the parent but only ever touches row r.
+    """
+
+    def __init__(self, rank_cache, row: int):
+        self._rc = rank_cache
+        self._row = row
+
+    def __getattr__(self, name):
+        return getattr(self._rc, name)
+
+    @property
+    def batch_size(self):
+        return 1
+
+    @property
+    def current_seq_len(self):
+        return self._rc.seq_lens[self._row]
+
+    @current_seq_len.setter
+    def current_seq_len(self, value):
+        self._rc.seq_lens[self._row] = int(value)
+
+    @property
+    def window_beg(self):
+        return self._rc.window_begs[self._row]
+
+    @window_beg.setter
+    def window_beg(self, value):
+        self._rc.window_begs[self._row] = int(value)
+
+    @property
+    def key_states(self):
+        return [t[self._row:self._row + 1] if t is not None else None
+                for t in self._rc.key_states]
+
+    @property
+    def value_states(self):
+        return [t[self._row:self._row + 1] if t is not None else None
+                for t in self._rc.value_states]
+
+    def get_kv_state(self, layer_idx, batch_size, offset, width, page_size = 0,
+                     cache_seqlens = None, block_table = None):
+        ks, vs = self._rc.get_kv_state(layer_idx, batch_size, offset, width,
+                                       page_size, cache_seqlens, block_table)
+        r = self._row
+        return [k[r:r + 1] for k in ks], [v[r:r + 1] for v in vs]
+
+    def shift_ring(self, layer_idx, shift_tokens):
+        self._rc.shift_ring_row(layer_idx, self._row, shift_tokens)
+
+    def reset(self):
+        self._rc.seq_lens[self._row] = 0
+        self._rc.window_begs[self._row] = 0
 
 
 def tp_rank_cache(

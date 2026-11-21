@@ -156,5 +156,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
     // cuda-graph-safe kv write (position from device memory)
 
-    m.def("kv_write", &kv_write, "kv_write");
+    m.def("kv_write", &kv_write, "kv_write",
+        py::arg("src_k"), py::arg("src_v"), py::arg("cache_k"), py::arg("cache_v"),
+        py::arg("pos"), py::arg("batch_size"), py::arg("q_len"), py::arg("kv_heads"),
+        py::arg("head_dim"), py::arg("row_map") = torch::Tensor());
 }

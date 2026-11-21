@@ -33,9 +33,14 @@ class P2PComm:
     # overlapping slots and clobber each other on replay (the gibberish bug).
     NSLOTS = 64
 
-    def __init__(self, rank: int, world: int):
+    def __init__(self, rank: int, world: int, n_slots: int = 64):
         self.rank = rank
         self.world = world
+        # Multi-batch captures more persistent graphs (decode/verify per batch size),
+        # each owning a permanent slot region; the caller raises this above the default
+        # 64 when max_batch > 1 so later graphs don't exhaust the arena and silently
+        # fall back to NCCL collectives mid-capture.
+        self.NSLOTS = int(n_slots)
         self.enabled = False
         self.arena = None
         self.peer_ptrs = None

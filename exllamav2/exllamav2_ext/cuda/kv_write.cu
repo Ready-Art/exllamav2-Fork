@@ -11,6 +11,7 @@ __global__ void kv_write_kernel
     half* __restrict__ cache_k,
     half* __restrict__ cache_v,
     const int32_t* __restrict__ pos,
+    const int32_t* __restrict__ row_map,
     int batch_size,
     int q_len,
     int kv_heads,
@@ -31,15 +32,20 @@ __global__ void kv_write_kernel
     int b = row / q_len;                          // which sequence
     int t = row - b * q_len;                      // token within this call
 
-    int p = pos[0];
+    // Multi-batch: each sequence has its own write position (pos[b]) and may live in
+    // any cache row (row_map[b]); the batched graph replays for any active slot subset.
+    // Single-sequence callers pass pos filled with one scalar and no row_map, which
+    // reduces to the original pos[0] / row b behaviour exactly.
+    int p = pos[b];
     if (p < 0) return;
+    int cache_b = row_map ? row_map[b] : b;
 
     int dst_row = p + t;
     if (dst_row >= cache_len) return;             // never write past the buffer
 
     // Cache is [batch, cache_len, kv_heads, head_dim]; source is [batch, q_len, ...]
     size_t src_off = ((size_t) row * row_half2 + col);
-    size_t dst_off = (((size_t) b * cache_len + dst_row) * row_half2 + col);
+    size_t dst_off = (((size_t) cache_b * cache_len + dst_row) * row_half2 + col);
 
     ((half2*) cache_k)[dst_off] = ((const half2*) src_k)[src_off];
     ((half2*) cache_v)[dst_off] = ((const half2*) src_v)[src_off];
@@ -53,6 +59,7 @@ void kv_write_cuda
     half* cache_k,
     half* cache_v,
     const int32_t* pos,
+    const int32_t* row_map,
     int batch_size,
     int q_len,
     int kv_heads,
@@ -73,6 +80,7 @@ void kv_write_cuda
         cache_k,
         cache_v,
         pos,
+        row_map,
         batch_size,
         q_len,
         kv_heads,

@@ -322,10 +322,16 @@ class FlashInferPaged:
         key = str(device)
         ws = cls._workspace_cache.get(key)
         if ws is None:
-            full = torch.zeros(cls.WORKSPACE_BYTES + 4096, dtype = torch.uint8, device = device)
-            ws = full[:cls.WORKSPACE_BYTES]
-            cls._workspace_canary[key] = full[cls.WORKSPACE_BYTES:]
-            cls._workspace_canary[key].fill_(0xA5)
+            # NORMAL tensor (not an inference tensor): the workspace is first created
+            # under the loader's InferenceMode, but the multi-batch drafter's eager
+            # FlashInfer wrappers plan()/run() on the scheduler thread OUTSIDE it, and
+            # plan() mutates workspace-backed buffers in place. In-place-on-normal is
+            # legal under InferenceMode too, so the captured graph path is unchanged.
+            with torch.inference_mode(False):
+                full = torch.zeros(cls.WORKSPACE_BYTES + 4096, dtype = torch.uint8, device = device)
+                ws = full[:cls.WORKSPACE_BYTES]
+                cls._workspace_canary[key] = full[cls.WORKSPACE_BYTES:]
+                cls._workspace_canary[key].fill_(0xA5)
             cls._workspace_cache[key] = ws
         return ws
 

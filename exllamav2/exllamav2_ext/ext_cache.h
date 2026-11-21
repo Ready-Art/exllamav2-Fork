@@ -11,7 +11,8 @@ void kv_write
     int batch_size,
     int q_len,
     int kv_heads,
-    int head_dim
+    int head_dim,
+    torch::Tensor row_map
 );
 void fp8_to_fp16(torch::Tensor in_tensor, torch::Tensor out_tensor, int batch_size, int offset, int width);
 

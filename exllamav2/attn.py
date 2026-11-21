@@ -2078,6 +2078,13 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                         _rope_off = self.model.tp_context.pos_tp.get(
                             dev, self.model.tp_context.pos
                         )
+                    elif getattr(attn_params, "batch_seq_lens", None) is not None:
+                        # Multi-batch capture WARMUP (eager): per-row positions, already
+                        # staged into pos_tp by _tp_graph_step before the warmup runs.
+                        _rope_past = -1
+                        _rope_off = self.model.tp_context.pos_tp.get(
+                            dev, self.model.tp_context.pos
+                        )
                     else:
                         _rope_past = past_len
                         _rope_off = attn_params.position_offsets_tp[idx] \
@@ -2138,7 +2145,12 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                 # branch raised "FlashAttention forward only supports head dimension at most
                 # 256". Keep the head_dim guard.
                 if has_flash_attn_with_paged and not cfg.no_flash_attn and self.head_dim <= 256 \
-                        and not self.model.tp_context.graph_mode:
+                        and not self.model.tp_context.graph_mode \
+                        and getattr(attn_params, "batch_seq_lens", None) is None:
+                    # (Multi-batch capture warmup bypasses FA2: its cache_seqlens KV write
+                    # addresses batch rows 0..B-1 at one scalar position, which is wrong
+                    # for a non-identity slot row map / per-row positions. The eager
+                    # FI/torch branch below does the per-row host write instead.)
                     # FA2 is kept only for the EAGER TP path. Graphed decode (incl. SWA hd256)
                     # is served by FlashInfer's use_cuda_graph wrapper below, phasing FA2 out
                     # of the captured path entirely.
@@ -2232,34 +2244,39 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                             batch_size,
                             q_len,
                             k[idx].shape[2],
-                            self.head_dim
+                            self.head_dim,
+                            self.model.tp_context.row_map_tp.get(
+                                dev, self.model.tp_context.row_map
+                            )
                         )
                         _fi_key = (
                             dev, q[idx].shape[2], k_cache[idx].shape[2],
                             self.head_dim, self.scaling,
                             self.sliding_window if self.sliding_window else -1
                         )
-                        if (_fi_hd and q_len == 1 and batch_size == 1
-                                and _fi_key in self.model.tp_context.fi_decode):
+                        _ctx = self.model.tp_context
+                        if (_fi_hd and q_len == 1
+                                and (_fi_key + (batch_size,)) in _ctx.fi_decode):
                             # Graph-safe hd512 decode: the paged wrapper was planned for
-                            # this step's kv_len OUTSIDE the graph (model._tp_graph_step);
-                            # run() reads the refreshed plan and is captured here.
-                            attn_output = self.model.tp_context.fi_decode_run(
-                                _fi_key, q[idx], k_cache[idx], v_cache[idx]
+                            # this step's per-row kv_lens OUTSIDE the graph
+                            # (model._tp_graph_step); run() reads the refreshed plan and is
+                            # captured here. B == 1 is the original single-request shape.
+                            attn_output = _ctx.fi_decode_run(
+                                _fi_key + (batch_size,), q[idx], k_cache[idx], v_cache[idx]
                             )
-                        elif (q_len > 1 and batch_size == 1 and _fi_hd
-                                and (_fi_key + (q_len,)) in self.model.tp_context.fi_prefill):
+                        elif (q_len > 1 and _fi_hd and not self.sliding_window
+                                and (_fi_key + (q_len, batch_size)) in _ctx.fi_prefill):
                             # Single-pass graphed verify: ONE paged-prefill run reads the
                             # KV prefix once for all q_len rows (fa2 causal aligns row i to
-                            # base+i+1). Planned outside the graph per replay
+                            # base+i+1), per batch row. Planned outside the graph per replay
                             # (model._fi_tp_graph_plan); fixed-buffer graph contract per
                             # BUG 103. Replaces q_len per-row decode runs: ~q_len x less KV
                             # traffic at long context and q_len x fewer kernels per layer.
-                            attn_output = self.model.tp_context.fi_prefill_run(
-                                _fi_key + (q_len,), q[idx], k_cache[idx], v_cache[idx]
+                            attn_output = _ctx.fi_prefill_run(
+                                _fi_key + (q_len, batch_size), q[idx], k_cache[idx], v_cache[idx]
                             )
                         elif (q_len > 1 and batch_size == 1 and _fi_hd
-                                and all((_fi_key + (i,)) in self.model.tp_context.fi_decode
+                                and all((_fi_key + (i, 1)) in _ctx.fi_decode
                                         for i in range(q_len))):
                             # BUG 109 fallback: graph-safe MTP verify via per-row FI DECODE.
                             # Each query row i is a decode query attending to its causal
@@ -2273,11 +2290,19 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                             # KV is already written above, so row i sees draft[0..i] too.
                             _rows = []
                             for i in range(q_len):
-                                _rows.append(self.model.tp_context.fi_decode_run(
-                                    _fi_key + (i,), q[idx][:, i:i + 1],
+                                _rows.append(_ctx.fi_decode_run(
+                                    _fi_key + (i, 1), q[idx][:, i:i + 1],
                                     k_cache[idx], v_cache[idx]
                                 ))
                             attn_output = torch.cat(_rows, dim = 1)   # (1, q_len, nq*hd)
+                        elif (q_len > 1 and batch_size > 1 and _fi_hd
+                                and (_fi_key + (q_len, batch_size)) in _ctx.fi_decode_rows):
+                            # Multi-batch SWA verify: one batched windowed-decode run over
+                            # B*q_len per-row requests (the B==1 per-row path above,
+                            # generalized). Planned outside the graph per replay.
+                            attn_output = _ctx.fi_decode_rows_run(
+                                _fi_key + (q_len, batch_size), q[idx], k_cache[idx], v_cache[idx]
+                            )
                         else:
                             # Torch fallback with a dynamic device mask: shapes FlashInfer
                             # cannot serve (no plan, softcap, odd depth). Attention must
@@ -2307,9 +2332,11 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                             # The old single bound pos + (q_len - 1) was correct for
                             # q_len == 1 but would let every row of a multi-token (MTP
                             # verify) window attend to the whole window, including future
-                            # keys -- non-causal. For q_len == 1 this reduces to the
-                            # original (1, 1, 1, cache_b) mask exactly.
-                            _lim = _pos + torch.arange(q_len, device = _dev).view(q_len, 1)
+                            # keys -- non-causal. Multi-batch: pos[b] is per batch row, so
+                            # the mask is (B, 1, q_len, cache_b); for B == 1, q_len == 1 it
+                            # reduces to the original (1, 1, 1, cache_b) mask exactly.
+                            _lim = (_pos[:batch_size].view(batch_size, 1)
+                                    + torch.arange(q_len, device = _dev).view(1, q_len))
                             # Both bounds are needed. The upper bound is the causal limit;
                             # the lower bound is the sliding window. _attn_torch would
                             # otherwise slice the *last* sliding_window entries of the
@@ -2318,18 +2345,23 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                             # the dynamic position.
                             if self.sliding_window:
                                 _lo = _lim - (self.sliding_window - 1)
-                                _ok = (_ki <= _lim) & (_ki >= _lo)
+                                _ok = (_ki.view(1, 1, cache_b) <= _lim.unsqueeze(-1)) \
+                                    & (_ki.view(1, 1, cache_b) >= _lo.unsqueeze(-1))
                             else:
-                                _ok = _ki <= _lim
+                                _ok = _ki.view(1, 1, cache_b) <= _lim.unsqueeze(-1)
                             _graph_mask = torch.where(
                                 _ok, 0.0, -65504.0
-                            ).to(torch.half).view(1, 1, q_len, cache_b)
+                            ).to(torch.half).view(batch_size, 1, q_len, cache_b)
+                            # Batch rows map to cache rows via row_map (identity at B == 1).
+                            _rmap_t = self.model.tp_context.row_map_tp.get(
+                                _dev_idx, self.model.tp_context.row_map
+                            )[:batch_size]
                             attn_output = self._attn_torch(
                                 batch_size,
                                 q_len,
                                 q[idx],
-                                k_cache[idx][:batch_size, :cache_b, :, :],
-                                v_cache[idx][:batch_size, :cache_b, :, :],
+                                k_cache[idx].index_select(0, _rmap_t)[:, :cache_b, :, :],
+                                v_cache[idx].index_select(0, _rmap_t)[:, :cache_b, :, :],
                                 attn_params,
                                 cfg,
                                 mask_override = _graph_mask
@@ -2343,16 +2375,46 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                         # loop's shift protocol guarantees the write fits in [0, ring);
                         # a negative rel only drops leading rows of the chunk.
                         _swa_win = self.sliding_window if self.sliding_window else 0
-                        if _swa_win:
-                            _rel = attn_params.past_len - getattr(cache, "window_beg", 0)
-                            _drop = max(0, -_rel)
-                            cache_a = max(0, _rel)
-                        else:
+                        _bsl = getattr(attn_params, "batch_seq_lens", None)
+                        if _bsl is not None:
+                            # Multi-batch capture WARMUP (eager): write each batch row's
+                            # K/V to its OWN cache row at its OWN position (ring-relative
+                            # for SWA), so the warmup is an idempotent rewrite of exactly
+                            # what the captured graph step writes. The attention below
+                            # reads a common in-bounds prefix (warmup values are discarded;
+                            # only the KV side effect persists).
+                            _rmap = attn_params.batch_row_map
+                            _wbs = attn_params.batch_window_begs
+                            _max_end = 0
+                            for _bi in range(batch_size):
+                                _r = _rmap[_bi]
+                                if _swa_win:
+                                    _rel_b = _bsl[_bi] - _wbs[_bi]
+                                    _drop_b = max(0, -_rel_b)
+                                    _ca_b = max(0, _rel_b)
+                                else:
+                                    _drop_b = 0
+                                    _ca_b = _bsl[_bi]
+                                _cb_b = _ca_b + q_len - _drop_b
+                                k_cache[idx][_r:_r + 1, _ca_b:_cb_b, :, :].copy_(
+                                    k[idx][_bi:_bi + 1, _drop_b:, :, :])
+                                v_cache[idx][_r:_r + 1, _ca_b:_cb_b, :, :].copy_(
+                                    v[idx][_bi:_bi + 1, _drop_b:, :, :])
+                                _max_end = max(_max_end, _cb_b)
                             _drop = 0
-                            cache_a = attn_params.past_len
-                        cache_b = cache_a + q_len - _drop
-                        k_cache[idx][:batch_size, cache_a:cache_b, :, :].copy_(k[idx][:, _drop:, :, :])
-                        v_cache[idx][:batch_size, cache_a:cache_b, :, :].copy_(v[idx][:, _drop:, :, :])
+                            cache_a = max(0, _max_end - q_len)
+                            cache_b = cache_a + q_len
+                        else:
+                            if _swa_win:
+                                _rel = attn_params.past_len - getattr(cache, "window_beg", 0)
+                                _drop = max(0, -_rel)
+                                cache_a = max(0, _rel)
+                            else:
+                                _drop = 0
+                                cache_a = attn_params.past_len
+                            cache_b = cache_a + q_len - _drop
+                            k_cache[idx][:batch_size, cache_a:cache_b, :, :].copy_(k[idx][:, _drop:, :, :])
+                            v_cache[idx][:batch_size, cache_a:cache_b, :, :].copy_(v[idx][:, _drop:, :, :])
                         if _swa_win:
                             _ql = q_len - _drop
                             _fi_swa = (

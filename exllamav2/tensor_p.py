@@ -122,10 +122,15 @@ class TPContext:
         model: ExLlamaV2,
         gpu_split: list[float] | None,
         expect_cache_tokens: int = 0,
-        expect_cache_base: type = None
+        expect_cache_base: type = None,
+        max_batch: int = 1
     ):
         self.model = model
         cfg = self.model.config
+        # Multi-batch (MP slot scheduler): number of cache rows / independent sequences
+        # the device-side position tensors and graph-mode FI wrappers must serve. 1 keeps
+        # the verified single-sequence path byte-identical.
+        self.max_batch = max(1, int(max_batch))
 
         assert cfg.arch.lm.supports_tp, \
             f"Tensor-parallel is not supported for {cfg.arch.arch_string}"
@@ -219,10 +224,16 @@ class TPContext:
         # BUG 107: FlashInfer paged PREFILL wrappers for the graphed MTP verify window
         # (q_len > 1). Same graph-safe pattern as fi_decode (use_cuda_graph=True, backend
         # "fa2", fixed indptr/indices/last_page_len buffers refreshed by a per-step plan
-        # outside the capture), but with a fixed qo_indptr = [0, q_len] so the captured
-        # multi-token attention replays at every round. One wrapper per (device, geometry,
-        # q_len). Replaces the full-cache-depth SDPA that made the graphed verify ~250 ms.
+        # outside the capture), but with a fixed qo_indptr = [0, q_len, 2*q_len, ...] so
+        # the captured multi-token attention replays at every round. One wrapper per
+        # (device, geometry, q_len, batch). Replaces the full-cache-depth SDPA that made
+        # the graphed verify ~250 ms.
         self.fi_prefill = {}
+
+        # Multi-batch SWA verify: one BatchDecode wrapper per (device, geometry, q_len,
+        # batch) serving B*q_len per-row windowed requests (the B==1 path keeps the
+        # original per-row fi_decode wrappers). Same fixed-buffer graph contract.
+        self.fi_decode_rows = {}
 
         self.define_split(gpu_split, expect_cache_tokens, expect_cache_base)
 
@@ -250,34 +261,76 @@ class TPContext:
 
     FI_DECODE_PAGE = 128
 
-    def fi_decode_plan(self, key, kv_len: int, k_cache_dev: torch.Tensor) -> bool:
+    def _fi_batch_meta(self, entry, kv_lens, row_map, npages, page):
+        """Refresh a graph-mode wrapper's fixed metadata buffers for one batched step.
+
+        Per-row page lists are contiguous runs ``row_map[b]*npages + [0, pages_valid_b)``
+        in the (B_max*npages, page, HKV, D) page view of the multi-row KV buffer. indptr /
+        last_page_len are written in place; the page indices are staged through a separate
+        buffer (plan() copies them into the registered fixed buffer, whose address the
+        captured graph holds). All writes run on the TP stream -- plan()'s host readback
+        is ordered after them (BUG 114 contract).
+        """
+        B = len(kv_lens)
+        pages_valid = [(l + page - 1) // page for l in kv_lens]
+        total = sum(pages_valid)
+        idx_host = torch.empty(total, dtype = torch.int32)
+        ip = [0]
+        o = 0
+        for b in range(B):
+            pv = pages_valid[b]
+            base = row_map[b] * npages
+            idx_host[o:o + pv] = torch.arange(base, base + pv, dtype = torch.int32)
+            o += pv
+            ip.append(o)
+        entry["stage"][:total].copy_(idx_host, non_blocking = True)
+        entry["indptr"].copy_(torch.tensor(ip, dtype = torch.int32), non_blocking = True)
+        entry["last_page_len"].copy_(torch.tensor(
+            [kv_lens[b] - (pages_valid[b] - 1) * page for b in range(B)],
+            dtype = torch.int32), non_blocking = True)
+        return total
+
+    def fi_decode_plan(self, key, kv_lens, k_cache_dev: torch.Tensor,
+                       row_map = None) -> bool:
         """
         Plan the shared per-device FlashInfer paged decode wrapper for this step.
 
         Host-side work: must run OUTSIDE any CUDA graph capture, before warmup/capture
-        and before every replay. The contiguous ``(1, S, HKV, D)`` TP KV buffer is served
-        as ``S // 128`` pages; the valid prefix length is dynamic via indptr/last_page_len,
-        which is exactly what the per-step re-plan refreshes (the graph-safe hd512 pattern).
+        and before every replay. The contiguous ``(B_max, S, HKV, D)`` TP KV buffer is
+        served as ``B_max * (S // 128)`` pages; each batch row's valid prefix length is
+        dynamic via indptr/last_page_len, which the per-step re-plan refreshes (the
+        graph-safe hd512 pattern).
 
-        :param key: ``(dev, num_qo_heads, num_kv_heads, head_dim, sm_scale, window_left)``
+        :param key: ``(dev, num_qo_heads, num_kv_heads, head_dim, sm_scale, window_left, B)``
             ``window_left`` is the sliding window (>=0) for SWA layers, else -1. Including
             it in the key gives SWA hd256 layers their own wrapper distinct from full hd512.
-        :param kv_len: valid KV prefix including the token being decoded. For SWA layers
-            this is the ring-relative fill (ring_pos + q_len), not the absolute position.
+            B (the batch size) is part of the key because FlashInfer's graph mode freezes
+            the batch at wrapper construction (plan() rejects a different batch size).
+        :param kv_lens: per-batch-row valid KV prefix including the token being decoded.
+            For SWA layers this is the ring-relative fill, not the absolute position.
         :param k_cache_dev: this device's KV buffer (for depth/dtype).
+        :param row_map: cache row per batch row (default identity).
         :return: True if the wrapper is ready, False if the shape cannot be served.
         """
         import flashinfer
         from exllamav2 import attn_backend
 
-        # BUG 109: the key is a 6-tuple for plain decode, or a 7-tuple (…, row_index) for
-        # the per-row MTP verify wrappers. The row index only discriminates the dict entry
-        # (one wrapper per verify row); the plan parameters are the first six elements.
-        dev, nq, nkv, hd, scale, window_left = key[:6]
+        # 7-tuple (dev, nq, nkv, hd, scale, window_left, B) for plain decode, or
+        # 8-tuple (..., row_index, B) for the B==1 per-row MTP verify wrappers: the
+        # row index only discriminates the dict entry (one wrapper per verify row);
+        # the plan parameters are the first six elements and the batch is the last.
+        if len(key) == 7:
+            dev, nq, nkv, hd, scale, window_left, B = key
+        else:
+            dev, nq, nkv, hd, scale, window_left, _row, B = key
         page = self.FI_DECODE_PAGE
         depth = k_cache_dev.shape[1]
-        if depth % page != 0 or kv_len < 1 or kv_len > depth:
+        if depth % page != 0 or B < 1 or len(kv_lens) != B:
             return False
+        if any(l < 1 or l > depth for l in kv_lens):
+            return False
+        if row_map is None:
+            row_map = list(range(B))
 
         # BUG 114: EVERYTHING that touches the fixed metadata buffers -- creation,
         # the per-step scalar writes, and plan() (which reads them back to host) --
@@ -292,7 +345,7 @@ class TPContext:
         torch.cuda.set_device(dev)
         torch.cuda.set_stream(self.streams_dev[dev])
         try:
-            self._fi_guard("decode-plan", kv_len, 1)
+            self._fi_guard("decode-plan", max(kv_lens), 1)
             if entry is None:
                 workspace = attn_backend.FlashInferPaged._get_workspace(torch.device("cuda", dev))
                 npages = depth // page
@@ -304,10 +357,10 @@ class TPContext:
                 # reallocating, and split-KV intermediates stay in the fixed workspace. This
                 # keeps split-KV parallelism (full hd512 decode speed) AND graph-safe addresses.
                 # backend="fa2" is explicit: under cuda graphs "auto" resolves to cuDNN, which
-                # is not the verified hd512/sm86 path. batch=1 / q_len=1 are fixed for decode.
-                indices = torch.arange(npages, dtype = torch.int32, device = dev)
-                indptr = torch.zeros(2, dtype = torch.int32, device = dev)
-                last_page_len = torch.zeros(1, dtype = torch.int32, device = dev)
+                # is not the verified hd512/sm86 path. Batch B is fixed per wrapper.
+                indices = torch.empty(B * npages, dtype = torch.int32, device = dev)
+                indptr = torch.zeros(B + 1, dtype = torch.int32, device = dev)
+                last_page_len = torch.zeros(B, dtype = torch.int32, device = dev)
                 entry = {
                     "wrapper": flashinfer.BatchDecodeWithPagedKVCacheWrapper(
                         workspace, "NHD",
@@ -321,17 +374,15 @@ class TPContext:
                     "indices": indices,
                     "indptr": indptr,
                     "last_page_len": last_page_len,
+                    "stage": torch.empty(B * npages, dtype = torch.int32, device = dev),
                     "ptrs": (indptr.data_ptr(), last_page_len.data_ptr(), indices.data_ptr()),
                 }
                 self.fi_decode[key] = entry
 
-            pages_valid = (kv_len + page - 1) // page
-            entry["indptr"][1] = pages_valid
-            entry["last_page_len"][0] = kv_len - (pages_valid - 1) * page
-
+            total = self._fi_batch_meta(entry, kv_lens, row_map, entry["npages"], page)
             entry["wrapper"].plan(
                 indptr = entry["indptr"],
-                indices = entry["indices"],
+                indices = entry["stage"][:total],
                 last_page_len = entry["last_page_len"],
                 num_qo_heads = nq,
                 num_kv_heads = nkv,
@@ -357,41 +408,49 @@ class TPContext:
 
     def fi_decode_run(self, key, q: torch.Tensor, k_cache_dev: torch.Tensor, v_cache_dev: torch.Tensor):
         """
-        Capturable hd>256 decode attention against the per-step plan. ``(1, 1, H, D)`` query,
-        contiguous per-device KV buffers; returns ``(1, 1, H * D)`` like _attn_torch.
+        Capturable hd>256 decode attention against the per-step plan. ``(B, 1, H, D)`` query,
+        contiguous per-device KV buffers; returns ``(B, 1, H * D)`` like _attn_torch.
         """
         entry = self.fi_decode[key]
         page = self.FI_DECODE_PAGE
         npages = entry["npages"]
         nkv = k_cache_dev.shape[2]
         hd = q.shape[3]
-        k_pages = k_cache_dev.view(npages, page, nkv, hd)
-        v_pages = v_cache_dev.view(npages, page, nkv, hd)
+        B = q.shape[0]
+        k_pages = k_cache_dev.view(-1, page, nkv, hd)
+        v_pages = v_cache_dev.view(-1, page, nkv, hd)
         # run() expects 3-D q (batch, num_qo_heads, head_dim); a 2-D (H, D) tensor is
         # misread as q_len_per_req=H by the non-tensor-core decode kernel.
-        out = entry["wrapper"].run(q.view(1, q.shape[2], hd), (k_pages, v_pages))
-        return out.view(1, 1, q.shape[2] * hd)
+        out = entry["wrapper"].run(q.view(B, q.shape[2], hd), (k_pages, v_pages))
+        return out.view(B, 1, q.shape[2] * hd)
 
-    def fi_prefill_plan(self, key, kv_len: int, k_cache_dev: torch.Tensor) -> bool:
+    def fi_prefill_plan(self, key, kv_lens, k_cache_dev: torch.Tensor,
+                        row_map = None) -> bool:
         """
         BUG 107: plan the shared per-device FlashInfer paged PREFILL wrapper for the
         graphed MTP verify window (q_len > 1). Host-side work, OUTSIDE the capture, before
         warmup/capture and before every replay -- exactly the fi_decode_plan pattern.
 
-        :param key: ``(dev, num_qo_heads, num_kv_heads, head_dim, sm_scale, window_left, q_len)``
-            q_len is part of the key: the fixed query shape is baked into qo_indptr.
-        :param kv_len: valid KV prefix including the q_len verify tokens (ring-relative for
-            SWA layers, absolute for full layers).
+        :param key: ``(dev, num_qo_heads, num_kv_heads, head_dim, sm_scale, window_left, q_len, B)``
+            q_len and B are part of the key: the fixed query shape is baked into qo_indptr
+            and FlashInfer graph mode freezes the batch at construction.
+        :param kv_lens: per-batch-row valid KV prefix including the q_len verify tokens
+            (ring-relative for SWA layers, absolute for full layers).
+        :param row_map: cache row per batch row (default identity).
         :return: True if the wrapper is ready, False if the shape cannot be served.
         """
         import flashinfer
         from exllamav2 import attn_backend
 
-        dev, nq, nkv, hd, scale, window_left, q_len = key
+        dev, nq, nkv, hd, scale, window_left, q_len, B = key
         page = self.FI_DECODE_PAGE
         depth = k_cache_dev.shape[1]
-        if depth % page != 0 or kv_len < 1 or kv_len > depth or q_len < 1:
+        if depth % page != 0 or q_len < 1 or B < 1 or len(kv_lens) != B:
             return False
+        if any(l < 1 or l > depth for l in kv_lens):
+            return False
+        if row_map is None:
+            row_map = list(range(B))
 
         # BUG 114: same-stream contract as fi_decode_plan -- buffer creation, the
         # per-step scalar writes and plan()'s host readback all run on the TP stream.
@@ -404,18 +463,18 @@ class TPContext:
         torch.cuda.set_device(dev)
         torch.cuda.set_stream(self.streams_dev[dev])
         try:
-            self._fi_guard("prefill-plan", kv_len, q_len)
+            self._fi_guard("prefill-plan", max(kv_lens), q_len)
             if entry is None:
                 workspace = attn_backend.FlashInferPaged._get_workspace(torch.device("cuda", dev))
                 npages = depth // page
                 # use_cuda_graph=True + backend="fa2": plan() refreshes the FA2 scheduling
                 # metadata in fixed buffers (the BUG 103 decode fix), so a captured run()
                 # replays correctly as kv_len grows. "auto" would resolve to cuDNN under
-                # graphs, which is not the verified hd512/sm86 path. batch=1, q_len fixed.
-                qo_indptr = torch.tensor([0, q_len], dtype = torch.int32, device = dev)
-                indices = torch.arange(npages, dtype = torch.int32, device = dev)
-                indptr = torch.zeros(2, dtype = torch.int32, device = dev)
-                last_page_len = torch.zeros(1, dtype = torch.int32, device = dev)
+                # graphs, which is not the verified hd512/sm86 path. B / q_len fixed.
+                qo_indptr = torch.arange(B + 1, dtype = torch.int32, device = dev) * q_len
+                indices = torch.empty(B * npages, dtype = torch.int32, device = dev)
+                indptr = torch.zeros(B + 1, dtype = torch.int32, device = dev)
+                last_page_len = torch.zeros(B, dtype = torch.int32, device = dev)
                 entry = {
                     "wrapper": flashinfer.BatchPrefillWithPagedKVCacheWrapper(
                         workspace, "NHD",
@@ -431,19 +490,17 @@ class TPContext:
                     "indices": indices,
                     "indptr": indptr,
                     "last_page_len": last_page_len,
+                    "stage": torch.empty(B * npages, dtype = torch.int32, device = dev),
                     "ptrs": (qo_indptr.data_ptr(), indptr.data_ptr(),
                              last_page_len.data_ptr(), indices.data_ptr()),
                 }
                 self.fi_prefill[key] = entry
 
-            pages_valid = (kv_len + page - 1) // page
-            entry["indptr"][1] = pages_valid
-            entry["last_page_len"][0] = kv_len - (pages_valid - 1) * page
-
+            total = self._fi_batch_meta(entry, kv_lens, row_map, entry["npages"], page)
             entry["wrapper"].plan(
                 qo_indptr = entry["qo_indptr"],
                 paged_kv_indptr = entry["indptr"],
-                paged_kv_indices = entry["indices"],
+                paged_kv_indices = entry["stage"][:total],
                 paged_kv_last_page_len = entry["last_page_len"],
                 num_qo_heads = nq,
                 num_kv_heads = nkv,
@@ -466,19 +523,108 @@ class TPContext:
     def fi_prefill_run(self, key, q: torch.Tensor, k_cache_dev: torch.Tensor, v_cache_dev: torch.Tensor):
         """
         Capturable multi-token (verify-window) attention against the per-step prefill plan.
-        ``(1, q_len, H, D)`` query, contiguous per-device KV buffers; returns
-        ``(1, q_len, H * D)`` like _attn_torch.
+        ``(B, q_len, H, D)`` query, contiguous per-device KV buffers; returns
+        ``(B, q_len, H * D)`` like _attn_torch.
         """
         entry = self.fi_prefill[key]
         page = self.FI_DECODE_PAGE
-        npages = entry["npages"]
         nkv = k_cache_dev.shape[2]
         hd = q.shape[3]
-        q_len = q.shape[1]
-        k_pages = k_cache_dev.view(npages, page, nkv, hd)
-        v_pages = v_cache_dev.view(npages, page, nkv, hd)
-        out = entry["wrapper"].run(q.view(q_len, q.shape[2], hd), (k_pages, v_pages))
-        return out.view(1, q_len, q.shape[2] * hd)
+        B, q_len = q.shape[0], q.shape[1]
+        k_pages = k_cache_dev.view(-1, page, nkv, hd)
+        v_pages = v_cache_dev.view(-1, page, nkv, hd)
+        out = entry["wrapper"].run(q.view(B * q_len, q.shape[2], hd), (k_pages, v_pages))
+        return out.view(B, q_len, q.shape[2] * hd)
+
+    def fi_decode_rows_plan(self, key, kv_lens, rows, k_cache_dev: torch.Tensor) -> bool:
+        """
+        Batched per-row windowed DECODE for the graphed SWA verify window (q_len > 1,
+        B > 1): one BatchDecode wrapper serving B*q_len "requests", request (b, i) being
+        row b's query i attending to its causal ring prefix. The B == 1 path keeps the
+        original per-row fi_decode wrappers (verified state); this is its multi-batch
+        generalization. Same fixed-buffer graph contract as fi_decode_plan.
+
+        :param key: ``(dev, num_qo_heads, num_kv_heads, head_dim, sm_scale, window_left, q_len, B)``
+        :param kv_lens: flat list of B*q_len valid (ring-relative, clamped) KV lengths.
+        :param rows: flat list of B*q_len cache rows (row_map[b] repeated q_len times).
+        """
+        import flashinfer
+        from exllamav2 import attn_backend
+
+        dev, nq, nkv, hd, scale, window_left, q_len, B = key
+        page = self.FI_DECODE_PAGE
+        depth = k_cache_dev.shape[1]
+        R = B * q_len
+        if depth % page != 0 or q_len < 1 or B < 1 or len(kv_lens) != R or len(rows) != R:
+            return False
+        if any(l < 1 or l > depth for l in kv_lens):
+            return False
+
+        entry = self.fi_decode_rows.get(key)
+        prev_dev = torch.cuda.current_device()
+        prev_stream = torch.cuda.current_stream(dev)
+        torch.cuda.set_device(dev)
+        torch.cuda.set_stream(self.streams_dev[dev])
+        try:
+            self._fi_guard("rows-plan", max(kv_lens), q_len)
+            if entry is None:
+                workspace = attn_backend.FlashInferPaged._get_workspace(torch.device("cuda", dev))
+                npages = depth // page
+                indices = torch.empty(R * npages, dtype = torch.int32, device = dev)
+                indptr = torch.zeros(R + 1, dtype = torch.int32, device = dev)
+                last_page_len = torch.zeros(R, dtype = torch.int32, device = dev)
+                entry = {
+                    "wrapper": flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+                        workspace, "NHD",
+                        use_cuda_graph = True,
+                        backend = "fa2",
+                        paged_kv_indptr_buffer = indptr,
+                        paged_kv_indices_buffer = indices,
+                        paged_kv_last_page_len_buffer = last_page_len,
+                    ),
+                    "npages": npages,
+                    "indices": indices,
+                    "indptr": indptr,
+                    "last_page_len": last_page_len,
+                    "stage": torch.empty(R * npages, dtype = torch.int32, device = dev),
+                    "ptrs": (indptr.data_ptr(), last_page_len.data_ptr(), indices.data_ptr()),
+                }
+                self.fi_decode_rows[key] = entry
+
+            total = self._fi_batch_meta(entry, kv_lens, rows, entry["npages"], page)
+            entry["wrapper"].plan(
+                indptr = entry["indptr"],
+                indices = entry["stage"][:total],
+                last_page_len = entry["last_page_len"],
+                num_qo_heads = nq,
+                num_kv_heads = nkv,
+                head_dim = hd,
+                page_size = page,
+                pos_encoding_mode = "NONE",
+                window_left = window_left,
+                logits_soft_cap = None,
+                sm_scale = scale,
+                q_data_type = torch.half,
+                kv_data_type = k_cache_dev.dtype,
+                disable_split_kv = os.environ.get("EXL2_FI_SPLITKV", "1") == "0",
+            )
+        finally:
+            torch.cuda.set_stream(prev_stream)
+            torch.cuda.set_device(prev_dev)
+        return True
+
+    def fi_decode_rows_run(self, key, q: torch.Tensor, k_cache_dev: torch.Tensor, v_cache_dev: torch.Tensor):
+        """Capturable batched per-row verify attention. ``(B, q_len, H, D)`` query ->
+        ``(B, q_len, H * D)`` output (request order (b, i) matches the plan)."""
+        entry = self.fi_decode_rows[key]
+        page = self.FI_DECODE_PAGE
+        nkv = k_cache_dev.shape[2]
+        hd = q.shape[3]
+        B, q_len = q.shape[0], q.shape[1]
+        k_pages = k_cache_dev.view(-1, page, nkv, hd)
+        v_pages = v_cache_dev.view(-1, page, nkv, hd)
+        out = entry["wrapper"].run(q.view(B * q_len, q.shape[2], hd), (k_pages, v_pages))
+        return out.view(B, q_len, q.shape[2] * hd)
 
     def _fi_guard(self, phase: str, kv_len: int, q_len: int):
         """
@@ -507,7 +653,8 @@ class TPContext:
         torch.cuda.synchronize()
         bad = []
         reuse = []
-        for kind, d in (("decode", self.fi_decode), ("prefill", self.fi_prefill)):
+        for kind, d in (("decode", self.fi_decode), ("prefill", self.fi_prefill),
+                        ("rows", self.fi_decode_rows)):
             for key, entry in d.items():
                 npages = entry["npages"]
                 ind = entry["indptr"]
@@ -519,21 +666,35 @@ class TPContext:
                 if "ptrs" in entry and entry["ptrs"] != ptrs:
                     reuse.append((kind, key, entry["ptrs"], ptrs))
                     continue
-                meta = torch.cat([ind, lpl, idx[:1], idx[-1:]]).cpu()
+                # Batch size: decode key (..., B); prefill/rows key (..., q_len, B).
+                B = key[-1]
+                nreq = len(lpl)
+                meta = torch.cat([ind, lpl]).cpu()
+                ip = meta[:nreq + 1].tolist()
+                lp = meta[nreq + 1:].tolist()
                 if kind == "prefill":
+                    q_len = key[6]
                     qo = entry["qo_indptr"].cpu()
-                    if int(qo[0]) != 0 or int(qo[1]) != key[-1]:
+                    want_qo = [i * q_len for i in range(B + 1)]
+                    if qo.tolist() != want_qo:
                         bad.append((kind, key, "qo_indptr", entry["qo_indptr"].data_ptr(),
-                                    qo.tolist(), [0, key[-1]]))
-                if int(meta[0]) != 0 or not (1 <= int(meta[1]) <= npages):
-                    bad.append((kind, key, "indptr", ind.data_ptr(),
-                                meta[:2].tolist(), [0, f"1..{npages}"]))
-                if not (1 <= int(meta[2]) <= 128):
-                    bad.append((kind, key, "last_page_len", lpl.data_ptr(),
-                                [int(meta[2])], "1..128"))
-                if int(meta[3]) != 0 or int(meta[4]) != npages - 1:
-                    bad.append((kind, key, "indices", idx.data_ptr(),
-                                [int(meta[3]), int(meta[4])], [0, npages - 1]))
+                                    qo.tolist(), want_qo))
+                # Bounds are per-REQUEST (rows wrappers serve B*q_len requests) and
+                # per-BUFFER (indices address cache rows via row_map, so values can
+                # exceed B*npages when the batch is a subset of the allocated rows).
+                ok_ip = (ip[0] == 0 and len(ip) == nreq + 1
+                         and all(1 <= ip[i + 1] - ip[i] <= npages for i in range(nreq))
+                         and ip[-1] <= nreq * npages)
+                if not ok_ip:
+                    bad.append((kind, key, "indptr", ind.data_ptr(), ip,
+                                f"0-start, per-row 1..{npages} pages, total <= {nreq * npages}"))
+                if not all(1 <= x <= 128 for x in lp):
+                    bad.append((kind, key, "last_page_len", lpl.data_ptr(), lp, "1..128"))
+                if ok_ip and ip[-1] > 0:
+                    iv = idx[:ip[-1]].cpu()
+                    if int(iv.min()) < 0 or int(iv.max()) >= idx.numel():
+                        bad.append((kind, key, "indices", idx.data_ptr(),
+                                    [int(iv.min()), int(iv.max())], f"0..{idx.numel() - 1}"))
         ws_bad = []
         for wkey, canary in attn_backend.FlashInferPaged._workspace_canary.items():
             tail = canary[:1024].cpu()
@@ -556,10 +717,15 @@ class TPContext:
         if reuse:
             raise RuntimeError("[fi-guard] FI buffer storage reuse -- cannot repair in place "
                                "(captured graphs hold the old addresses); evidence above")
+        _dicts = {"decode": self.fi_decode, "prefill": self.fi_prefill,
+                  "rows": self.fi_decode_rows}
+        if any(key[-1] > 1 for _, key, _, _, _, _ in bad):
+            raise RuntimeError("[fi-guard] batched FI metadata corruption -- cannot repair "
+                               "without the step's kv_lens/row_map; evidence above")
         for kind, key, name, ptr, got, want in bad:
-            entry = (self.fi_decode if kind == "decode" else self.fi_prefill)[key]
+            entry = _dicts[kind][key]
             if name == "qo_indptr":
-                entry["qo_indptr"].copy_(torch.tensor([0, key[-1]], dtype=torch.int32,
+                entry["qo_indptr"].copy_(torch.tensor([0, key[6]], dtype=torch.int32,
                                                       device=entry["qo_indptr"].device))
             elif name == "indptr":
                 entry["indptr"][0] = 0   # [1] is refreshed by the plan about to run
@@ -648,7 +814,10 @@ class TPContext:
         kv_elements = 0
         for _li in range(cfg.num_hidden_layers):
             _hd, _, _kvh, _full = cfg.get_layer_attn_geometry(_li)
-            _tokens = expect_cache_tokens if (_full or not _ring) else min(_ring, expect_cache_tokens)
+            # Multi-batch: every cache row holds its own ring, so the SWA reservation
+            # scales with max_batch too (full layers scale via expect_cache_tokens).
+            _tokens = expect_cache_tokens if (_full or not _ring) \
+                else min(_ring * self.max_batch, expect_cache_tokens)
             kv_elements += _kvh * _hd * _tokens
         cache_size = 2 * bytes_per_element * kv_elements
         gpu_split = [max(0, gs - int(cache_size * r / 1024**2)) for gs, r in zip(gpu_split, attn_ratio)]
@@ -793,22 +962,36 @@ class TPContext:
         # CUDA kernel can only dereference a pointer into its own device's memory, so a single
         # dev0-resident `pos` made devices 1-3 read garbage -- which silently corrupted the KV
         # write on those devices (the graph-vs-eager divergence at step 2).
-        self.pos = torch.zeros((1,), dtype = torch.int32, device = self.device)
+        # Multi-batch: one position per cache row (pos[b] is sequence b's write position;
+        # rope_ reads past_lens[blockIdx.z], kv_write reads pos[b]). At max_batch == 1 this
+        # is the original (1,) tensor and every legacy fill/read is unchanged.
+        _mb = self.max_batch
+        self.pos = torch.zeros((_mb,), dtype = torch.int32, device = self.device)
         self.pos_tp = {}
         for _dev in devices:
             self.pos_tp[_dev] = self.pos if _dev == self.device else \
-                torch.zeros((1,), dtype = torch.int32, device = _dev)
+                torch.zeros((_mb,), dtype = torch.int32, device = _dev)
 
         # BUG 94: ring-relative KV write position for the sliding-window layers, one per
         # device (same per-device rationale as `pos`). The SWA attention writes its new K/V
         # at ring position `past_len - window_beg` and reads the window from the ring; the
         # absolute `pos` would run off the end of the 1280-deep ring once the sequence
         # grows past it (the 16k prefill/decode crash).
-        self.ring_pos = torch.zeros((1,), dtype = torch.int32, device = self.device)
+        self.ring_pos = torch.zeros((_mb,), dtype = torch.int32, device = self.device)
         self.ring_pos_tp = {}
         for _dev in devices:
             self.ring_pos_tp[_dev] = self.ring_pos if _dev == self.device else \
-                torch.zeros((1,), dtype = torch.int32, device = _dev)
+                torch.zeros((_mb,), dtype = torch.int32, device = _dev)
+
+        # Multi-batch slot mapping: batch row b of a graphed step writes cache row
+        # row_map[b] (the scheduler compacts any active slot subset into the batch).
+        # Identity by default; refreshed before every replay like pos. kv_write reads it
+        # on-device; the FI plans build their page indices from it host-side.
+        self.row_map = torch.arange(_mb, dtype = torch.int32, device = self.device)
+        self.row_map_tp = {}
+        for _dev in devices:
+            self.row_map_tp[_dev] = self.row_map if _dev == self.device else \
+                torch.arange(_mb, dtype = torch.int32, device = _dev)
 
         # Per-device cache_seqlens for flash_attn_with_kvcache, one tensor per device per
         # attention geometry. These live here, not on attn_params, for the same reason `pos` does:
@@ -822,7 +1005,7 @@ class TPContext:
             if self.rank is not None:
                 _sp = [(d, a, b) for d, a, b in _sp if d == self.rank]
             self.past_len_tp[_key] = [
-                torch.zeros((1,), dtype = torch.int32, device = _dev)
+                torch.zeros((_mb,), dtype = torch.int32, device = _dev)
                 for _dev, _, _ in _sp
             ]
 
@@ -830,8 +1013,48 @@ class TPContext:
         """Stable per-device cache_seqlens tensors for this geometry."""
         return self.past_len_tp.get(geometry_key)
 
-    def set_pos(self, value: int):
+    def _fill_vec(self, _t, value):
+        """Write an int scalar (legacy: every entry) or a per-row list into a device
+        position tensor, on the CURRENT stream. The list form writes only the first
+        len(value) entries -- the active batch rows; kernels index by batch row."""
+        if isinstance(value, int):
+            _t.fill_(value)
+        else:
+            n = len(value)
+            stage = getattr(self, "_pos_stage", None)
+            if stage is None or stage.numel() < self.max_batch:
+                stage = self._pos_stage = torch.empty(self.max_batch, dtype = torch.int32)
+            stage[:n].copy_(torch.tensor(value, dtype = torch.int32))
+            _t[:n].copy_(stage[:n], non_blocking = True)
+
+    def _set_vec_all_devs(self, tp_dict, value):
+        """Issue _fill_vec on every device's TP stream and order dev0's graph-launch
+        stream after all of them (the set_pos ordering contract, BUG 43)."""
+        evs = []
+        for _dev, _t in tp_dict.items():
+            with torch.cuda.device(_dev):
+                _s = self.streams_dev[_dev]
+                _prev = torch.cuda.current_stream(_dev)
+                torch.cuda.set_stream(_s)
+                try:
+                    self._fill_vec(_t, value)
+                    _ev = torch.cuda.Event()
+                    _ev.record(_s)
+                    evs.append((_dev, _ev))
+                finally:
+                    torch.cuda.set_stream(_prev)
+        with torch.cuda.device(self.device):
+            _s0 = self.streams_dev[self.device]
+            for _dev, _ev in evs:
+                if _dev == self.device:
+                    continue
+                _s0.wait_event(_ev)
+
+    def set_pos(self, value):
         """Set the device-side sequence position on every TP device, ordered before replay.
+
+        ``value`` is an int (single-sequence legacy path: fills the whole tensor) or a
+        per-batch-row list (multi-batch: pos[b] = sequence b's position).
 
         Each device needs its own copy because the kernels that read it (kv_write and the
         attention mask) run on that device and can only dereference their own memory.
@@ -842,52 +1065,19 @@ class TPContext:
         divergence. Each fill is therefore issued on that device's TP stream and dev0's TP stream
         (the one the graph is launched on) waits on an event recorded after it.
         """
-        evs = []
-        for _dev, _t in self.pos_tp.items():
-            with torch.cuda.device(_dev):
-                _s = self.streams_dev[_dev]
-                _prev = torch.cuda.current_stream(_dev)
-                torch.cuda.set_stream(_s)
-                try:
-                    _t.fill_(value)
-                    _ev = torch.cuda.Event()
-                    _ev.record(_s)
-                    evs.append((_dev, _ev))
-                finally:
-                    torch.cuda.set_stream(_prev)
+        self._set_vec_all_devs(self.pos_tp, value)
 
-        # Make the stream the graph is launched on wait for every fill above.
-        with torch.cuda.device(self.device):
-            _s0 = self.streams_dev[self.device]
-            for _dev, _ev in evs:
-                if _dev == self.device:
-                    continue
-                _s0.wait_event(_ev)
-
-    def set_ring_pos(self, value: int):
+    def set_ring_pos(self, value):
         """BUG 94: like set_pos, but for the SWA ring write position (see ring_pos)."""
-        evs = []
-        for _dev, _t in self.ring_pos_tp.items():
-            with torch.cuda.device(_dev):
-                _s = self.streams_dev[_dev]
-                _prev = torch.cuda.current_stream(_dev)
-                torch.cuda.set_stream(_s)
-                try:
-                    _t.fill_(value)
-                    _ev = torch.cuda.Event()
-                    _ev.record(_s)
-                    evs.append((_dev, _ev))
-                finally:
-                    torch.cuda.set_stream(_prev)
-        with torch.cuda.device(self.device):
-            _s0 = self.streams_dev[self.device]
-            for _dev, _ev in evs:
-                if _dev == self.device:
-                    continue
-                _s0.wait_event(_ev)
+        self._set_vec_all_devs(self.ring_pos_tp, value)
 
-    def fill_tp(self, tensors, value: int):
-        """Fill one int tensor per device with ``value``, ordered before the graph launch.
+    def set_row_map(self, value):
+        """Multi-batch: cache row per batch row, ordered before replay (see row_map)."""
+        self._set_vec_all_devs(self.row_map_tp, value)
+
+    def fill_tp(self, tensors, value):
+        """Fill one int tensor per device with ``value`` (int scalar or per-batch-row
+        list), ordered before the graph launch.
 
         ``tensors`` is a list parallel to ``get_split(BROADCAST_KV)``, i.e. one entry per device
         (entries may be None). These are the ``past_len_tp`` tensors handed to
@@ -907,12 +1097,12 @@ class TPContext:
             with torch.cuda.device(_dev):
                 _s = self.streams_dev.get(_dev)
                 if _s is None:
-                    _t.fill_(value)
+                    self._fill_vec(_t, value)
                     continue
                 _prev = torch.cuda.current_stream(_dev)
                 torch.cuda.set_stream(_s)
                 try:
-                    _t.fill_(value)
+                    self._fill_vec(_t, value)
                     _ev = torch.cuda.Event()
                     _ev.record(_s)
                     evs.append((_dev, _ev))
