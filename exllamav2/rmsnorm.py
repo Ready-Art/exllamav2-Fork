@@ -207,16 +207,28 @@ class ExLlamaV2RMSNorm(ExLlamaV2Module):
 
         # BUG 41: reuse the output buffers instead of allocating 4 tensors per
         # norm per token. See tp_reuse_buffers in tensor_p.py.
+        # BUG 121: separate row-keyed never-evicted graph cache (see linear.py note).
         from exllamav2.tensor_p import tp_reuse_buffers
-        _cache = self.__dict__.get("_tp_out_cache")
-        if _cache is None:
-            _cache = {}
-            self._tp_out_cache = _cache
-        outputs = tp_reuse_buffers(
-            _cache,
-            [(hs.device, hs.shape[0], hs.shape[1], hs.dtype) for hs in hidden_states],
-            eager_large_ok = not self.model.tp_context.graph_mode
-        )
+        if self.model.tp_context.graph_mode:
+            _cache = self.__dict__.get("_tp_out_cache_graph")
+            if _cache is None:
+                _cache = {}
+                self._tp_out_cache_graph = _cache
+            outputs = tp_reuse_buffers(
+                _cache,
+                [(hs.device, hs.shape[0], hs.shape[1], hs.dtype) for hs in hidden_states],
+                key_rows = True
+            )
+        else:
+            _cache = self.__dict__.get("_tp_out_cache")
+            if _cache is None:
+                _cache = {}
+                self._tp_out_cache = _cache
+            outputs = tp_reuse_buffers(
+                _cache,
+                [(hs.device, hs.shape[0], hs.shape[1], hs.dtype) for hs in hidden_states],
+                eager_large_ok = True
+            )
         # BUG 73: C++ takes Sequence[Tensor] for the weights. A rank-local worker has a
         # single-device Parameter, not a per-device list.
         _weights = self.weight if isinstance(self.weight, (list, tuple)) else [self.weight]

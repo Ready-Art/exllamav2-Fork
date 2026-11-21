@@ -444,17 +444,36 @@ class ExLlamaV2Linear(ExLlamaV2Module):
 
         # BUG 41: reuse the output buffers instead of allocating 4 tensors per
         # projection per token. See tp_reuse_buffers in tensor_p.py.
+        # BUG 121: graph mode uses a SEPARATE row-keyed never-evicted cache (mirrors
+        # _bc_cache_graph). The shared realloc cache freed each previous q_len shape's
+        # buffers when the next graph captured (bonus rows=1 -> verify rows=2 -> rows=3),
+        # but earlier graphs bake those addresses; once the allocator recycled the freed
+        # blocks (BUG 120's fresh prefill buffers), graph replays sprayed fp16 GEMM outputs
+        # over live tensors (FI qo_indptr garbage on the second reply). The graph cache is
+        # cleared before each capture (tp_graph.py) so every graph's buffers are pool-owned.
         from exllamav2.tensor_p import tp_reuse_buffers
-        _cache = self.__dict__.get("_tp_out_cache")
-        if _cache is None:
-            _cache = {}
-            self._tp_out_cache = _cache
-        outputs = tp_reuse_buffers(
-            _cache,
-            [(hs.device, hs.shape[0], (b - a) * dim, hs.dtype)
-             for hs, (dev, a, b) in zip(hidden_states, split)],
-            eager_large_ok = not ctx.graph_mode
-        )
+        if ctx.graph_mode:
+            _cache = self.__dict__.get("_tp_out_cache_graph")
+            if _cache is None:
+                _cache = {}
+                self._tp_out_cache_graph = _cache
+            outputs = tp_reuse_buffers(
+                _cache,
+                [(hs.device, hs.shape[0], (b - a) * dim, hs.dtype)
+                 for hs, (dev, a, b) in zip(hidden_states, split)],
+                key_rows = True
+            )
+        else:
+            _cache = self.__dict__.get("_tp_out_cache")
+            if _cache is None:
+                _cache = {}
+                self._tp_out_cache = _cache
+            outputs = tp_reuse_buffers(
+                _cache,
+                [(hs.device, hs.shape[0], (b - a) * dim, hs.dtype)
+                 for hs, (dev, a, b) in zip(hidden_states, split)],
+                eager_large_ok = True
+            )
 
         # BUG 66: C++ takes Sequence[int]; a rank-local worker has a scalar handle.
         _handles = self.q_handle if isinstance(self.q_handle, (list, tuple)) else [self.q_handle]

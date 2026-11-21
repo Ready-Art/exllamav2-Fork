@@ -170,6 +170,14 @@ class TPGraphRunner:
                     getattr(ctx, "_gather_cache_graph", None)):
             if _gc is not None:
                 _gc.clear()
+        # BUG 121: same treatment for the per-module GEMM/norm output graph caches
+        # (linear/rmsnorm _tp_out_cache_graph): clear so each capture allocates fresh
+        # pool-owned buffers. Previously captured graphs keep their own pool memory
+        # alive independently, so dropping their cache entries does not free them.
+        for _m in ctx.model.modules:
+            _gc = getattr(_m, "_tp_out_cache_graph", None)
+            if _gc is not None:
+                _gc.clear()
 
         # BUG 110 (SP multi-device): capture_begin pools allocations on the CURRENT device
         # (dev0) only. In the single-process TP path the step also allocates on dev1-3; without
