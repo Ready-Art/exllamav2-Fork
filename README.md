@@ -58,6 +58,9 @@ architectures are untested here — treat them as experimental and verify correc
   graphs + MTP path at `max_batch_size: 2` (short and 64k context, one prompt at a time); concurrent
   multi-stream load is still being validated. The default remains batch size 1. See
   [Multi-batch](#multi-batch-experimental-mp--mtp).
+- **DFlash block-diffusion drafting is experimental.** Implemented on the MP path (batch size 1)
+  with first end-to-end runs verified on the tested rig; long-context and multi-turn tool-loop
+  validation is in progress. See [DFlash](#dflash-block-diffusion-drafting-experimental-mp).
 
 ## Feedback & contributions
 
@@ -77,6 +80,7 @@ architectures are untested here — treat them as experimental and verify correc
 | **Multi-GPU tensor parallelism (TP)** | Shard one model across GPUs. Single-process TP (`load_tp`, `--gpu_split`) for simplicity. |
 | **Multiprocess backend (MP)** | One worker process per GPU (`TPProcessGroup`) so dispatch overlaps across devices — higher decode throughput than single-process TP. |
 | **MTP speculative decoding** | A Gemma-4 *assistant* drafter proposes a window of tokens; the target verifies them in one forward. Works **with TP and MP** (the drafter gathers the target's sharded K/V). |
+| **DFlash block-diffusion drafting (experimental)** | A [z-lab DFlash](https://huggingface.co/z-lab/gemma-4-31B-it-DFlash) drafter denoises a whole block (anchor + up to 15 mask tokens) in **one parallel pass**, conditioned on the target's hidden states; FlashInfer attention. **MP only**, batch size 1; see [DFlash](#dflash-block-diffusion-drafting-experimental-mp). |
 | **Multi-batch (experimental)** | Slot-based concurrency on the **MP + MTP** path (`TPProcessGroup(max_batch=N)` + `MTPMPBatchDriver`): one cache row per job, batched graphed verify rounds, per-slot append-only prompt caching. Opt-in; see [Multi-batch](#multi-batch-experimental-mp--mtp). |
 | **Gemma-4-31B-IT support** | Text-only. Handles the model's two attention geometries (head_dim 256 sliding / 512 full), `k_eq_v` layers, proportional RoPE and per-layer norms. |
 | **Sliding-window + TP KV cache** | `ExLlamaV2Cache_SWA` / `ExLlamaV2Cache_TP`: ring buffers for sliding layers make long context fit (≈22.5 GB instead of ≈236 GB at 256k for Gemma-4-31B). |
@@ -201,6 +205,35 @@ token that deviates from the cached draft/bonus token triggers a rewind-and-reco
 target probability and deviating tokens are resampled from the target's residual distribution,
 avoiding the SP recommit cost. Greedy MTP matches plain autoregressive generation except for rare
 fp16 near-tie flips between the verify-window and single-token decode attention kernels on long prose.
+
+### DFlash block-diffusion drafting (experimental, MP)
+
+**Status: experimental.** First end-to-end runs are verified on the tested rig (Gemma-4-31B-IT,
+4× RTX 3090 @ 200 W); long-context and multi-turn tool-loop validation is in progress.
+
+[DFlash](https://huggingface.co/z-lab/gemma-4-31B-it-DFlash) (z-lab,
+[paper](https://arxiv.org/abs/2602.06036)) is a block-diffusion drafter: instead of MTP's
+sequential draft steps, it denoises a whole block — one anchor token plus up to 15 mask tokens —
+in **one parallel forward**. It conditions on the target's residual streams at six layers
+(concat → projection → per-layer K/V), so the draft K/V is derived from target hidden states
+captured during prefill/verify; the draft model never re-processes the prompt. Attention is
+FlashInfer paged prefill (sliding layers causal + window, the full layer non-causal within the
+block). Draft cost is ~flat in the window width — that is where DFlash wins over MTP at large
+windows.
+
+- **MP backend only**, `max_batch_size: 1`. The drafter runs on one device (default 0) and needs
+  a full fp16 copy of the target lm_head plus its own position-indexed draft K/V cache: ~6.6 GB
+  extra on the draft device at 32k cache, ~9.2 GB at 160k (fits 24 GB cards, but tight — prefer
+  `cache_size: 32768` unless you need the depth).
+- Same verify/accept protocol as MP MTP (`MTPMPDriver`): every emitted token comes from the
+  target's verified distribution (greedy or probabilistic acceptance), so output stays exactly
+  target-autoregressive. The append-only prompt cache applies too (draft K/V persists per lineage).
+- Through TabbyAPI: `draft_model.draft_mode: dflash` (a DFlash checkpoint is also auto-detected
+  under `mtp` mode). `draft_num_tokens` defaults to the checkpoint's `block_size - 1` (15);
+  smaller windows are supported.
+- exllamav2 side: `DFlashDrafter` (`exllamav2/dflash_drafter.py`) + `TPProcessGroup.enable_mtp`;
+  greedy parity harness in [`mtp/dflash_test.py`](mtp/dflash_test.py) (DFlash greedy must match
+  plain autoregressive output exactly).
 
 ### Multi-batch (experimental, MP + MTP)
 

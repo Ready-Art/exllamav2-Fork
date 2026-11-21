@@ -133,6 +133,18 @@ class ExLlamaV2:
         # eager WITHOUT disabling the decode/bonus graphs (see _tp_graph_step).
         self._tp_graph_verify_failed = False
 
+        # DFlash: module indices whose INPUT residual (= the target decoder
+        # layer's output, the HF hidden_states[layer_id + 1] convention) is
+        # captured when a forward requests return_row_aux. Set by
+        # TPProcessGroup.enable_mtp on every rank, derived from the module keys
+        # (Gemma-4 has attn + mlp + layer_scalar modules per layer, so the tap
+        # for layer L is the index right after its layer_scalar).
+        # None = no DFlash taps configured.
+        self._dflash_aux_taps = None
+        # Grow-only pinned-host staging for the per-chunk aux D2H (DFLASH5.txt:
+        # GPU-resident accumulation OOMed the master on a 71k prefill).
+        self._dflash_aux_staging = None
+
         # Build model
 
         cfg = self.config
@@ -1042,6 +1054,7 @@ class ExLlamaV2:
         loras: list[ExLlamaV2Lora] | None = None,
         return_last_state: bool = False,
         return_row_states: bool = False,
+        return_row_aux: bool = False,
         position_offsets: torch.Tensor | None = None,
         abort_event: threading.Event | None = None,
         cpu_logits: bool = False,
@@ -1119,6 +1132,7 @@ class ExLlamaV2:
                 loras = loras,
                 return_last_state = return_last_state,
                 return_row_states = return_row_states,
+                return_row_aux = return_row_aux,
                 position_offsets = position_offsets,
                 abort_event = abort_event,
                 **kwargs
@@ -1126,6 +1140,8 @@ class ExLlamaV2:
 
             if abort_event and abort_event.is_set(): return
 
+            if return_row_aux:
+                return result.get("logits"), result.get("last_state"), result.get("row_aux")
             if "row_states" in result:
                 return result.get("logits"), result["row_states"]
             elif "last_state" in result:
@@ -1143,6 +1159,7 @@ class ExLlamaV2:
         result = None
         last_state = None
         row_states = None
+        row_aux = None
         _prefill_trace = os.environ.get("EXL2_PREFILL_TRACE", "1") != "0"
 
         chunk_begin = 0
@@ -1268,6 +1285,7 @@ class ExLlamaV2:
                 loras = loras,
                 return_last_state = return_last_state and remaining_q_len <= chunk_size,
                 return_row_states = return_row_states and remaining_q_len <= chunk_size,
+                return_row_aux = return_row_aux,
                 position_offsets = position_offsets,
                 abort_event = abort_event,
                 **kwargs
@@ -1299,6 +1317,25 @@ class ExLlamaV2:
                     r["logits"] = r["logits"].cpu()
                 result = r["logits"] if result is None else torch.cat((result, r["logits"]), dim = 1)
 
+            # DFlash aux: stage THIS chunk to pinned host memory immediately.
+            # GPU-resident accumulation grows linearly with prompt length (71590
+            # tokens = 1.15 GB/rank plus cat transients) and OOMs the master
+            # mid-prefill (DFLASH5.txt). Grow-only model-level staging (the
+            # kv_pack pattern): one ~33 MB D2H per chunk, GPU aux footprint stays
+            # at one chunk. Under seqpar this is the rank's hidden shard; the MP
+            # parent joins the ranks after the pipe. Safe to hand the staging
+            # view out: the pipe pickler copies at send time, and the in-process
+            # master join / feed_context consume it before the next prefill.
+            ca = r.get("row_aux")
+            if ca is not None:
+                stag = self._dflash_aux_staging
+                if stag is None or stag.shape[1] < q_len or stag.shape[-1] != ca.shape[-1]:
+                    stag = torch.empty((bsz, q_len, ca.shape[-1]),
+                                       dtype = ca.dtype, pin_memory = True)
+                    self._dflash_aux_staging = stag
+                stag[:, chunk_begin:chunk_end].copy_(ca, non_blocking = True)
+                row_aux = stag
+
             chunk_begin = chunk_end
             remaining_q_len -= chunk_size
             last_state = r.get("last_state")
@@ -1311,6 +1348,12 @@ class ExLlamaV2:
         if q_len > 64 and self.tp_context is not None and cache is not None:
             self.tp_context._fi_guard("post-prefill", cache.current_seq_len, 0)
 
+        if return_row_aux:
+            if row_aux is not None:
+                # Every chunk's non_blocking D2H must have landed before the
+                # staging buffer leaves for the pipe / parent join.
+                torch.cuda.current_stream().synchronize()
+            return result, last_state, row_aux
         if return_row_states:
             return result, row_states
         if last_state is None:
@@ -1447,6 +1490,7 @@ class ExLlamaV2:
         last_id_only: bool,
         return_last_state: bool = False,
         return_row_states: bool = False,
+        return_row_aux: bool = False,
         row_map = None,
         window_begs = None
     ):
@@ -1479,8 +1523,12 @@ class ExLlamaV2:
         # Graph state mode: 0 = logits only (decode / plain verify), 1 = last row's
         # pre-final-norm state (bonus-commit fallback), 2 = EVERY row's pre-final-norm
         # state (bonus-eliminated verify: the driver seeds the next round's drafter from
-        # the last accepted draft's state, so no separate bonus forward is needed).
-        state_mode = 2 if return_row_states else (1 if return_last_state else 0)
+        # the last accepted draft's state, so no separate bonus forward is needed),
+        # 3 = EVERY row's DFlash aux states (the 6 target-layer residual taps, full
+        # width -- only reached for decode_repl steps, see forward_chunk's gate).
+        state_mode = 3 if return_row_aux else \
+            (2 if return_row_states else (1 if return_last_state else 0))
+        aux_taps = list(self._dflash_aux_taps or []) if state_mode == 3 else []
 
         # The embedding module holds its weight on the CPU (embedding.py:55 keeps it there
         # deliberately), so the token lookup runs on the host and produces a host tensor. Host work
@@ -1579,12 +1627,19 @@ class ExLlamaV2:
             # The bonus graph also returns the pre-final-norm hidden state. The copy into this
             # static buffer is recorded INSIDE the graph, so every replay refreshes it.
             state_buf = None
+            aux_buf = None
             if state_mode == 1:
                 state_buf = torch.empty((batch_size, 1, self.config.hidden_size),
                                         dtype = _h0.dtype, device = ctx.device)
             elif state_mode == 2:
                 state_buf = torch.empty((batch_size, seq_len, self.config.hidden_size),
                                         dtype = _h0.dtype, device = ctx.device)
+            elif state_mode == 3:
+                # DFlash aux: one full-width residual snapshot per tap, in
+                # target_layer_ids order (the caller's feed_context layout).
+                aux_buf = torch.empty((batch_size, seq_len,
+                                       len(aux_taps) * self.config.hidden_size),
+                                      dtype = _h0.dtype, device = ctx.device)
             out = {}
 
             def step_fn():
@@ -1615,11 +1670,19 @@ class ExLlamaV2:
                     # runs -- the same point forward_chunk's eager extract_state_indices clones
                     # at. Mode 1 keeps the last row (bonus commit); mode 2 keeps every row
                     # (bonus-eliminated verify).
-                    if state_mode and idx == self.head_layer_idx - 1:
+                    if state_mode and state_mode != 3 and idx == self.head_layer_idx - 1:
                         if state_mode == 1:
                             state_buf.copy_(x.narrow(-2, -1, 1))
                         else:
                             state_buf.copy_(x)
+                    # DFlash aux taps: same clone point as the eager extraction
+                    # (before module idx runs = after the tapped decoder layer's
+                    # last module). The forward_chunk gate guarantees full width
+                    # here (decode_repl).
+                    if state_mode == 3 and idx in aux_taps:
+                        j = aux_taps.index(idx)
+                        H = self.config.hidden_size
+                        aux_buf[:, :, j * H : (j + 1) * H].copy_(x)
                     if idx == self.head_layer_idx and last_id_only:
                         x = x.narrow(-2, -1, 1)
                     # No safe_move_tensor here: in graph mode the residual stream stays on the
@@ -1661,6 +1724,7 @@ class ExLlamaV2:
                 runner.cache = cache
                 runner.input_buf = input_buf
                 runner.state_buf = state_buf
+                runner.aux_buf = aux_buf
                 # Stage the real inputs so warmup and capture run at the caller's position with the
                 # caller's tokens (the warmup KV writes are idempotent: same rows, same values).
                 stage_inputs(input_buf)
@@ -1888,6 +1952,7 @@ class ExLlamaV2:
         loras: list[ExLlamaV2Lora] | None = None,
         return_last_state: bool = False,
         return_row_states: bool = False,
+        return_row_aux: bool = False,
         position_offsets: torch.Tensor | None = None,
         abort_event: threading.Event | None = None,
         attn_params: ExLlamaV2Attention.Params | ExLlamaV2Attention.PagedParams | None = None,
@@ -1922,6 +1987,14 @@ class ExLlamaV2:
         extract_state_indices = set(extract_state_indices or [])
         if return_last_state or return_row_states:
             extract_state_indices.add(self.head_layer_idx - 1)
+        # DFlash aux taps: the residual BEFORE each tap module runs (= the previous
+        # decoder layer's output, the HF hidden_states[layer_id + 1] convention).
+        # Under seqpar prefill these clones are this rank's hidden shard; the MP
+        # parent joins the ranks along the hidden dim. decode_repl steps (verify)
+        # are full width on every rank.
+        if return_row_aux:
+            assert self._dflash_aux_taps, "return_row_aux requires DFlash aux taps (enable_mtp)"
+            extract_state_indices.update(self._dflash_aux_taps)
         if extract_state_indices:
             r["states"] = {}
 
@@ -1955,13 +2028,24 @@ class ExLlamaV2:
         use_graphs = kwargs.pop("use_graphs", True)
         graph_state = (return_last_state or return_row_states) \
             and extract_state_indices == {self.head_layer_idx - 1}
+        # DFlash aux graphs need FULL-WIDTH taps: decode_repl steps (q_len <= 32)
+        # run the residual replicated, so the captured clones are the complete
+        # hidden state. Seqpar-sharded steps (prefill, or decode_repl disabled)
+        # fall back to the eager extraction, whose per-rank shards the MP parent
+        # joins. graph_state and graph_aux are mutually exclusive by construction.
+        # return_last_state + aux (the heal re-commit) also stays eager: mode 3
+        # captures only the aux taps, not the final-norm state the caller needs.
+        graph_aux = return_row_aux and not return_last_state and (
+            self.tp_context is None
+            or not self.tp_context.seqpar
+            or (self.tp_context.decode_repl and seq_len <= 32))
         if (
             use_graphs
             and self.tp_context is not None
             and cache is not None
             and (seq_len == 1 or graph_verify)
             and not preprocess_only
-            and (not extract_state_indices or graph_state)
+            and (not extract_state_indices or graph_state or graph_aux)
             and not loras
             and not kwargs.get("indexed_embeddings")
             and self.tp_graph is not None
@@ -1971,7 +2055,8 @@ class ExLlamaV2:
             graph_runner = self._tp_graph_step(
                 input_ids, cache, attn_params, past_len, batch_size, seq_len, last_id_only,
                 return_last_state = graph_state and return_last_state,
-                return_row_states = graph_state and return_row_states
+                return_row_states = graph_state and return_row_states,
+                return_row_aux = graph_aux
             )
             if graph_runner is not None:
                 # The graph wrote its logits into the runner's static buffer; hand it back.
@@ -1982,6 +2067,8 @@ class ExLlamaV2:
                         r["row_states"] = graph_runner.state_buf
                     else:
                         r["last_state"] = graph_runner.state_buf
+                if graph_aux:
+                    r["row_aux"] = graph_runner.aux_buf
 
         if graph_runner is None:
 
@@ -2041,6 +2128,13 @@ class ExLlamaV2:
                 if preprocess_only and idx == self.last_kv_layer_idx:
                     x = None
                     break
+
+            # DFlash aux: concatenate the tap snapshots in target_layer_ids order.
+            # Seqpar prefill: each clone is this rank's hidden shard, so the result
+            # is (B, rows, n_features * hidden_local) -- the MP parent joins ranks.
+            if return_row_aux:
+                r["row_aux"] = torch.cat(
+                    [r["states"][t] for t in self._dflash_aux_taps], dim = -1)
 
         # Advance cache
 

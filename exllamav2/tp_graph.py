@@ -92,10 +92,12 @@ class TPGraphRunner:
         # Change98: per-runner static buffers. The graph holds their addresses, so they are
         # allocated once at capture and never reallocated. input_buf is the staged embedding;
         # logits is the capture-time output tensor the graph rewrites on every replay;
-        # state_buf (MTP bonus graph only) receives the pre-final-norm hidden state.
+        # state_buf (MTP bonus graph only) receives the pre-final-norm hidden state;
+        # aux_buf (DFlash verify graph only) receives the per-row target-layer aux states.
         self.input_buf = None
         self.logits = None
         self.state_buf = None
+        self.aux_buf = None
 
     def capture(self):
         """
@@ -292,6 +294,7 @@ class TPGraphRunner:
         self.input_buf = None
         self.logits = None
         self.state_buf = None
+        self.aux_buf = None
 
     def replay(self):
         if self.num_replays == 0:

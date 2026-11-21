@@ -67,10 +67,17 @@ class MTPMPDriver:
         self.d = drafter
         self.window = int(window)
         self.verbose = verbose
+        # DFlash drafter: same round protocol (bonus-eliminated mode B), but the
+        # drafter conditions on target aux states (context K/V) instead of a
+        # hidden-state seed + gathered target K/V. The branch points below are
+        # guarded by this flag; the MTP path is unchanged when it is False.
+        self._dflash = getattr(drafter, "is_dflash", False)
         # Self-healing (Change95 §12): the prefill state can be corrupted (BUG 90a);
         # re-committing the boundary token -- and doing so again at every round via
         # the bonus commit -- escapes it. SP validation ran with token_healing=True.
-        self.heal = heal
+        # DFlash REQUIRES heal: the mode-A anchor re-feed needs the fresh aux row
+        # the heal re-commit produces (and the prefill aux can be corrupted too).
+        self.heal = True if self._dflash else heal
         self.tokens: list[int] = []
         self.state = None            # (base_tok (1,1) cpu, base_state (1,1,H) cpu, base_pos)
         self.base_logits = None      # (1,1,vocab) cpu fp32, predicts base_pos+1
@@ -83,7 +90,10 @@ class MTPMPDriver:
         # state of the last COMMITTED token (cache.current_seq_len - 1) -- the drafter's
         # (stale) state seed while a bonus is pending. expected_pos is the cache position
         # the next round must start at; any deviation triggers the re-commit fallback.
-        self._bonus_elim = os.environ.get("EXL2_MTP_BONUS_ELIM", "1") != "0"
+        # DFlash always runs bonus-eliminated (the anchor IS the pending bonus;
+        # the legacy bonus-forward protocol has no aux-state counterpart).
+        self._bonus_elim = True if self._dflash \
+            else os.environ.get("EXL2_MTP_BONUS_ELIM", "1") != "0"
         self.pending_bonus = None    # int token id decided but not yet KV-committed
         self.last_state = None       # (1,1,H) cpu, state of token at expected_pos-1
         self.expected_pos = 0
@@ -101,13 +111,23 @@ class MTPMPDriver:
         self.t_accept = 0.0    # probabilistic acceptance (dense probs + residual sampling)
 
     # ------------------------------------------------------------------ begin
-    def begin(self, prompt_ids: torch.Tensor, prefill_logits, prefill_state):
+    def begin(self, prompt_ids: torch.Tensor, prefill_logits, prefill_state,
+              aux=None, aux_p0: int = 0):
         """Seed the base from a prefill ``forward_state`` result.
 
         ``pg.forward_state(prompt_ids, ...)`` caches the whole prompt and returns the
         last prompt token's logits (predicting position ``n_prompt``) and its
         pre-final-norm state -- exactly the first round's base, at no extra forward.
+
+        DFlash: ``aux`` is the prefill's (rows, n_features*hidden) target aux states
+        for the tokens prefilled THIS job (the whole prompt on a fresh cache, only
+        the new suffix on a prompt-cache hit/restore); ``aux_p0`` is their first
+        absolute position. They become the draft KV context; the heal re-commit
+        then refreshes the boundary token's row.
         """
+        if self._dflash:
+            assert aux is not None, "DFlash begin() requires the prefill aux states"
+            self.d.feed_context(aux, aux_p0)
         self.tokens = prompt_ids[0].tolist()
         n = len(self.tokens)
         # prefill_state is (1, n_prompt, H): the state is captured before the
@@ -148,7 +168,15 @@ class MTPMPDriver:
                 f"{len(self.tokens)}")
         base_tok = torch.tensor([[self.tokens[base_pos]]], dtype=torch.long)
         self.pg.mtp_set_seq_len(base_pos)
-        logits, state = self.pg.forward_state(base_tok, last_id_only=True, cpu_logits=True)
+        if self._dflash:
+            # The re-commit also refreshes the boundary token's draft context K/V
+            # (mtp_set_seq_len trimmed the draft length to base_pos; this feed
+            # overwrites that row and restores ctx_len = base_pos + 1).
+            logits, state, aux = self.pg.forward_state(
+                base_tok, last_id_only=True, cpu_logits=True, return_row_aux=True)
+            self.d.feed_context(aux, base_pos)
+        else:
+            logits, state = self.pg.forward_state(base_tok, last_id_only=True, cpu_logits=True)
         self.state = (base_tok, state.float().cpu(), self.pg.cache.current_seq_len - 1)
         self.base_logits = logits.float().cpu()
         # Re-commit restores an ALIGNED base: no pending bonus, fresh state/logits.
@@ -263,12 +291,17 @@ class MTPMPDriver:
         #   its query at pos+1 over the gathered KV (which ends at pos-1).
         if mode_b:
             base_tok = torch.tensor([[self.pending_bonus]], dtype=torch.long)
-            draft, _ = self.d.draft_window(base_tok, self.last_state, pos + 1, self.window)
+            # DFlash: the anchor IS the pending bonus at pos (its context K/V is
+            # not committed yet); MTP's query sits one position later at pos+1.
+            dpos = pos if self._dflash else pos + 1
+            draft, _ = self.d.draft_window(base_tok, self.last_state, dpos, self.window)
             draft = draft.cpu()                                    # cat with CPU bonus; pipe needs CPU
             verify_ids = torch.cat([base_tok, draft], dim=-1)      # (1, W+1)
         else:
             base_tok, base_state, base_pos = self.state
-            draft, _ = self.d.draft_window(base_tok, base_state, pos, self.window)
+            # DFlash mode A: the anchor is the last COMMITTED token at pos-1.
+            dpos = pos - 1 if self._dflash else pos
+            draft, _ = self.d.draft_window(base_tok, base_state, dpos, self.window)
             draft = draft.cpu()
             verify_ids = draft                                     # (1, W)
         self.total_draft += draft.shape[-1]
@@ -286,7 +319,15 @@ class MTPMPDriver:
         #    return_row_states: per-row pre-final-norm states (graph state mode 2), so the
         #    next round's drafter can seed from the last accepted draft's state.
         #    NOTE: input_ids cross the worker pipes -- they MUST be CPU tensors.
-        if self._bonus_elim:
+        if self._dflash:
+            # DFlash verify: the per-row AUX states (6-layer residual taps) replace
+            # the final-norm states -- they become the next round's draft context.
+            # Already CPU (the pipe boundary copies off the graph's static buffer).
+            vlogits, vaux = self.pg.forward(verify_ids.cpu(), pos, verify_ids.shape[-1],
+                                            1, False, graph_verify = True,
+                                            return_row_aux = True)
+            vstates = None
+        elif self._bonus_elim:
             vlogits, vstates = self.pg.forward(verify_ids.cpu(), pos, verify_ids.shape[-1],
                                                1, False, graph_verify = True,
                                                return_row_states = True)
@@ -392,7 +433,16 @@ class MTPMPDriver:
             #           (row 0 at pos).
             #   mode A: m_acc>0 -> row m_acc-1 (d_{m_acc-1} at pos+m_acc-1); m_acc=0 ->
             #           the aligned base state (token at pos-1, not in this window).
-            if mode_b:
+            if self._dflash:
+                # Feed the accepted rows' aux states into the draft KV context:
+                # mode B = [bonus, accepted drafts] at pos; mode A = the anchor's
+                # stored row + accepted drafts at pos-1. Overwrites the block's
+                # noise K/V; ctx_len lands exactly at rewind_to. No state seed.
+                self.d.feed_verify(vaux, m_acc, pos, mode_b)
+                self.last_state = None
+                committed_tok = draft_flat[m_acc - 1] if m_acc > 0 else \
+                    (int(self.pending_bonus) if mode_b else int(self.tokens[pos - 1]))
+            elif mode_b:
                 self.last_state = vstates[:, m_acc:m_acc + 1, :].float().cpu()
                 committed_tok = draft_flat[m_acc - 1] if m_acc > 0 else int(self.pending_bonus)
             else:

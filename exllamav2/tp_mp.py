@@ -157,14 +157,27 @@ def mp_worker(conn, device, world_size, rank, init_method, uuid_hex, model_dir, 
         try:
             if cmd == "forward":
                 # args: (input_ids, past_len, seq_len, batch_size, last_id_only,
-                #        graph_verify[, return_row_states])
+                #        graph_verify, return_row_states[, return_row_aux])
                 result = _worker_forward(ctx, *args)
                 conn.send(("ok", result))
             elif cmd == "forward-state":
-                # MTP: args: (input_ids, last_id_only, cpu_logits). Fan-out collective:
-                # every rank runs its slice; only rank 0 returns (logits, last_state).
+                # MTP: args: (input_ids, last_id_only, cpu_logits[, return_row_aux]).
+                # Fan-out collective: every rank runs its slice; only rank 0 returns
+                # (logits, last_state[, aux]). DFlash aux shards come from every rank.
                 result = _worker_forward_state(ctx, *args)
                 conn.send(("ok", result))
+            elif cmd == "set-aux-taps":
+                # DFlash: the module indices whose input residual is captured on
+                # return_row_aux forwards. Must match on every rank (the capture is
+                # collective; a divergent tap set would desync the graph state mode).
+                ctx["model"]._dflash_aux_taps = list(args[0])
+                conn.send(("ok", None))
+            elif cmd == "head-shard":
+                # DFlash: this rank's vocab-parallel lm_head shard (CPU fp16), so the
+                # parent can assemble the full head for the drafter's logits GEMM.
+                m = ctx["model"]
+                head = m.modules[m.head_layer_idx]
+                conn.send(("ok", head.linear.weight.detach().cpu()))
             elif cmd == "set-seqlen":
                 # MTP: distributed rewind. All ranks must move current_seq_len together
                 # (the SWA ring shift is a deterministic function of it -- BUG 94).
@@ -267,7 +280,7 @@ def mp_worker(conn, device, world_size, rank, init_method, uuid_hex, model_dir, 
             conn.send(("error", tb))
 
 
-def _worker_forward_state(ctx, input_ids, last_id_only, cpu_logits):
+def _worker_forward_state(ctx, input_ids, last_id_only, cpu_logits, return_row_aux = False):
     """
     MTP: one forward that ALSO returns the pre-final-norm hidden state.
 
@@ -279,6 +292,12 @@ def _worker_forward_state(ctx, input_ids, last_id_only, cpu_logits):
     buffer inside the capture. The returned state/logits are that runner's static
     buffers: callers must consume (copy / serialize) them before the next replay.
     Multi-token state requests (prefill) still take the eager path.
+
+    DFlash (return_row_aux): also return the per-row aux states (the target-layer
+    residual taps, concatenated). Prefill is seqpar-sharded, so EVERY rank returns
+    its (rows, n_features * hidden_local) shard on CPU and the parent joins them;
+    a full-width step (decode_repl) returns rank 0's (rows, n_features * hidden)
+    only. The return is (logits, state, aux) on rank 0, aux-or-None on workers.
     """
     model = ctx["model"]
     cache = ctx["cache"]
@@ -286,9 +305,16 @@ def _worker_forward_state(ctx, input_ids, last_id_only, cpu_logits):
     if input_ids.device.index != dev:
         input_ids = input_ids.to(dev)
     r = model.forward(input_ids, cache = cache, last_id_only = last_id_only,
-                      return_last_state = True, cpu_logits = cpu_logits)
+                      return_last_state = True, cpu_logits = cpu_logits,
+                      return_row_aux = return_row_aux)
     if r is None:
         return None
+    if return_row_aux:
+        logits, state, aux = r
+        aux = aux[0].detach().cpu() if aux is not None else None
+        if ctx["rank"] != 0:
+            return _aux_shard_or_none(model, aux)
+        return (logits, state, aux)
     if isinstance(r, tuple):
         logits, state = r
     else:
@@ -296,6 +322,39 @@ def _worker_forward_state(ctx, input_ids, last_id_only, cpu_logits):
     if ctx["rank"] != 0:
         return None
     return (logits, state)
+
+
+def _aux_shard_or_none(model, aux):
+    """DFlash pipe protocol: a worker pipes its aux shard only when the states are
+    seqpar-sharded (width < n_features * hidden). Full-width steps (decode_repl
+    verify) are rank-0-only -- workers return None and the parent uses rank 0's."""
+    if aux is None:
+        return None
+    full_w = len(model._dflash_aux_taps) * model.config.hidden_size
+    return aux if aux.shape[-1] < full_w else None
+
+
+def _join_aux(aux0, worker_auxes, n_features, hidden_size):
+    """Join the ranks' DFlash aux shards into (rows, n_features * hidden).
+
+    Each rank's tensor is (rows, n_features * hidden_local): the concat of its
+    per-tap hidden shards. Viewing as (rows, n_features, hidden_local) and
+    concatenating along dim 2 in RANK order reconstructs every tap's full hidden
+    state (the RS split assigns contiguous rank-ordered ranges, set_split).
+    Full-width rank-0 states (all workers None) pass through unchanged.
+    """
+    full_w = n_features * hidden_size
+    if all(a is None for a in worker_auxes):
+        assert aux0.shape[-1] == full_w, \
+            f"DFlash aux: rank-0 width {aux0.shape[-1]} != full {full_w}"
+        return aux0
+    parts = [aux0] + list(worker_auxes)
+    rows = aux0.shape[0]
+    shards = [p.view(rows, n_features, p.shape[-1] // n_features) for p in parts]
+    full = torch.cat(shards, dim = 2)
+    assert full.shape[2] == hidden_size, \
+        f"DFlash aux shard join width {full.shape[2]} != hidden {hidden_size}"
+    return full.reshape(rows, full_w)
 
 
 def _worker_kv_slice(ctx, layer_idx, start, end):
@@ -394,7 +453,7 @@ def _worker_kv_pack(ctx, lf, fl0, fl1, ls, sl0, sl1):
 
 
 def _worker_forward(ctx, input_ids, past_len, seq_len, batch_size, last_id_only,
-                    graph_verify = False, return_row_states = False):
+                    graph_verify = False, return_row_states = False, return_row_aux = False):
     """
     Run this rank's share of one forward pass.
 
@@ -411,6 +470,12 @@ def _worker_forward(ctx, input_ids, past_len, seq_len, batch_size, last_id_only,
     the last accepted draft's verify state instead of paying a separate bonus forward.
     Rank 0 returns ``(logits, row_states)``; the other ranks return None. Every rank must
     agree on this flag too -- it changes the captured graph's state mode.
+
+    ``return_row_aux`` (DFlash): return the per-row aux states instead of the final-norm
+    states -- rank 0 ``(logits, aux)`` (aux is (rows, n_features*hidden), CPU); workers
+    their aux shard when seqpar-sharded, else None (see _aux_shard_or_none). The verify
+    window is decode_repl (full width), so this is normally rank-0-only; the graph's aux
+    buffer is static -- the parent consumes it before the next replay.
     """
     model = ctx["model"]
     cache = ctx["cache"]
@@ -427,9 +492,16 @@ def _worker_forward(ctx, input_ids, past_len, seq_len, batch_size, last_id_only,
         last_id_only = last_id_only,
         graph_verify = graph_verify,
         return_row_states = return_row_states,
+        return_row_aux = return_row_aux,
     )
     if r is None:
         return None
+    if return_row_aux:
+        logits, _state, aux = r
+        aux = aux[0].detach().cpu() if aux is not None else None
+        if ctx["rank"] != 0:
+            return _aux_shard_or_none(model, aux)
+        return (logits, aux)
     if return_row_states:
         if ctx["rank"] != 0:
             return None
@@ -721,9 +793,17 @@ class TPProcessGroup:
     def enable_mtp(self, drafter, num_draft_tokens = 6):
         """Attach the MTP drafter so :meth:`forward_state` / :meth:`gather_kv_mtp`
         serve the draft-verify loop. The drafter is a parent-process, single-device
-        model; it reads the target's sharded K/V via :meth:`gather_kv_mtp`."""
+        model; it reads the target's sharded K/V via :meth:`gather_kv_mtp`.
+
+        DFlash drafters (is_dflash) take a different wiring: no K/V shadow (the
+        draft KV is derived from target hidden states, owned by the drafter),
+        aux-tap capture configured on every rank, and a full lm_head copy
+        assembled from the vocab shards for the draft logits GEMM."""
         self.mtp_drafter = drafter
         self.num_speculative_tokens = int(num_draft_tokens)
+        if getattr(drafter, "is_dflash", False):
+            self._enable_dflash(drafter)
+            return
         # Allocate the joined KV shadow NOW, at load time with a clean allocator --
         # not lazily on the first gather after a long prefill (debug10.txt OOM).
         self._mtp_kv = None
@@ -798,18 +878,96 @@ class TPProcessGroup:
                 except Exception:
                     pass
 
-    def forward_state(self, input_ids, last_id_only = True, cpu_logits = True):
+    def _enable_dflash(self, drafter):
+        """DFlash wiring: aux taps on every rank, the full lm_head copy (vocab
+        shards gathered), the drafter's KV allocation, and load-time warmup of
+        the aux path + the drafter's FlashInfer prefill kernels."""
+        assert self.max_batch == 1, "DFlash currently requires max_batch_size 1"
+        # Aux taps: decoder layer L's output is the residual BEFORE the first
+        # module of layer L+1 runs. Derive the indices from the module keys --
+        # Gemma-4 uses THREE modules per layer (attn, mlp, layer_scalar), so a
+        # fixed stride would tap the wrong stream. tap = last module of L, + 1.
+        import re
+        last_of_layer = {}
+        for i, m in enumerate(self.model.modules[: self.model.head_layer_idx]):
+            mt = re.search(r"\.layers\.(\d+)(?:\.|$)", m.key)
+            if mt:
+                last_of_layer[int(mt.group(1))] = i
+        assert all(L in last_of_layer for L in drafter.target_layer_ids), \
+            "DFlash aux taps: target layer modules not found"
+        taps = [last_of_layer[L] + 1 for L in drafter.target_layer_ids]
+        self.model._dflash_aux_taps = taps
+        for device, w in sorted(self.workers.items()):
+            w.send("set-aux-taps", (taps,))
+        for device, w in sorted(self.workers.items()):
+            w.recv()
+
+        # Full lm_head for the draft logits GEMM. Vocab-parallel head: gather every
+        # rank's shard (the VC split assigns contiguous rank-ordered row ranges);
+        # replicated head (EXL2_TP_VOCAB_HEAD=0): the master already holds it all.
+        head_mod = self.model.modules[self.model.head_layer_idx]
+        if getattr(head_mod, "_tp_vocab_parallel", False):
+            shards = [head_mod.linear.weight.detach().cpu()]
+            for device, w in sorted(self.workers.items()):
+                shards.append(w.call("head-shard"))
+            weight = torch.cat(shards, dim = 0)
+        else:
+            weight = head_mod.linear.weight.detach().clone()
+        drafter.set_head(weight, head_mod.padding)
+
+        # Draft KV at LOAD time with a clean allocator (the _alloc_mtp_kv lesson:
+        # lazy allocation after a long prefill OOMs on a fragmented allocator).
+        drafter.alloc_kv(self.max_seq_len)
+        self._mtp_kv = None   # DFlash keeps no MTP gather shadow
+        if os.environ.get("EXL2_VRAM_TRACE", "1") != "0":
+            self._vram_breakdown()
+
+        # Cold-start fix (same pattern as MTP): FlashInfer JIT-compiles each kernel
+        # geometry on first use; pay it at load, not inside the first request.
+        if os.environ.get("EXL2_MTP_WARMUP", "1") != "0":
+            try:
+                import time as _time
+                _t0 = _time.perf_counter()
+                print("[dflash] warmup: pre-compiling FlashInfer kernels "
+                      "(slow only on the very first load)...", flush=True)
+                dummy = torch.tensor([[0, 0]], dtype = torch.long)
+                _logits, _state, _aux = self.forward_state(
+                    dummy, last_id_only = True, cpu_logits = True, return_row_aux = True)
+                drafter.feed_context(_aux, 0)
+                drafter.draft_window(torch.tensor([[0]], dtype = torch.long), None, 2, 1)
+                self.mtp_reset_cache()
+                print(f"[dflash] warmup done in {_time.perf_counter() - _t0:.1f}s", flush=True)
+            except Exception as e:
+                print(f"[dflash] warmup skipped ({type(e).__name__}: {e}); first request "
+                      f"will pay FlashInfer JIT", flush=True)
+                try:
+                    self.mtp_reset_cache()
+                except Exception:
+                    pass
+
+    def forward_state(self, input_ids, last_id_only = True, cpu_logits = True,
+                      return_row_aux = False):
         """Distributed forward that returns ``(logits, last_state)``.
 
         ``last_state`` is the pre-final-norm hidden state of the last processed
         token (what the MTP drafter consumes as its round base). Every rank runs
         the collective; only the master produces the value.
+
+        DFlash (return_row_aux=True): returns ``(logits, last_state, aux)`` where
+        ``aux`` is (rows, n_features * hidden) on CPU -- the ranks' seqpar shards
+        joined along the hidden dim (prefill), or the master's full-width states
+        (decode-shaped steps). Consumed by DFlashDrafter.feed_context.
         """
         for device, w in sorted(self.workers.items()):
-            w.send("forward-state", (input_ids, last_id_only, cpu_logits))
-        out = _worker_forward_state(self.master_ctx, input_ids, last_id_only, cpu_logits)
-        for device, w in sorted(self.workers.items()):
-            w.recv()
+            w.send("forward-state", (input_ids, last_id_only, cpu_logits, return_row_aux))
+        out = _worker_forward_state(self.master_ctx, input_ids, last_id_only, cpu_logits,
+                                    return_row_aux)
+        worker_aux = [w.recv() for _, w in sorted(self.workers.items())]
+        if return_row_aux and out is not None:
+            logits, state, aux0 = out
+            aux = _join_aux(aux0, worker_aux, len(self.model._dflash_aux_taps),
+                            self.config.hidden_size)
+            return logits, state, aux
         return out
 
     def mtp_set_seq_len(self, n):
@@ -820,6 +978,10 @@ class TPProcessGroup:
             w.send("set-seqlen", (n,))
             w.recv()
         self.cache.current_seq_len = n
+        # DFlash: the draft context length tracks the committed target length.
+        # Round rewinds land at or above ctx_len (no-op); external trims shrink it.
+        if getattr(self.mtp_drafter, "is_dflash", False):
+            self.mtp_drafter.trim(n)
 
     def snapshot_prompt_ring(self):
         """Save every rank's SWA ring + window_beg at the current position (the end
@@ -849,6 +1011,10 @@ class TPProcessGroup:
         # the drafter's incremental gather shadow is stale after a rewind -- reset the
         # bookkeeping and re-zero, but KEEP the buffers (post-prefill realloc OOMs)
         self._reset_mtp_kv()
+        # DFlash: the draft KV for the restored prefix is still valid (same lineage,
+        # written when those tokens were first committed); only trim the length.
+        if getattr(self.mtp_drafter, "is_dflash", False):
+            self.mtp_drafter.trim(seq)
         return True
 
     def mtp_reset_cache(self):
@@ -862,6 +1028,9 @@ class TPProcessGroup:
         # reset the MTP gather shadow so the next gather starts fresh -- keep the
         # buffers allocated (freeing them forces a post-prefill realloc; debug10.txt)
         self._reset_mtp_kv()
+        # DFlash: new lineage -- drop the draft context (buffers kept).
+        if getattr(self.mtp_drafter, "is_dflash", False):
+            self.mtp_drafter.reset()
         # a stale disconnect abort from a previous job must not kill this one
         self.abort_flag.clear()
 
@@ -878,13 +1047,20 @@ class TPProcessGroup:
                        for a in m.modules if isinstance(a, ExLlamaV2Attention)
                        and getattr(a, "_o_fp16_row", None) is not None)
             shadow = sum(t.numel() * t.element_size() for t in self._mtp_kv.values()
-                         if torch.is_tensor(t))
+                         if torch.is_tensor(t)) if self._mtp_kv is not None else 0
             draft = 0
             d = self.mtp_drafter
             for obj in [d] + list(getattr(d, "layers", [])):
                 for v in vars(obj).values():
-                    if torch.is_tensor(v):
+                    # CUDA only: the drafter also holds a full CPU embedding copy
+                    # (DFlash/MTP), which must not inflate the GPU attribution.
+                    if torch.is_tensor(v) and v.is_cuda:
                         draft += v.numel() * v.element_size()
+            dflash_kv = 0
+            if getattr(d, "is_dflash", False) and d.k_cache is not None:
+                dflash_kv = sum(t.numel() * t.element_size()
+                                for t in d.k_cache + d.v_cache)
+                draft += dflash_kv
             kv = 0
             for ks in (self.cache.key_states, self.cache.value_states):
                 for t in ks:
@@ -897,7 +1073,8 @@ class TPProcessGroup:
             print(f"[vram] master torch alloc MiB: {per} (reserved dev0="
                   f"{mb(torch.cuda.memory_reserved(0)):.0f})", flush=True)
             print(f"[vram] components MiB: o_rs_fp16={mb(o_rs):.0f} mtp_shadow={mb(shadow):.0f} "
-                  f"drafter={mb(draft):.0f} kv_cache={mb(kv):.0f}", flush=True)
+                  f"drafter={mb(draft):.0f} dflash_kv={mb(dflash_kv):.0f} "
+                  f"kv_cache={mb(kv):.0f}", flush=True)
         except Exception as e:
             print(f"[vram] breakdown skipped ({type(e).__name__}: {e})", flush=True)
 
@@ -1175,7 +1352,7 @@ class TPProcessGroup:
         return st
 
     def forward(self, input_ids, past_len, seq_len, batch_size, last_id_only,
-                graph_verify = False, return_row_states = False):
+                graph_verify = False, return_row_states = False, return_row_aux = False):
         """
         Fan out the step, then run the master's own share.
 
@@ -1194,15 +1371,25 @@ class TPProcessGroup:
         """
         for device, w in sorted(self.workers.items()):
             w.send("forward", (input_ids, past_len, seq_len, batch_size, last_id_only,
-                               graph_verify, return_row_states))
+                               graph_verify, return_row_states, return_row_aux))
 
         # Master's own share, overlapped with the workers.
         logits = _worker_forward(self.master_ctx, input_ids, past_len, seq_len,
-                                 batch_size, last_id_only, graph_verify, return_row_states)
+                                 batch_size, last_id_only, graph_verify, return_row_states,
+                                 return_row_aux)
 
         # Collect the workers' replies so their errors surface here rather than as a hang.
-        for device, w in sorted(self.workers.items()):
-            w.recv()
+        worker_out = [w.recv() for _, w in sorted(self.workers.items())]
+
+        if return_row_aux and logits is not None:
+            # DFlash verify: (logits, aux) with the ranks' shards joined when the
+            # step ran seqpar-sharded (decode_repl off); normally full-width from
+            # the master alone. aux is the verify graph's STATIC buffer, already
+            # copied to CPU by the worker wrapper -- consume before next replay.
+            lg, aux0 = logits
+            aux = _join_aux(aux0, worker_out, len(self.model._dflash_aux_taps),
+                            self.config.hidden_size)
+            return lg, aux
 
         return logits
 
