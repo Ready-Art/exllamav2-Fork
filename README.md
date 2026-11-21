@@ -300,18 +300,23 @@ Measured on **4× RTX 3090 (sm86) on a PCI switch with P2P enabled** (`NCCL_P2P_
 | Plain decode (MP) | ~39 tok/s | ~40 tok/s |
 | **MTP (MP)** | **~40 tok/s** | **~53 tok/s (≈1.35×)** |
 
-The MP decode/verify path now uses a custom **in-graph PCIe P2P collective kernel** for the small
-all-gathers/all-reduces (replacing NCCL's per-op latency on this no-NVLink topology). Recent
-long-context measurements on the same rig: **plain decode ~28.9 tok/s at 122k context**, **MTP
-~55 tok/s at ~1.3k context**, and a **64k-token prefill in ~97 s** (`EXL2_TP_O_RS=1`, the default).
-These are still proof-of-concept numbers with headroom remaining (see Release status).
+The MP decode/verify path uses a custom **in-graph PCIe P2P collective kernel** for the small
+all-gathers/all-reduces (replacing NCCL's per-op latency on this no-NVLink topology), with a
+deferred-ack rendezvous (one graph-start barrier instead of per-op ack spins). Recent
+measurements on the same rig (2026-11-21, via tabbyAPI): **MTP ~68 tok/s at ~1.3k context,
+temperature-1 sampling**, with `draft_num_tokens: 3` and the whole-window drafter CUDA graph
+enabled — launched as `NCCL_P2P_LEVEL=PXB EXL2_MTP_DRAFT_GRAPH=1 python main.py` with
+`gpu_split: [22, 22, 22, 22]`, `cache_size: 32768`, `chunk_size: 2048`, `max_batch_size: 1`.
+Also: **plain decode ~28.9 tok/s at 122k context** and a **64k-token prefill in ~97 s**
+(`EXL2_TP_O_RS=1`, the default). These are still proof-of-concept numbers with headroom
+remaining (see Release status).
 
 MTP acceptance ≈ 2.7 tokens/round on mixed prose, ≈ 3.9 on structured prompts, up to 5–6 on
 arithmetic. Speedups scale with acceptance; long-context (32k/64k) MTP also matches or beats plain
 decode. Numbers vary with prompt, context length and hardware. **Short-context caveat:** at ~512
 tokens of context, MP MTP greedy currently runs *slower* than plain MP decode (~27 vs ~37 tok/s
 measured through TabbyAPI) — the per-round fixed costs (worker-pipe K/V gather/rewind round trips
-and the torch hd512 verify-window attention) dominate when there is little context to amortize
+and the hd512 verify-window attention) dominate when there is little context to amortize
 them over. Reducing those round costs is the main MTP optimization target.
 
 **Sampling caveat:** the numbers above are greedy. On **SP**, under sampling (e.g. temperature 1.0)
