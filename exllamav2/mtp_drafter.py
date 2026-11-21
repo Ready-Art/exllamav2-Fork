@@ -61,21 +61,29 @@ _DRAFTER_VOCAB = 262144
 
 
 def _rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """Weighted RMSNorm over the last dim (fp32 reduce, back to input dtype)."""
-    dtype = x.dtype
-    xf = x.float()
-    var = xf.pow(2).mean(-1, keepdim=True)
-    xf = xf * torch.rsqrt(var + eps)
-    return (xf * weight.float()).to(dtype)
+    """Weighted RMSNorm over the last dim (fp32 reduce, back to input dtype).
+
+    BUG 38 pattern (same fix the target got): the pure-torch fp32 chain was ~8 kernel
+    dispatches per norm; at ~17 norms per draft step that was ~130 dispatches/step of
+    host time, the bulk of the drafter's per-step cost. The fused ext kernel does the
+    identical math (fp32 reduce, single rounding) in one launch.
+    """
+    shape = x.shape
+    x2 = x.reshape(-1, shape[-1])
+    y = torch.empty_like(x2)
+    ext_c.rms_norm(x2, weight, y, eps)
+    return y.view(shape)
 
 
 def _head_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """Per-head RMSNorm. ``x`` is (..., heads, head_dim), ``weight`` is (head_dim,)."""
-    dtype = x.dtype
-    xf = x.float()
-    var = xf.pow(2).mean(-1, keepdim=True)
-    xf = xf * torch.rsqrt(var + eps)
-    return (xf * weight.float()).to(dtype)
+    """Per-head RMSNorm. ``x`` is (..., heads, head_dim), ``weight`` is (heads, head_dim)
+    (the loader repeats the checkpoint's shared (head_dim,) weight, as headnorm.py does)."""
+    if x.dtype != torch.half:
+        x = x.to(torch.half)
+    if not x.is_contiguous():
+        x = x.contiguous()
+    ext_c.head_norm(x, weight, none_tensor, x, eps, True)
+    return x
 
 
 def _gelu_tanh(x: torch.Tensor) -> torch.Tensor:
@@ -93,7 +101,7 @@ class _DrafterLayer:
     sliding_window: int      # 0 for full
     input_ln: torch.Tensor
     q_proj: torch.Tensor     # (num_q*hd, hidden)
-    q_norm: torch.Tensor     # (head_dim,)
+    q_norm: torch.Tensor     # (num_q_heads, head_dim), repeated from the shared (head_dim,)
     o_proj: torch.Tensor     # (hidden, num_q*hd)
     post_attn_ln: torch.Tensor
     pre_ff_ln: torch.Tensor
@@ -287,7 +295,9 @@ class Gemma4AssistantDrafter:
                 sliding_window = 0 if full else self.sliding_window,
                 input_ln = g(f"{prefix}.input_layernorm.weight"),
                 q_proj = g(f"{prefix}.self_attn.q_proj.weight"),
-                q_norm = g(f"{prefix}.self_attn.q_norm.weight"),
+                # head_norm kernel indexes w per head (w + hd*head); repeat the shared
+                # (hd,) checkpoint weight to (nq, hd), exactly as ExLlamaV2HeadNorm.load.
+                q_norm = g(f"{prefix}.self_attn.q_norm.weight").repeat(self.num_q_heads, 1),
                 o_proj = g(f"{prefix}.self_attn.o_proj.weight"),
                 post_attn_ln = g(f"{prefix}.post_attention_layernorm.weight"),
                 pre_ff_ln = g(f"{prefix}.pre_feedforward_layernorm.weight"),
