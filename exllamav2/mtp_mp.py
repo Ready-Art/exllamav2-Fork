@@ -37,8 +37,11 @@ verify window (W+1 rows), so that one forward writes its KV, produces its logits
 state)`` at query position pos+1 -- the state is one position stale (the EAGLE-style
 tradeoff: acceptance may shift, but the emitted distribution stays EXACTLY
 target-autoregressive because acceptance is still probabilistic against the target's
-verified logits). The first round after begin()/re-commit has no pending bonus and
-runs the original W-row protocol with an aligned base state.
+verified logits). The first round after begin()/re-commit is mode B too: step()
+decides the first bonus from the base logits, queues it for emission, and the next
+step()'s verify commits it as row 0 (the exl3 reference always drafts from an
+uncommitted bonus). The legacy W-row mode A survives only for DFlash's anchor
+geometry, EXL2_MTP_BONUS_ELIM=0, and the moved-cache re-commit fallback.
 
 Usage::
 
@@ -221,7 +224,16 @@ class MTPMPDriver:
                     p = self._dense_probs(self.base_logits, settings, tokenizer,
                                           sequence_ids, ban_tokens)
                     self.pending_bonus = self._sample_from(p, _random.random())
-            self._round(settings, tokenizer, sequence_ids, ban_tokens)
+                # This bonus has NOT been emitted yet -- steady-state bonuses are the
+                # last token of the PREVIOUS round's queue, but the first one comes
+                # straight from the base logits. Queue it for emission BEFORE the
+                # round runs (the round executes on the next step()): verify row 0
+                # commits its KV either way, so dropping it from the stream loses the
+                # reply's first token (the thought-channel opener) and desyncs the
+                # emitted text / token history from the cache.
+                self.pending_tokens = [self.pending_bonus]
+            if not self.pending_tokens:
+                self._round(settings, tokenizer, sequence_ids, ban_tokens)
         tok = self.pending_tokens.pop(0)
         self.tokens.append(tok)
         return tok
