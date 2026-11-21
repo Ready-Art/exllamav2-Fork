@@ -922,6 +922,21 @@ class TPProcessGroup:
         if os.environ.get("EXL2_VRAM_TRACE", "1") != "0":
             self._vram_breakdown()
 
+        # VRAM fit check: the drafter stack (~6.4 GB @32k cache) is master-only by
+        # default. On 2-GPU splits the doubled weight shard leaves <1 GB on the
+        # master for prefill transients -> first-chunk OOM. The drafter is fully
+        # device-parameterized; a worker GPU usually has the room. Warn, don't
+        # auto-move (placement stays the user's knob).
+        free_b, _ = torch.cuda.mem_get_info(drafter.dev)
+        if free_b < 1536 * 2**20:
+            best = max(range(torch.cuda.device_count()),
+                       key = lambda i: torch.cuda.mem_get_info(i)[0])
+            best_free = torch.cuda.mem_get_info(best)[0]
+            print(f"[dflash] WARNING: only {free_b / 2**20:.0f} MiB free on "
+                  f"cuda:{drafter.device} after drafter allocation -- prefill may "
+                  f"OOM. Consider draft_device: {best} "
+                  f"({best_free / 2**20:.0f} MiB free there).", flush = True)
+
         # Cold-start fix (same pattern as MTP): FlashInfer JIT-compiles each kernel
         # geometry on first use; pay it at load, not inside the first request.
         if os.environ.get("EXL2_MTP_WARMUP", "1") != "0":

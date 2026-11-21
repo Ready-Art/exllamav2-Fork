@@ -224,7 +224,9 @@ windows.
 - **MP backend only**, `max_batch_size: 1`. The drafter runs on one device (default 0) and needs
   a full fp16 copy of the target lm_head plus its own position-indexed draft K/V cache: ~6.6 GB
   extra on the draft device at 32k cache, ~9.2 GB at 160k (fits 24 GB cards, but tight — prefer
-  `cache_size: 32768` unless you need the depth).
+  `cache_size: 32768` unless you need the depth). **On 2-GPU splits set `draft_device` to a
+  worker GPU (e.g. `1`)** — the master's doubled weight shard otherwise leaves too little room
+  for prefill; a load-time warning points at the freest device if the placement is tight.
 - Same verify/accept protocol as MP MTP (`MTPMPDriver`): every emitted token comes from the
   target's verified distribution (greedy or probabilistic acceptance), so output stays exactly
   target-autoregressive. The append-only prompt cache applies too (draft K/V persists per lineage).
