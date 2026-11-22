@@ -318,6 +318,26 @@ class TPGraphManager:
         self.disabled_reason: str | None = None
         # Set once a capture has failed, so we do not retry (and re-fail) every token.
         self.failed = False
+        # Stable P2P arena epoch per graph shape (see p2p_epoch). Survives runner
+        # drops/clears: a recaptured shape reuses its region instead of leaking one.
+        self._p2p_epochs: dict[tuple, int] = {}
+
+    def p2p_epoch(self, key: tuple, p2p) -> int:
+        """Enter the shape's permanent P2P slot region for warmup + capture.
+
+        First capture of a shape allocates a fresh epoch; every recapture of the
+        same shape reuses it (the old graph was released, so no live graph holds
+        the region's baked addresses). Bounds arena consumption by the number of
+        distinct graph shapes, not the number of captures -- the multi-batch
+        envelope recaptures at job boundaries would otherwise exhaust the arena.
+        """
+        e = self._p2p_epochs.get(key)
+        if e is None:
+            e = p2p.begin_graph()
+            self._p2p_epochs[key] = e
+        else:
+            p2p.begin_graph(e)
+        return e
 
     def key_for(self, batch_size: int, q_len: int, state: int = 0,
                 last_id_only: bool = True) -> tuple:

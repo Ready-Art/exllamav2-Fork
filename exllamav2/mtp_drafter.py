@@ -231,7 +231,17 @@ class Gemma4AssistantDrafter:
         self._b_swa_lens = None
         self._b_wrap_full = None
         self._b_wrap_swa = None
+        self._b_pr_full = None      # per-row A/B wrappers (EXL2_BATCH_DRAFT_PERROW)
+        self._b_pr_swa = None
         self._b_pos = None          # (max_batch,) int32 device frontier positions
+        # Batched whole-window draft graphs (EXL2_MTP_DRAFT_GRAPH=1, multi-batch):
+        # one captured graph per active batch size, same on-device chaining contract
+        # as the scalar draft graph (GPU embed, argmax -> next step, FI paged decode
+        # over the persistent 4-D shadows with one host plan per round). The eager
+        # batch path is host-dispatch-bound exactly like the scalar eager path was.
+        self._b_graphs = {}         # B -> dict(graph, state, id_in, ids, pos, full, swa)
+        self._b_graph_failed = set()  # batch sizes whose capture failed (eager fallback)
+        self._bg_pages = None       # shared page views over the 4-D shadows
 
     # ------------------------------------------------------------------ config
 
@@ -705,6 +715,48 @@ class Gemma4AssistantDrafter:
             k, v = st["ks"], st["vs"]
             wrap = self._b_wrap_swa
             nkv = self.num_kv_heads
+        # A/B knob: per-row B=1 plans/runs instead of one B-row batched run. Isolates
+        # the batched FI decode (kernel or plan metadata) from everything else when
+        # multi-row draft quality degrades. EXL2_BATCH_DRAFT_PERROW=1 enables.
+        if os.environ.get("EXL2_BATCH_DRAFT_PERROW", "0") == "1":
+            import flashinfer
+            from exllamav2 import attn_backend
+            if self._b_pr_full is None:
+                ws = attn_backend.FlashInferPaged._get_workspace(self.dev)
+                self._b_pr_full = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+                    ws, "NHD", backend = "fa2")
+                self._b_pr_swa = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+                    ws, "NHD", backend = "fa2")
+            outs = []
+            for b in range(B):
+                r = self._b_rows[b]
+                if layer.is_full:
+                    wr, lens, nk, hd_, win = (self._b_pr_full, self._b_full_lens,
+                                              self.num_global_kv_heads, self.global_head_dim, -1)
+                    kk, vv = st["kf"], st["vf"]
+                else:
+                    wr, lens, nk, hd_, win = (self._b_pr_swa, self._b_swa_lens,
+                                              self.num_kv_heads, self.head_dim,
+                                              self.sliding_window - 1)
+                    kk, vv = st["ks"], st["vs"]
+                l = max(1, lens[b])
+                pv = (l + page - 1) // page
+                base = r * (kk.shape[1] // page)
+                wr.plan(
+                    indptr = torch.tensor([0, pv], dtype = torch.int32, device = self.dev),
+                    indices = torch.tensor(list(range(base, base + pv)),
+                                           dtype = torch.int32, device = self.dev),
+                    last_page_len = torch.tensor([l - (pv - 1) * page],
+                                                 dtype = torch.int32, device = self.dev),
+                    num_qo_heads = nq, num_kv_heads = nk, head_dim = hd_,
+                    page_size = page, pos_encoding_mode = "NONE", window_left = win,
+                    logits_soft_cap = None, sm_scale = 1.0,
+                    q_data_type = torch.half, kv_data_type = torch.half)
+                kp = kk.view(-1, page, nk, hd_)
+                vp = vv.view(-1, page, nk, hd_)
+                outs.append(wr.run(q[b:b + 1].view(1, nq, hd), (kp, vp)))
+            out = torch.cat(outs, dim = 0)
+            return out.view(B, 1, nq * hd) @ layer.o_proj.t()
         k_pages = k.view(-1, page, nkv, hd)
         v_pages = v.view(-1, page, nkv, hd)
         out = wrap.run(q.view(B, nq, hd), (k_pages, v_pages))   # (B, nq, hd)
@@ -726,8 +778,11 @@ class Gemma4AssistantDrafter:
         return x * layer.layer_scalar
 
     def _step_batch(self, tok: torch.Tensor, state: torch.Tensor,
-                    pos_t: torch.Tensor, first: bool):
-        """One batched draft step. tok (B,1) device ids, state (B,1,backbone)."""
+                    pos_t: torch.Tensor, first: bool,
+                    use_sparse: bool = False, probe: bool = False):
+        """One batched draft step. tok (B,1) device ids, state (B,1,backbone).
+        use_sparse: logits over the sparse head's subset (caller maps argmax back).
+        probe: measure full-vs-sparse argmax agreement on this step's hidden state."""
         if first:
             w = self.t_final_norm.weight
             if w.device != self.dev:
@@ -747,7 +802,12 @@ class Gemma4AssistantDrafter:
             x = self._block_batch(layer, x, pos_t)
         x = _rmsnorm(x, self.final_norm, self.rms_norm_eps)
         next_state = x @ self.post_projection.t()
-        logits = x @ self.head.t()
+        if probe and self.sparse is not None:
+            self.sparse.probe(x)
+        if use_sparse and self.sparse is not None and self.sparse.active:
+            logits = self.sparse.logits(x)               # (B,1,columns)
+        else:
+            logits = x @ self.head.t()
         return logits, next_state
 
     def draft_window_batch(self, base_tok: torch.Tensor, base_state: torch.Tensor,
@@ -764,6 +824,34 @@ class Gemma4AssistantDrafter:
         assert self._b_st is not None, "call gather_target_batch(rows) first"
         window = self.num_draft_tokens if window is None else window
         B = len(self._b_rows)
+        # Sparse head: subset logits + id map for the greedy draft (the batch driver
+        # never needs full logits -- acceptance runs on the TARGET's verified logits).
+        use_sparse = self.sparse is not None and self.sparse.active
+        probe = use_sparse and self.sparse.should_probe()
+        graph = None
+        if (window == self.num_draft_tokens and B not in self._b_graph_failed
+                and os.environ.get("EXL2_MTP_DRAFT_GRAPH", "0") == "1"):
+            graph = self._ensure_draft_graph_batch(B)
+            if graph is not None and probe:
+                # Miss-rate probe: one EAGER first step, dual argmax on the same hidden
+                # states (the scalar graph path's contract). A tripped gate drops the
+                # graphs and falls through to the eager full-head window.
+                with torch.inference_mode(False):
+                    self._b_ensure_wrappers()
+                    self._b_plan()
+                    self._b_ensure_pos(B, pos)
+                tok0 = base_tok.to(self.dev, non_blocking = True).long()
+                st0 = base_state.to(self.dev, non_blocking = True).half()
+                if st0.dim() == 2:
+                    st0 = st0.view(B, 1, -1)
+                self._step_batch(tok0, st0, self._b_pos[:B], first = True,
+                                 use_sparse = False, probe = True)
+                if self.sparse.disabled:
+                    self.invalidate_draft_graph()
+                    graph = None
+                    use_sparse = False
+            if graph is not None:
+                return self._draft_window_graph_batch(B, base_tok, base_state, pos, window)
         # NORMAL tensors: the first call may run inside the loader's InferenceMode
         # (load-time batch warmup), but these wrappers/buffers persist and are mutated
         # in place by every later plan()/fill from the scheduler thread OUTSIDE it.
@@ -771,21 +859,233 @@ class Gemma4AssistantDrafter:
         with torch.inference_mode(False):
             self._b_ensure_wrappers()
             self._b_plan()
-            if self._b_pos is None or self._b_pos.numel() < B:
-                self._b_pos = torch.zeros(max(B, getattr(self.target, "max_batch", B)),
-                                          dtype = torch.int32, device = self.dev)
-            self._b_pos[:B].copy_(torch.tensor(pos, dtype = torch.int32))
+            self._b_ensure_pos(B, pos)
         tok = base_tok.to(self.dev, non_blocking = True).long()
         state = base_state.to(self.dev, non_blocking = True).half()
         if state.dim() == 2:
             state = state.view(B, 1, -1)
         ids = []
         for k in range(window):
-            logits, state = self._step_batch(tok, state, self._b_pos[:B], first = (k == 0))
+            logits, state = self._step_batch(tok, state, self._b_pos[:B], first = (k == 0),
+                                             use_sparse = use_sparse, probe = (probe and k == 0))
             nxt = torch.argmax(logits, dim = -1)         # (B,1)
+            if use_sparse:
+                nxt = self.sparse.map_ids(nxt)
             ids.append(nxt)
             tok = nxt
         return torch.cat(ids, dim = -1).cpu()            # (B, window)
+
+    def _b_ensure_pos(self, B: int, pos: list):
+        """(Re)allocate + fill the eager batch path's device frontier positions.
+        Call under inference_mode(False) (job-thread in-place mutation)."""
+        if self._b_pos is None or self._b_pos.numel() < B:
+            self._b_pos = torch.zeros(max(B, getattr(self.target, "max_batch", B)),
+                                      dtype = torch.int32, device = self.dev)
+        self._b_pos[:B].copy_(torch.tensor(pos, dtype = torch.int32))
+
+    # ------------------------------------------------------------------ batch draft graph
+
+    def _graph_kv_plan_batch(self, B: int, full_lens: list, swa_lens: list):
+        """Host-side per-round plan of the batch graph's two FI wrappers (OUTSIDE the
+        graph). Per-row kv lengths are fixed within a draft window (the drafter writes
+        no K/V), so one plan serves every captured step. plan() copies the dynamic
+        metadata into the fixed buffers provided at construction -- the captured
+        run()'s addresses stay stable (the target's BUG 103 graph contract)."""
+        page = 128
+        ent = self._b_graphs[B]
+        for e, lens, nkv, hd, window in (
+            (ent["full"], full_lens, self.num_global_kv_heads, self.global_head_dim, -1),
+            (ent["swa"], swa_lens, self.num_kv_heads, self.head_dim, self.sliding_window - 1),
+        ):
+            npages = e["npages"]
+            indptr = [0]
+            indices = []
+            lpl = []
+            for r, l in zip(self._b_rows, lens):
+                l = max(1, l)
+                pv = (l + page - 1) // page
+                base = r * npages
+                indices.extend(range(base, base + pv))
+                indptr.append(indptr[-1] + pv)
+                lpl.append(l - (pv - 1) * page)
+            e["wrapper"].plan(
+                indptr = torch.tensor(indptr, dtype = torch.int32, device = self.dev),
+                indices = torch.tensor(indices, dtype = torch.int32, device = self.dev),
+                last_page_len = torch.tensor(lpl, dtype = torch.int32, device = self.dev),
+                num_qo_heads = self.num_q_heads,
+                num_kv_heads = nkv,
+                head_dim = hd,
+                page_size = page,
+                pos_encoding_mode = "NONE",
+                window_left = window,
+                logits_soft_cap = None,
+                sm_scale = 1.0,
+                q_data_type = torch.half,
+                kv_data_type = torch.half,
+            )
+
+    def _block_graph_fi_batch(self, layer: _DrafterLayer, x: torch.Tensor, ent: dict):
+        """One drafter block for the captured batch window: same math as _block_batch,
+        but attention is the graph-safe FI paged-decode run over the persistent 4-D
+        shadows (per-row valid prefixes, fa2 fp16/fp32 softmax) and RoPE reads the
+        per-row frontier positions from the entry's device tensor."""
+        hd = layer.head_dim
+        nq = layer.num_q_heads
+        B = x.shape[0]
+        y = _rmsnorm(x, layer.input_ln, self.rms_norm_eps)
+        q = y @ layer.q_proj.t()
+        q = q.view(B, 1, nq, hd)
+        q = _head_rmsnorm(q, layer.q_norm, self.rms_norm_eps)
+        sin, cos = self._get_rope()[layer.rope_index]
+        ext_c.rope_(q, sin, cos, -1, nq, hd, ent["pos"], True)
+        kf_pages, vf_pages, ks_pages, vs_pages = self._bg_pages
+        if layer.is_full:
+            e, pages = ent["full"], (kf_pages, vf_pages)
+        else:
+            e, pages = ent["swa"], (ks_pages, vs_pages)
+        out = e["wrapper"].run(q.view(B, nq, hd), pages)
+        a = out.view(B, 1, nq * hd) @ layer.o_proj.t()
+        a = _rmsnorm(a, layer.post_attn_ln, self.rms_norm_eps)
+        x = x + a
+        y = _rmsnorm(x, layer.pre_ff_ln, self.rms_norm_eps)
+        gate = y @ layer.gate.t()
+        up = y @ layer.up.t()
+        y = _gelu_tanh(gate) * up
+        y = y @ layer.down.t()
+        y = _rmsnorm(y, layer.post_ff_ln, self.rms_norm_eps)
+        x = x + y
+        return x * layer.layer_scalar
+
+    def _ensure_draft_graph_batch(self, B: int):
+        """Capture the WHOLE W-step draft window for batch size B (lazy, once per B).
+
+        Same contract as the scalar _ensure_draft_graph: GPU-resident embed table,
+        on-device argmax -> next step's index and post-projected state chaining, FI
+        graph-mode batch-decode wrappers with fixed metadata buffers replanned per
+        round outside the graph. Every buffer is process-lifetime-held (the entry
+        dict) or capture-pool-owned (BUG 110/121). The sparse subset is baked at
+        capture; a rebuild/disable invalidates every batch graph explicitly.
+        Capture failure falls back to the eager batch path for this B.
+        """
+        ent = self._b_graphs.get(B)
+        if ent is not None:
+            return ent
+        if B in self._b_graph_failed or self._b_st is None:
+            return None
+        try:
+            import flashinfer
+            from exllamav2 import attn_backend
+            dev = self.dev
+            H = self.backbone_hidden_size
+            W = self.num_draft_tokens
+            page = 128
+            self._ensure_gpu_embed()
+            st = self._b_st
+            kf, vf, ks, vs = st["kf"], st["vf"], st["ks"], st["vs"]
+            if kf.dim() != 4 or kf.shape[1] % page or ks.shape[1] % page:
+                raise RuntimeError(f"batch shadows not 4-D/page-aligned: {tuple(kf.shape)}")
+            if self._bg_pages is None:
+                self._bg_pages = (
+                    kf.view(-1, page, kf.shape[2], kf.shape[3]),
+                    vf.view(-1, page, vf.shape[2], vf.shape[3]),
+                    ks.view(-1, page, ks.shape[2], ks.shape[3]),
+                    vs.view(-1, page, vs.shape[2], vs.shape[3]),
+                )
+            workspace = attn_backend.FlashInferPaged._get_workspace(dev)
+
+            def mk_entry(npages):
+                indptr = torch.zeros(B + 1, dtype = torch.int32, device = dev)
+                indices = torch.empty(B * npages, dtype = torch.int32, device = dev)
+                lpl = torch.zeros(B, dtype = torch.int32, device = dev)
+                return {
+                    "wrapper": flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+                        workspace, "NHD",
+                        use_cuda_graph = True,
+                        backend = "fa2",
+                        paged_kv_indptr_buffer = indptr,
+                        paged_kv_indices_buffer = indices,
+                        paged_kv_last_page_len_buffer = lpl,
+                    ),
+                    "npages": npages,
+                }
+
+            # inference_mode(False): capture may run inside the loader's InferenceMode
+            # (load-time batch warmup); the graph's buffers are mutated in place by
+            # every later replay-stage copy from the scheduler thread OUTSIDE it.
+            with torch.inference_mode(False):
+                ent = {
+                    "graph": None,
+                    "full": mk_entry(kf.shape[1] // page),
+                    "swa": mk_entry(ks.shape[1] // page),
+                    "state": torch.empty((B, 1, H), dtype = torch.half, device = dev),
+                    "id_in": torch.empty((B, 1), dtype = torch.long, device = dev),
+                    "ids": torch.empty((B, W), dtype = torch.long, device = dev),
+                    "pos": torch.zeros((B,), dtype = torch.int32, device = dev),
+                }
+                # Valid (non-degenerate) capture inputs: token 0's embed row, zero
+                # state (RMSNorm eps guards), lengths >= 1 avoid all-masked softmax.
+                ent["id_in"].zero_()
+                ent["state"].zero_()
+                ent["pos"].fill_(1)
+                self._b_graphs[B] = ent
+                self._graph_kv_plan_batch(B, self._b_full_lens, self._b_swa_lens)
+                sparse_at_capture = self.sparse is not None and self.sparse.active
+
+                def window_fn():
+                    tok = ent["id_in"]
+                    state = ent["state"]
+                    for k in range(W):
+                        emb = self._gpu_embed[tok.view(-1)].view(B, 1, H)
+                        y = torch.cat((emb, state), dim = -1)
+                        x = y @ self.pre_projection.t()
+                        for layer in self.layers:
+                            x = self._block_graph_fi_batch(layer, x, ent)
+                        x = _rmsnorm(x, self.final_norm, self.rms_norm_eps)
+                        state = x @ self.post_projection.t()
+                        if sparse_at_capture:
+                            tok = self.sparse.ids[(x @ self.sparse.subset.t()).argmax(dim = -1)]
+                        else:
+                            tok = (x @ self.head.t()).argmax(dim = -1)
+                        ent["ids"][:, k:k + 1].copy_(tok)
+
+                with torch.cuda.device(dev):
+                    s = torch.cuda.Stream(dev)
+                    s.wait_stream(torch.cuda.current_stream(dev))
+                    with torch.cuda.stream(s):
+                        for _ in range(3):
+                            window_fn()
+                    torch.cuda.current_stream(dev).wait_stream(s)
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g, pool = torch.cuda.graph_pool_handle()):
+                        window_fn()
+                ent["graph"] = g
+            print(f"[mtp-drafter] captured {W}-step batch draft window graph (B={B}, "
+                  f"FI paged decode, GPU embed)", flush = True)
+            return ent
+        except Exception as e:
+            self._b_graph_failed.add(B)
+            self._b_graphs.pop(B, None)
+            print(f"[mtp-drafter] batch graph capture failed B={B} "
+                  f"({type(e).__name__}: {e}); eager fallback", flush = True)
+            return None
+
+    def _draft_window_graph_batch(self, B: int, base_tok, base_state, pos: list,
+                                  window: int) -> torch.Tensor:
+        ent = self._b_graphs[B]
+        self._graph_kv_plan_batch(B, self._b_full_lens, self._b_swa_lens)
+        ent["pos"].copy_(torch.tensor(pos, dtype = torch.int32))
+        ent["id_in"].copy_(base_tok.to(self.dev, non_blocking = True).long())
+        state = base_state.to(self.dev, non_blocking = True).half()
+        if state.dim() == 2:
+            state = state.view(B, 1, -1)
+        # First step consumes the target's FINAL-NORMED state; later steps consume
+        # the post-projected state the graph itself chains on-device.
+        w = self.t_final_norm.weight
+        if w.device != self.dev:
+            w = w.to(self.dev, non_blocking = True)
+        ent["state"].copy_(_rmsnorm(state, w, self.t_final_norm.variance_epsilon))
+        ent["graph"].replay()
+        return ent["ids"].cpu()                          # (B, window)
 
     # ------------------------------------------------------------------ draft graph (FI)
 
@@ -1030,6 +1330,12 @@ class Gemma4AssistantDrafter:
 
     def invalidate_draft_graph(self):
         self._draft_graph = None
+        # Batch graphs bake the sparse subset at capture too -- a rebuild/disable
+        # invalidates every batch size's graph (recaptured lazily on the next round).
+        if self._b_graphs:
+            for ent in self._b_graphs.values():
+                ent["graph"] = None
+            self._b_graphs.clear()
 
     # ------------------------------------------------------------------ helpers
 

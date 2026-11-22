@@ -647,8 +647,11 @@ class ExLlamaV2:
         # PCIe P2P small-collective fast path (probed + agreed across ranks; any
         # failure falls back to NCCL). EXL2_TP_P2P=0 forces NCCL.
         from exllamav2.p2p_comm import P2PComm
+        # Arena scales with max_batch: every (B, q_len) graph shape owns a permanent
+        # slot region (~12 slots/graph, stable across recaptures). B=2 keeps the
+        # proven 128; B=4 needs headroom for the 8 decode+verify shapes + eager ops.
         self.tp_context.p2p = P2PComm(rank, self.tp_context.num_devices,
-                                      n_slots = 128 if max_batch > 1 else 64)
+                                      n_slots = 64 if max_batch <= 1 else 64 + 32 * max_batch)
         if self.tp_context.seqpar:
             assert bool(getattr(self.config.arch.lm, "tp_per_layer_geometry", False)), \
                 "EXL2_TP_SEQPAR requires the per-layer-geometry TP path (Gemma-4)"
@@ -1484,6 +1487,39 @@ class ExLlamaV2:
         if planned:
             ctx.fi_decode_order_before_replay()
 
+    def _tp_graph_invalidate_shape(self, batch_size: int, q_len: int):
+        """BUG 117 envelope invalidation scoped to one (B, q_len) graph family.
+
+        Releases every runner of the family (all state modes / last_id_only -- they
+        share the family's FI wrappers) BEFORE dropping those wrappers, so no live
+        graph references freed wrapper buffers (the BUG 117 ordering). Wrapper
+        scoping mirrors _fi_tp_graph_plan_batch's keys:
+
+          * q_len == 1: the 7-tuple fi_decode entries (..., B), shared by the decode
+            and bonus-commit graphs of that batch size.
+          * q_len > 1: fi_prefill / fi_decode_rows entries (..., q_len, B); at B == 1
+            also the 8-tuple per-row fi_decode verify wrappers (..., row, 1). The
+            7-tuple B=1 decode wrappers belong to the (1, 1) family and stay.
+
+        Graphs stay enabled; the family recaptures on demand at the new kv, reusing
+        its stable P2P arena epoch (TPGraphManager.p2p_epoch)."""
+        ctx = self.tp_context
+        for key in list(self.tp_graph.runners.keys()):
+            if key[0] == batch_size and key[1] == q_len:
+                self.tp_graph.runners.pop(key).release()
+        for key in list(ctx.fi_prefill.keys()):
+            if key[-2] == q_len and key[-1] == batch_size:
+                del ctx.fi_prefill[key]
+        for key in list(ctx.fi_decode_rows.keys()):
+            if key[-2] == q_len and key[-1] == batch_size:
+                del ctx.fi_decode_rows[key]
+        for key in list(ctx.fi_decode.keys()):
+            if q_len == 1:
+                if len(key) == 7 and key[-1] == batch_size:
+                    del ctx.fi_decode[key]
+            elif batch_size == 1 and len(key) == 8 and key[-1] == 1:
+                del ctx.fi_decode[key]
+
     def _tp_graph_step(
         self,
         input_ids: torch.Tensor,
@@ -1592,15 +1628,14 @@ class ExLlamaV2:
             _kv = _max_past + seq_len
             _cap_kv = getattr(runner, "capture_kv", 0)
             if _kv > _cap_kv + TP_GRAPH_KV_ENVELOPE or _kv < _cap_kv - TP_GRAPH_KV_ENVELOPE:
-                # Context-regime change: rebuild EVERY graph and FlashInfer graph wrapper at
-                # the new length. Clearing the wrappers too covers both possible bad states
-                # (the capture-baked graph launch and the wrapper's first-plan sizing); all
-                # runners are released first so no live graph still references the freed
-                # wrapper buffers. Graphs stay enabled -- the shapes recapture on demand.
-                self.tp_graph.clear()
-                ctx.fi_decode.clear()
-                ctx.fi_prefill.clear()
-                ctx.fi_decode_rows.clear()
+                # Context-regime change for THIS shape: recapture only its (B, q_len)
+                # family at the new length (graphs stay enabled). The old global clear
+                # thrashed under multi-batch -- concurrent jobs at different context
+                # lengths change the batch composition (and its max kv) at every job
+                # boundary, rebuilding every shape each time. Other shapes keep their
+                # own envelopes, wrappers and P2P arena regions; only the violating
+                # shape's launch is capture-baked at the wrong kv.
+                self._tp_graph_invalidate_shape(batch_size, seq_len)
                 runner = None
 
         def stage_inputs(input_buf):
@@ -1740,12 +1775,17 @@ class ExLlamaV2:
                 else:
                     self._fi_tp_graph_plan(cache, past_len + seq_len, q_len = seq_len)
                 ctx.graph_mode = True
-                # Per-graph P2P slot region: warmup + capture bake slots from a fresh
-                # permanent epoch so this graph never shares arena slots with another
-                # persistent graph (the in-graph clobber bug). Restored to eager (0) after.
+                # Per-graph P2P slot region: warmup + capture bake slots from the
+                # shape's STABLE permanent epoch, so this graph never shares arena
+                # slots with another persistent graph (the in-graph clobber bug) and
+                # a recapture of the same shape reuses its region instead of leaking
+                # a fresh one (arena exhaustion under multi-batch envelope churn).
+                # Restored to eager (0) after.
                 _p2p = getattr(ctx, "p2p", None)
                 if _p2p is not None:
-                    _p2p.begin_graph()
+                    self.tp_graph.p2p_epoch(
+                        self.tp_graph.key_for(batch_size, seq_len, state_mode, last_id_only),
+                        _p2p)
                 try:
                     runner.capture()
                     break

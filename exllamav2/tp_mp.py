@@ -249,6 +249,37 @@ def mp_worker(conn, device, world_size, rank, init_method, uuid_hex, model_dir, 
                 ctx["cache"].seq_lens[args[0]] = 0
                 ctx["cache"].window_begs[args[0]] = 0
                 conn.send(("ok", None))
+            elif cmd == "truncate-row":
+                # Partial prefix reuse: rewind ONE slot to position p (>= its ring
+                # origin). K/V beyond p is ignored until overwritten -- full layers
+                # by seq_len, SWA by the ring fill. No copies, no ring shift.
+                r, p = args
+                assert p >= ctx["cache"].window_begs[r]
+                ctx["cache"].seq_lens[r] = p
+                conn.send(("ok", None))
+            elif cmd == "clone-row":
+                # Shared-prefix prompt cache: copy src row's committed K/V state at
+                # position p into dst row -- full layers [0, p), SWA ring prefix
+                # [0, p - window_begs[src]) at the SAME ring origin. A physical copy
+                # (slots never share live K/V). Bookkeeping adopts the source's origin.
+                src, dst, p = args
+                cache = ctx["cache"]
+                wb = cache.window_begs[src]
+                n = p - wb
+                with torch.inference_mode():
+                    for l in range(len(cache.key_states)):
+                        kc, vc = cache.key_states[l], cache.value_states[l]
+                        if kc is None:
+                            continue
+                        if kc.shape[1] == cache.kv_state_size:
+                            kc[dst, :n].copy_(kc[src, :n])
+                            vc[dst, :n].copy_(vc[src, :n])
+                        else:
+                            kc[dst, :p].copy_(kc[src, :p])
+                            vc[dst, :p].copy_(vc[src, :p])
+                cache.seq_lens[dst] = p
+                cache.window_begs[dst] = wb
+                conn.send(("ok", None))
             elif cmd == "kv-pack-batch":
                 # Multi-batch MTP gather: per-row deltas of both drafter source layers,
                 # packed into one pinned CPU tensor (see _worker_kv_pack_batch).
@@ -875,25 +906,41 @@ class TPProcessGroup:
                 except Exception:
                     pass
 
-        # Multi-batch warmup: pre-capture the B=2 decode graph and JIT the batched
-        # drafter kernels at load, so the first concurrent request doesn't pay for them.
+        # Multi-batch warmup: pre-capture EVERY batch size's decode + verify graphs
+        # and JIT the batched drafter kernels at load, so the first concurrent request
+        # doesn't pay for them. With EXL2_MTP_DRAFT_GRAPH=1 the whole-window batch
+        # draft graph is captured here too (kv-length-safe: replanned per round).
         if self.max_batch > 1 and os.environ.get("EXL2_MTP_WARMUP", "1") != "0":
             try:
                 import time as _time
                 _t0 = _time.perf_counter()
-                print("[mtp] batch warmup: pre-compiling multi-batch kernels...", flush=True)
-                B = min(2, self.max_batch)
-                dummy = torch.zeros((B, 1), dtype = torch.long)
-                self.forward_batch(dummy, [0] * B, list(range(B)), last_id_only = True)
-                self.mtp_set_seq_lens([1] * B + [0] * (self.max_batch - B))
-                self.gather_kv_mtp_batch(list(range(B)))
-                drafter.gather_target_batch(list(range(B)))
-                drafter.draft_window_batch(
-                    torch.zeros((B, 1), dtype = torch.long),
-                    torch.zeros((B, 1, drafter.backbone_hidden_size)),
-                    [1] * B, 1)
-                for r in range(B):
-                    self.mtp_reset_row(r)
+                print("[mtp] batch warmup: pre-compiling multi-batch kernels "
+                      f"(B=1..{self.max_batch})...", flush=True)
+                W = self.num_speculative_tokens
+                draft_graph = os.environ.get("EXL2_MTP_DRAFT_GRAPH", "0") == "1"
+                for B in range(1, self.max_batch + 1):
+                    dummy = torch.zeros((B, 1), dtype = torch.long)
+                    self.forward_batch(dummy, [0] * B, list(range(B)), last_id_only = True)
+                    # Verify shape (B, W+1) with per-row states: captures the round
+                    # graph and JITs the q_len>1 attention kernels (paged prefill +
+                    # batched SWA decode-rows).
+                    self.forward_batch(torch.zeros((B, W + 1), dtype = torch.long),
+                                       [1] * B, list(range(B)), last_id_only = False,
+                                       graph_verify = True, return_row_states = True)
+                    self.mtp_set_seq_lens([1] * B + [0] * (self.max_batch - B))
+                    self.gather_kv_mtp_batch(list(range(B)))
+                    drafter.gather_target_batch(list(range(B)))
+                    drafter.draft_window_batch(
+                        torch.zeros((B, 1), dtype = torch.long),
+                        torch.zeros((B, 1, drafter.backbone_hidden_size)),
+                        [1] * B, 1)
+                    if draft_graph:
+                        drafter.draft_window_batch(
+                            torch.zeros((B, 1), dtype = torch.long),
+                            torch.zeros((B, 1, drafter.backbone_hidden_size)),
+                            [1] * B, W)
+                    for r in range(B):
+                        self.mtp_reset_row(r)
                 print(f"[mtp] batch warmup done in {_time.perf_counter() - _t0:.1f}s",
                       flush=True)
             except Exception as e:
@@ -1553,6 +1600,79 @@ class TPProcessGroup:
         self.cache.window_begs[row] = 0
         self._reset_mtp_kv_row(row)
         self.abort_flag.clear()
+
+    def clone_row(self, src, dst, p):
+        """Shared-prefix prompt cache: copy slot ``src``'s committed K/V state at
+        position ``p`` into slot ``dst`` on EVERY rank (full layers [0, p), SWA ring
+        prefix at src's window origin), then clone the drafter's joined shadow row.
+        A physical copy -- slots never share live K/V afterwards, so the isolation
+        invariant holds. The caller (slot scheduler) runs between rounds, so src's
+        [0, p) prefix is committed and stable.
+
+        The shadow lags the cache by the last round's accepted drafts (gather runs
+        at the pre-verify frontier): clone only up to src's gather frontier and let
+        the next gather_kv_mtp_batch pull the small delta through the normal
+        incremental protocol -- no full-length re-pull across the pipes."""
+        mc = self.cache
+        assert 0 < p <= mc.seq_lens[src], f"clone_row: bad position {p}"
+        wb = mc.window_begs[src]
+        assert p >= wb, f"clone_row: prefix {p} below src ring origin {wb}"
+        for device, w in sorted(self.workers.items()):
+            w.send("clone-row", (src, dst, p))
+        with torch.inference_mode():
+            for l in range(len(mc.key_states)):
+                kc, vc = mc.key_states[l], mc.value_states[l]
+                if kc is None:
+                    continue
+                if kc.shape[1] == mc.kv_state_size:
+                    n = p - wb
+                    kc[dst, :n].copy_(kc[src, :n])
+                    vc[dst, :n].copy_(vc[src, :n])
+                else:
+                    kc[dst, :p].copy_(kc[src, :p])
+                    vc[dst, :p].copy_(vc[src, :p])
+        mc.seq_lens[dst] = p
+        mc.window_begs[dst] = wb
+        st = self._mtp_kv
+        if st is not None and "fls" in st:
+            # Re-zero dst's shadow first (its tail may hold a stale lineage; the
+            # zero-init contract keeps unwritten rows finite), then copy the source's
+            # valid prefix up to its gather frontier.
+            self._reset_mtp_kv_row(dst)
+            f = min(p, st["fls"][src])
+            swb = st["wbs"][src]
+            n = max(0, min(f - swb, st["ks"].shape[1]))
+            with torch.inference_mode():
+                st["kf"][dst, :f].copy_(st["kf"][src, :f])
+                st["vf"][dst, :f].copy_(st["vf"][src, :f])
+                if n > 0:
+                    st["ks"][dst, :n].copy_(st["ks"][src, :n])
+                    st["vs"][dst, :n].copy_(st["vs"][src, :n])
+            st["fls"][dst] = f
+            st["sls"][dst] = f
+            st["wbs"][dst] = swb
+        for device, w in sorted(self.workers.items()):
+            w.recv()
+
+    def truncate_row(self, row, p):
+        """Partial prefix reuse: rewind slot ``row`` to position ``p`` on every rank,
+        keeping its K/V (full layers ignore rows >= p via seq_len; the SWA ring's valid
+        fill shrinks to p - window_beg). The drafter shadow's gather frontiers truncate
+        the same way -- its gathered prefix [0, min(fls, p)) stays valid, so the next
+        gather pulls only the suffix delta. No copies, no ring shift; p must sit inside
+        the live ring (>= window_beg)."""
+        mc = self.cache
+        assert mc.window_begs[row] <= p <= mc.seq_lens[row], \
+            f"truncate_row: bad position {p}"
+        for device, w in sorted(self.workers.items()):
+            w.send("truncate-row", (row, p))
+        mc.seq_lens[row] = p
+        st = self._mtp_kv
+        if st is not None and "fls" in st:
+            st["fls"][row] = min(st["fls"][row], p)
+            st["sls"][row] = min(st["sls"][row], p)
+        for device, w in sorted(self.workers.items()):
+            w.recv()
 
     def snapshot_prompt_ring_row(self, row):
         """Per-slot prompt-boundary ring snapshot (pinned CPU on every rank)."""

@@ -66,9 +66,9 @@ architectures are untested here — treat them as experimental and verify correc
   functional, but they receive far less optimization effort and **will not match the performance
   of the MP + CUDA graphs + MTP path** on the tested rig. Treat them as secondary paths.
 - Only **Gemma-4-31B-IT** has been built and tested end-to-end (see [Release status](#release-status--alphabeta-proof-of-concept)).
-- **Multi-batch (batch > 1) is experimental.** It is implemented and validated on the MP + CUDA
-  graphs + MTP path at `max_batch_size: 2` (short and 64k context, one prompt at a time); concurrent
-  multi-stream load is still being validated. The default remains batch size 1. See
+- **Multi-batch (batch > 1) is experimental.** It is implemented on the MP + CUDA graphs + MTP
+  path and validated under true concurrent load at `max_batch_size: 4` (4× RTX 3090, mixed context
+  lengths, greedy and sampled, shared-prefix KV cloning). The default remains batch size 1. See
   [Multi-batch](#multi-batch-experimental-mp--mtp).
 - **DFlash block-diffusion drafting is experimental.** Implemented on the MP path (batch size 1)
   with first end-to-end runs verified on the tested rig; long-context and multi-turn tool-loop
@@ -251,9 +251,10 @@ windows.
 
 ### Multi-batch (experimental, MP + MTP)
 
-**Status: experimental.** Validated on the tested rig at batch size 2 (short and 64k context,
-one prompt at a time, greedy and sampled); concurrent multi-stream load is still being validated.
-The default is batch size 1, which keeps the single-sequence path unchanged.
+**Status: experimental.** Validated on the tested 4× RTX 3090 rig under true concurrent load at
+batch size 4 (mixed context lengths up to ~15k, greedy and sampled, shared-prefix cloning,
+per-slot prompt-cache continuations). The default is batch size 1, which keeps the
+single-sequence path unchanged.
 
 The MP + MTP path can run several jobs concurrently with `TPProcessGroup(..., max_batch=N)` and
 `MTPMPBatchDriver` (`exllamav2/mtp_mp.py`). Each job owns one **cache row (slot)**:
@@ -261,18 +262,47 @@ The MP + MTP path can run several jobs concurrently with `TPProcessGroup(..., ma
 - Per-row sequence positions / SWA ring origins; the graphed verify window is batched
   (`(B, W+1)` rows, one CUDA graph per batch size) with per-row acceptance, rewind and sampling —
   the same target-autoregressive guarantees as the scalar driver.
+- **Full-batch rounds**: each scheduler step drains every active row's decided tokens (a burst of
+  `m_acc+1` chunks per row), so every verify round runs at the full active batch size. Staggered
+  admissions and variable acceptance cannot desynchronize the rows into solo rounds.
 - The drafter cross-attends to all active rows in one batched FlashInfer decode per draft step.
-- **Per-slot append-only prompt cache**: a job reuses a slot's K/V only when its prompt strictly
-  extends that slot's own lineage (or restores its prompt-boundary ring snapshot); anything else
-  resets the row. Slots never share K/V, so concurrent conversations cannot cross-contaminate.
+  With `EXL2_MTP_DRAFT_GRAPH=1` the whole W-step draft window is a captured CUDA graph per batch
+  size (GPU-resident embed table, on-device argmax/state chaining, per-round FlashInfer plan).
+- **Sparse draft head** (`EXL2_SPARSE_DRAFT_HEAD=<columns>`) works on the batch path too: the
+  frequency subset is rebuilt at job boundaries, baked into the draft graphs, and probe-gated.
+- **Per-slot append-only prompt cache**: a job reuses a slot's K/V when its prompt strictly
+  extends that slot's own lineage, restores its prompt-boundary ring snapshot, or shares a long
+  prefix with it (edited/regenerated turns rewind to the divergence point — a position
+  truncation, no copies).
+- **Cross-slot shared-prefix clone**: a new job whose prompt shares a long prefix with another
+  slot's lineage (e.g. concurrent requests with the same system prompt / document) copies that
+  slot's committed K/V — full layers, SWA ring and the drafter shadow — instead of re-prefilling
+  the prefix. The clone is a physical copy: slots never share live K/V afterwards, so concurrent
+  conversations cannot cross-contaminate. Knobs: `EXL2_BATCH_KV_CLONE=0` disables,
+  `EXL2_BATCH_CLONE_MIN` sets the minimum shared prefix (default 512 tokens).
+- **Context-regime graph management**: a verify graph whose kv length leaves its capture envelope
+  (±2048) is recaptured *per (B, q_len) shape* — other shapes keep their graphs, FlashInfer
+  wrappers and P2P arena regions. Each shape reuses a stable arena epoch across recaptures, so
+  mixed-length concurrency does not exhaust the P2P slot arena.
+- **Threaded acceptance**: the per-row sampler pipeline (the ext kernels release the GIL) runs in
+  a thread pool for penalty-free sampling rows — same kernels, same draw order, same distribution.
 - Prefill is serialized per slot (chunked, with decode rounds interleaved between chunks);
   generation is capped so a verify window always fits inside the cache depth.
+- Progress line every 50 rounds: `[mtp-mp-batch] … acc/round … emit/round … ms/round
+  (gather/draft/verify/accept/rewind) … draft_agree …` (acceptance and draft/target argmax
+  agreement; judge speed by total emitted tokens/s across streams). Measured ~100-110 tok/s
+  **aggregate** across 4 concurrent streams on open-ended essay prompts at temperature 0.7
+  (4× RTX 3090, W=3, `cache_size: 32768`); acceptance-dependent — predictable content and
+  greedy sampling run faster.
 
 VRAM scales linearly with `max_batch`: the KV cache and the joined MTP K/V shadow are allocated
-per row (~5 GB/row at 160k context for Gemma-4-31B on 4 GPUs). On 24 GB cards, batch size 2 fits
-at 160k cache; larger batches need a smaller `cache_size`. Through TabbyAPI, enable it with
-`model.max_batch_size` (see the TabbyAPI fork docs); the exllamav2-side knobs are
-`TPProcessGroup(max_batch=...)` and the `forward_batch` / `gather_kv_mtp_batch` protocol.
+per row (~5 GB/row at 160k context for Gemma-4-31B on 4 GPUs; ~1.2 GB/row at 32k). On 24 GB cards,
+batch size 4 fits at `cache_size: 32768` on 4 GPUs (master ~18.5 GB with the draft graph's embed
+table). **On 2 GPUs each rank holds twice the KV heads**, so halve the per-slot budget again
+(e.g. `cache_size: 8192–16384` for batch 4, or a lower-bpw quant — 6.0 bpw weights alone are
+~11.7 GB/rank on 2 GPUs). Through TabbyAPI, enable it with `model.max_batch_size` (see the
+TabbyAPI fork docs); the exllamav2-side knobs are `TPProcessGroup(max_batch=...)` and the
+`forward_batch` / `gather_kv_mtp_batch` / `clone_row` protocol.
 
 ## Gemma-4-31B-IT
 

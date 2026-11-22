@@ -142,11 +142,21 @@ class P2PComm:
         print(f"[p2p] rank {rank}: PCIe P2P collectives ENABLED "
               f"({self.NSLOTS} x 1 MB slots, world {world})", flush = True)
 
-    def begin_graph(self) -> int:
-        """Start a fresh permanent slot region for a graph capture (warmup + capture
+    def begin_graph(self, epoch: int | None = None) -> int:
+        """Start a permanent slot region for a graph capture (warmup + capture
         share it). Slots are NEVER reused across epochs, so persistent graphs can't
-        clobber each other's baked arena addresses on replay."""
-        self._epoch += 1
+        clobber each other's baked arena addresses on replay.
+
+        A caller recapturing the SAME graph shape passes that shape's stable epoch:
+        the released graph no longer references the region, and the recapture's
+        collective keys map to the same slots, so the region is safely reused.
+        Without this every recapture leaks a fresh region and a multi-batch server
+        (envelope recaptures at job boundaries) exhausts the arena -- _slot returns
+        None and collectives silently drop to NCCL mid-capture."""
+        if epoch is None:
+            self._epoch += 1
+        else:
+            self._epoch = int(epoch)
         return self._epoch
 
     def end_graph(self):

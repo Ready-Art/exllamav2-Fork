@@ -57,6 +57,7 @@ Usage::
 from __future__ import annotations
 
 import os
+import threading
 
 import torch
 
@@ -534,6 +535,89 @@ class MTPMPDriver:
         return s
 
 
+_accept_pool = None
+
+
+def _get_accept_pool():
+    """Thread pool for per-row acceptance precompute. The sampler ext kernels
+    (apply_rep_penalty / sample_probs) wrap their compute in Py_BEGIN_ALLOW_THREADS
+    and torch CPU ops release the GIL during execution, so independent rows truly
+    parallelize -- same kernels, same math, same random-draw ORDER (draws happen in
+    the serial per-row walk, not in the workers), hence the emitted distribution is
+    unchanged. At B=4 the serial accept was ~9 ms/round; threaded it is ~1 ms."""
+    global _accept_pool
+    if _accept_pool is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _accept_pool = ThreadPoolExecutor(
+            max_workers=min(8, os.cpu_count() or 4), thread_name_prefix="mtp-accept")
+    return _accept_pool
+
+
+_accept_tls = threading.local()
+
+
+def _accept_precompute(vl, settings, tokenizer, seq, ban, d, W):
+    """Dense target probs + CDFs for one row's whole verify window, for the
+    penalty-free fast path (probs at row k then do not depend on which earlier
+    drafts were accepted, so all W+1 rows can be computed up front -- and in
+    parallel across slots). Residual CDFs remove the draft's point mass exactly
+    as the serial walk's normalize(max(0, p - q_k)) does.
+
+    PERF: every vocab-sized buffer is THREAD-LOCAL and reused, and every torch op
+    writes via out=. Fresh 1-4 MB allocations per op (stack/cumsum/clone/where)
+    page-fault-serialize the worker threads through the kernel mmap path --
+    measured ~15 ms/round at B=4 with allocations vs ~3 ms with reuse. The
+    non-exotic sampler pipeline is inlined here (eligibility guarantees no
+    penalties/exotic modifiers) to keep the ext call's output buffer reusable;
+    the serial fallback keeps using MTPMPDriver._dense_probs verbatim."""
+    # torch defaults to one intra-op thread per core (32 here); 4 concurrent workers
+    # would oversubscribe 128 OMP threads and spin-contend. 4 threads/worker keeps the
+    # vocab-sized cumsum/div/where glue fast while total threads (4 workers x 4) stay
+    # within the core count. Process-global setting; the scheduler's own CPU torch ops
+    # are tiny and unaffected.
+    torch.set_num_threads(4)
+    from exllamav2.ext import exllamav2_ext as ext_c
+    V = vl.shape[-1]
+    buf = getattr(_accept_tls, "buf", None)
+    if buf is None or buf["P"].shape[0] != W + 1 or buf["P"].shape[1] != V:
+        buf = _accept_tls.buf = {
+            "lg": torch.empty(V, dtype=torch.float32),
+            "out": torch.empty(V, dtype=torch.float32),
+            "P": torch.empty(W + 1, V, dtype=torch.float32),
+            "C": torch.empty(W + 1, V, dtype=torch.float32),
+            "R": torch.empty(W + 1, V, dtype=torch.float32),
+            "RC": torch.empty(W + 1, V, dtype=torch.float32),
+            "idx": torch.arange(W, dtype=torch.long),
+            "meta": torch.empty(0, dtype=torch.bool, device="meta"),
+        }
+    lg, out, P, C, R, RC = (buf["lg"], buf["out"], buf["P"], buf["C"],
+                            buf["R"], buf["RC"])
+    vs = tokenizer.get_vocab_size()
+    for k in range(W + 1):
+        lg.copy_(vl[k])
+        if ban:
+            lg[ban] = -1e30
+        if vs < V:
+            lg[vs:] = float("-inf")
+        ext_c.sample_probs(
+            lg.view(1, 1, V), settings.temperature, settings.top_k, settings.top_p,
+            settings.top_a, settings.min_p, settings.tfs, settings.typical,
+            out.view(1, V), buf["meta"],
+            1.0, settings.min_temp, settings.max_temp, settings.temp_exponent,
+            settings.smoothing_factor)
+        P[k].copy_(out)
+    torch.cumsum(P, dim=-1, out=C)
+    R.copy_(P)
+    # Only the W draft rows carry a point mass to remove; row W is the bonus row
+    # (sampled from C[W], its residual is never used).
+    R[buf["idx"], torch.tensor(d, dtype=torch.long)] = 0.0
+    s = R.sum(dim=-1, keepdim=True)
+    torch.div(R, s, out=R)
+    torch.where(s > 1e-12, R, P, out=R)
+    torch.cumsum(R, dim=-1, out=RC)
+    return P, C, RC
+
+
 class MTPMPBatchDriver:
     """
     Multi-batch MTP driver for the MP slot scheduler: one independent mode-B state
@@ -560,6 +644,24 @@ class MTPMPBatchDriver:
         self.mtp_rounds = 0
         self.mtp_acc = 0
         self.mtp_drafts = 0
+        self.mtp_emitted = 0
+        import time as _time
+        self._time = _time
+        self.t_round = 0.0
+        self.t_gather = 0.0
+        self.t_draft = 0.0
+        self.t_verify = 0.0
+        self.t_accept = 0.0
+        self.t_pre = 0.0
+        self.t_rewind = 0.0
+        # Draft-quality instrument: fraction of draft tokens equal to the target's
+        # argmax on the same verify rows (separates draft degradation from accept math).
+        self.draft_agree_sum = 0
+        self.draft_agree_n = 0
+        # Per-batch-index and per-draft-position split (localizes multi-row bugs).
+        self.agree_bi = {}
+        self.agree_k = [0] * 16
+        self.agree_kn = [0] * 16
 
     # -- per-row lifecycle -------------------------------------------------
 
@@ -568,6 +670,14 @@ class MTPMPBatchDriver:
         """Arm row r after its prefill. ``logits``/``state`` are the prefill's last-row
         outputs (None forces the heal recommit). The first bonus is decided here and
         queued for emission; its KV is committed by the first verify round (mode B)."""
+        # Sparse draft head: count the prompt's tokens and rebuild the subset at this
+        # job boundary (never mid-round). A changed subset invalidates the captured
+        # batch draft graphs; they recapture lazily on the next round. Other active
+        # rows keep decoding -- their pending drafts are just tokens, acceptance is
+        # always against the target's full-head logits.
+        if hasattr(self.drafter, "observe_tokens"):
+            self.drafter.observe_tokens(prompt_ids)
+            self.drafter.refresh_sparse_head()
         n_prompt = prompt_ids.shape[-1]
         tokens = prompt_ids[0].tolist()
         if logits is not None:
@@ -637,8 +747,20 @@ class MTPMPBatchDriver:
     # -- round orchestration -----------------------------------------------
 
     def step_batch(self, active, settings_map, tokenizer, seq_ids_map, ban_map=None):
-        """One scheduler step: pop one decided token per active row, running a shared
-        verify round for the rows whose pending queue ran dry. Returns {row: token}."""
+        """One scheduler step: run a shared verify round for the rows whose pending
+        queue ran dry, then DRAIN every active row's decided tokens. Returns
+        {row: [tokens]} (a burst of m_acc+1 per refreshed row).
+
+        Draining fully (instead of popping one token per step) keeps every row's
+        queue empty at round time, so EVERY round runs at the full active batch
+        size. The old one-token pop desynchronized rows under staggered admission
+        and variable acceptance: queues drifted apart, rounds ran at B~1 in
+        rotation, and the batched verify almost never engaged (measured 83.7 t/s
+        aggregate at 4 streams vs ~68 solo). Bursts of 3-4 chunks per round are
+        imperceptible to streaming clients, and the penalty history is NOW aligned
+        at round time (seq_ids caught up through the full drain -- strictly better
+        than the old pending-queue lag). Stop/max-token truncation discards the
+        burst tail exactly as the old mid-round stops did (overshoot <= W)."""
         need = [r for r in active if not self.rows[r]["pending"]]
         if need:
             self._round(need, settings_map, tokenizer, seq_ids_map, ban_map)
@@ -646,15 +768,17 @@ class MTPMPBatchDriver:
         for r in active:
             row = self.rows[r]
             if row["pending"]:
-                t = row["pending"].pop(0)
-                row["tokens"].append(t)
-                out[r] = t
+                ts = row["pending"]
+                row["pending"] = []
+                row["tokens"].extend(ts)
+                out[r] = ts
         return out
 
     def _round(self, rows, settings_map, tokenizer, seq_ids_map, ban_map):
         pg = self.pg
         cache = pg.cache
         W = self.W
+        _t0 = self._time.perf_counter()
 
         for r in rows:
             row = self.rows[r]
@@ -667,23 +791,134 @@ class MTPMPBatchDriver:
         # Batched gather + draft. Mode-B seed per row: (pending bonus, state of the last
         # COMMITTED token), query at the bonus's OWN position pos over KV ending at
         # pos-1 (exl3: positions = kv_seqlens) -- the scalar driver's geometry.
+        _t = self._time.perf_counter()
         pg.gather_kv_mtp_batch(rows)
         self.drafter.gather_target_batch(rows)
+        self.t_gather += self._time.perf_counter() - _t
         base_tok = torch.tensor([[self.rows[r]["pending_bonus"]] for r in rows],
                                 dtype=torch.long)
         base_state = torch.cat([self.rows[r]["last_state"] for r in rows], dim=0)
+        _t = self._time.perf_counter()
         draft = self.drafter.draft_window_batch(
             base_tok, base_state, list(pos), W)                 # (B, W) CPU
+        self.t_draft += self._time.perf_counter() - _t
 
         # Batched verify: [bonus, drafts] per row. Row 0 commits the bonus KV; rows
         # 1..W write the drafts. vlogits[k] predicts the token after verify row k.
         vids = torch.cat([base_tok, draft], dim=-1)             # (B, W+1)
+        _t = self._time.perf_counter()
         vlogits, vstates = pg.forward_batch(
             vids, pos, rows, last_id_only=False, graph_verify=True,
             return_row_states=True)
         vlogits = vlogits.float().cpu()
+        self.t_verify += self._time.perf_counter() - _t
+        _va = vlogits.argmax(dim=-1)
+        _eq = (draft == _va[:, :W])
+        self.draft_agree_sum += int(_eq.sum())
+        self.draft_agree_n += draft.numel()
+        # XCHECK: run the SCALAR draft path on row 0's shadow (3-D views of the same
+        # gathered K/V, scalar RoPE position) and compare against the batch draft and
+        # the target argmax. scalar==batch!=target -> verify logits wrong at B>1;
+        # scalar==target!=batch -> batch draft compute wrong; all differ -> gather.
+        if os.environ.get("EXL2_BATCH_DRAFT_XCHECK", "0") == "1" and self.mtp_rounds % 25 == 0:
+            d_ = self.drafter
+            st_ = pg._mtp_kv
+            r0 = rows[0]
+            ring_ = st_["ks"].shape[1]
+            sv = (d_.kv_full, d_.kv_full_len, d_.kv_swa, d_.kv_swa_len,
+                  d_.kv_swa_window_beg)
+            d_.kv_full = (st_["kf"][r0], st_["vf"][r0])
+            d_.kv_full_len = cache.seq_lens[r0]
+            d_.kv_swa = (st_["ks"][r0], st_["vs"][r0])
+            d_.kv_swa_len = min(cache.seq_lens[r0] - cache.window_begs[r0], ring_)
+            d_.kv_swa_window_beg = cache.window_begs[r0]
+            try:
+                ids_s, _ = d_.draft_window(base_tok[0:1], base_state[0:1], pos[0], W)
+                print(f"[xcheck] row {r0} scalar={ids_s[0].tolist()} "
+                      f"batch={draft[0].tolist()} target={_va[0, :W].tolist()}",
+                      flush=True)
+            finally:
+                (d_.kv_full, d_.kv_full_len, d_.kv_swa, d_.kv_swa_len,
+                 d_.kv_swa_window_beg) = sv
+            # Solo EAGER verify of row 0 on the same vids/position (the verified B=1
+            # path) vs the batched graphed verify: argmax agreement + max logit diff
+            # separates fp16 near-tie flips (small diff) from a plumbing bug (large).
+            # The KV rewrite is idempotent; restore the row position afterwards.
+            vl_solo = pg.forward_row(r0, vids[0:1], last_id_only=False)
+            pg.mtp_set_seq_len_row(r0, pos[0])
+            vl_solo = vl_solo.float().cpu()[0]
+            _vb = vlogits[0]
+            _diff = (vl_solo - _vb).abs().max().item()
+            _am = int((vl_solo.argmax(dim=-1) == _vb.argmax(dim=-1)).sum())
+            print(f"[xcheck-verify] row {r0} solo-vs-batch argmax {_am}/{W + 1} "
+                  f"maxlogitdiff={_diff:.4f} solo={vl_solo.argmax(dim=-1).tolist()} "
+                  f"batch={_vb.argmax(dim=-1).tolist()}", flush=True)
+            # Force a FULL re-pull of row 0's shadow and diff against the incremental
+            # gather's content: nonzero diff = the incremental multi-row gather left
+            # stale/wrong K/V (the draft reads the shadow; the target reads the cache).
+            _seq0 = cache.seq_lens[r0]
+            _wb0 = cache.window_begs[r0]
+            _swa0 = min(_seq0 - _wb0, st_["ks"].shape[1])
+            _kf_b = st_["kf"][r0, :_seq0].clone()
+            _vf_b = st_["vf"][r0, :_seq0].clone()
+            _ks_b = st_["ks"][r0, :_swa0].clone()
+            _vs_b = st_["vs"][r0, :_swa0].clone()
+            st_["fls"][r0] = 0
+            st_["sls"][r0] = 0
+            st_["wbs"][r0] = _wb0
+            pg.gather_kv_mtp_batch([r0])
+            _dk = (st_["kf"][r0, :_seq0] - _kf_b).abs().max().item()
+            _dv = (st_["vf"][r0, :_seq0] - _vf_b).abs().max().item()
+            _dks = (st_["ks"][r0, :_swa0] - _ks_b).abs().max().item()
+            _dvs = (st_["vs"][r0, :_swa0] - _vs_b).abs().max().item()
+            print(f"[xcheck-gather] row {r0} re-pull diffs K={_dk:.5f} V={_dv:.5f} "
+                  f"Ks={_dks:.5f} Vs={_dvs:.5f} (seq={_seq0} swa={_swa0} wb={_wb0})",
+                  flush=True)
+        for _bi in range(len(rows)):
+            _s, _n = self.agree_bi.get(_bi, (0, 0))
+            self.agree_bi[_bi] = (_s + int(_eq[_bi].sum()), _n + W)
+            for _k in range(W):
+                self.agree_k[_k] += int(_eq[_bi, _k])
+                self.agree_kn[_k] += 1
 
         new_lens = list(cache.seq_lens)
+        _t = self._time.perf_counter()
+        # Parallel acceptance precompute: penalty-free sampling rows have accept probs
+        # that do not depend on the acceptance outcome (no rep-penalty history growth),
+        # so each row's whole (W+1, V) probs + CDFs + residual CDFs can be computed up
+        # front -- in worker threads (the ext sampler releases the GIL). Rows with
+        # penalties/exotic modifiers keep the exact serial walk below. Random draws
+        # stay in the serial per-row walk, in the original order.
+        pre = {}
+        for bi, r in enumerate(rows):
+            st_ = settings_map.get(r)
+            if st_ is None:
+                continue
+            if (st_.token_repetition_penalty != 1.0
+                    or st_.token_frequency_penalty != 0.0
+                    or st_.token_presence_penalty != 0.0
+                    or st_.mirostat or st_.xtc_probability > 0.0
+                    or st_.dry_multiplier > 0.0 or st_.token_bias is not None
+                    or st_.cfg_scale is not None or st_.temperature_last
+                    or st_.smoothing_factor > 0.0):
+                continue
+            seq_ = seq_ids_map.get(r)
+            if seq_ is None:
+                seq_ = torch.zeros((1, 0), dtype=torch.long)
+            ban_ = ban_map.get(r) if ban_map else None
+            pre[bi] = (vlogits[bi], st_, seq_, ban_, draft[bi].tolist())
+        if len(pre) > 1:
+            _pool = _get_accept_pool()
+            _futs = {bi: _pool.submit(_accept_precompute, vl_, st_, tokenizer, seq_, ban_, d_, W)
+                     for bi, (vl_, st_, seq_, ban_, d_) in pre.items()}
+            _tp = self._time.perf_counter()
+            pre = {bi: f.result() for bi, f in _futs.items()}
+            self.t_pre += self._time.perf_counter() - _tp
+        elif len(pre) == 1:
+            bi_, (vl_, st_, seq_, ban_, d_) = next(iter(pre.items()))
+            _tp = self._time.perf_counter()
+            pre = {bi_: _accept_precompute(vl_, st_, tokenizer, seq_, ban_, d_, W)}
+            self.t_pre += self._time.perf_counter() - _tp
         for bi, r in enumerate(rows):
             row = self.rows[r]
             p = pos[bi]
@@ -699,13 +934,44 @@ class MTPMPBatchDriver:
                 while m_acc < W and int(va[m_acc]) == d[m_acc]:
                     m_acc += 1
                 bonus_id = int(va[m_acc])
-                last_state = vstates[bi, m_acc:m_acc + 1].float().cpu()
+                # (1,1,H) -- EVERY stored last_state must be 3-dim: begin_row seeds
+                # (1,1,H), and rounds cat states across rows at different lifecycle
+                # stages. vstates[bi, k:k+1] would drop a dim ((1,H)); homogeneous
+                # batches tolerated it (the drafter reshapes all-2-dim input), but a
+                # freshly admitted row mixed with rounded rows crashed the cat.
+                last_state = vstates[bi:bi + 1, m_acc:m_acc + 1].float().cpu()
+            elif bi in pre:
+                # Fast path: precomputed probs/CDFs (parallel across rows). Same math
+                # and draw order as the serial walk: u_k ~ U[0,1) per draft, residual
+                # draw on the first rejection, one bonus draw on full acceptance.
+                import random as _random
+                res = pre[bi]
+                P, C, RC = res.result() if hasattr(res, "result") else res
+                vocab = vl.shape[-1]
+                m_acc = 0
+                bonus_id = None
+                for k in range(W):
+                    if _random.random() < float(P[k, d[k]]):
+                        m_acc = k + 1
+                        continue
+                    bonus_id = min(int(torch.searchsorted(
+                        RC[k], torch.tensor(_random.random(), dtype=torch.float32)
+                    ).item()), vocab - 1)
+                    last_state = vstates[bi:bi + 1, k:k + 1].float().cpu()
+                    break
+                if bonus_id is None:
+                    bonus_id = min(int(torch.searchsorted(
+                        C[W], torch.tensor(_random.random(), dtype=torch.float32)
+                    ).item()), vocab - 1)
+                    last_state = vstates[bi:bi + 1, W:W + 1].float().cpu()
             else:
                 # BUG 105/106: probabilistic acceptance against the TARGET distribution,
                 # per row -- the scalar mode-B math verbatim. The draft is greedy (point
                 # mass q_k on d[k]): accept with p_target_k(d[k]); on rejection resample
                 # the residual normalize(max(0, p - q_k)). Emitted distribution is exactly
                 # target-autoregressive; draft quality only affects the acceptance RATE.
+                # Serial fallback for penalty/exotic rows: probs at row k depend on the
+                # accepted drafts appended to the penalty history.
                 import random as _random
                 m_acc = 0
                 bonus_id = None
@@ -727,13 +993,13 @@ class MTPMPBatchDriver:
                     s = float(resid.sum())
                     resid = resid / s if s > 1e-12 else probs
                     bonus_id = MTPMPDriver._sample_from(resid, _random.random())
-                    last_state = vstates[bi, k:k + 1].float().cpu()
+                    last_state = vstates[bi:bi + 1, k:k + 1].float().cpu()
                     break
                 if bonus_id is None:
                     pW = MTPMPDriver._dense_probs(vl[W:W + 1].unsqueeze(0), settings,
                                                   tokenizer, seq, ban)
                     bonus_id = MTPMPDriver._sample_from(pW, _random.random())
-                    last_state = vstates[bi, W:W + 1].float().cpu()
+                    last_state = vstates[bi:bi + 1, W:W + 1].float().cpu()
 
             rewind = p + m_acc + 1
             new_lens[r] = rewind
@@ -744,10 +1010,40 @@ class MTPMPBatchDriver:
             self.mtp_acc += m_acc
             self.mtp_drafts += W
 
+        self.t_accept += self._time.perf_counter() - _t
         # One distributed rewind for every row (full layers: bookkeeping only; SWA: the
         # ring fill shrinks, slots beyond it are ignored until overwritten).
+        _t = self._time.perf_counter()
         pg.mtp_set_seq_lens(new_lens)
+        self.t_rewind += self._time.perf_counter() - _t
         self.mtp_rounds += 1
+        self.mtp_emitted += sum(len(self.rows[r]["pending"]) for r in rows)
+        self.t_round += self._time.perf_counter() - _t0
+        # Sparse draft head: count every row's committed tokens (accepted drafts +
+        # bonus) in ONE observation -- the scalar driver's per-round observe, batched.
+        if hasattr(self.drafter, "observe_tokens"):
+            self.drafter.observe_tokens(torch.tensor(
+                [t for r in rows for t in self.rows[r]["pending"]], dtype=torch.long))
+        if self.mtp_rounds % 50 == 0:
+            r = self.mtp_rounds
+            agree = (self.draft_agree_sum / self.draft_agree_n
+                     if self.draft_agree_n else 0.0)
+            bi_str = " ".join(
+                f"bi{b}={s / n:.2f}" for b, (s, n) in sorted(self.agree_bi.items()) if n)
+            k_str = " ".join(
+                f"k{k}={self.agree_k[k] / self.agree_kn[k]:.2f}"
+                for k in range(W) if self.agree_kn[k])
+            print(f"[mtp-mp-batch] {r} rounds B={len(rows)} pre_n={len(pre)} "
+                  f"acc/round={self.mtp_acc / r:.3f} "
+                  f"emit/round={self.mtp_emitted / r:.3f} "
+                  f"ms/round={self.t_round / r * 1000:.2f} "
+                  f"(gather={self.t_gather / r * 1000:.2f} "
+                  f"draft={self.t_draft / r * 1000:.2f} "
+                  f"verify={self.t_verify / r * 1000:.2f} "
+                  f"accept={self.t_accept / r * 1000:.2f} "
+                  f"pre={self.t_pre / r * 1000:.2f} "
+                  f"rewind={self.t_rewind / r * 1000:.2f}) "
+                  f"draft_agree={agree:.3f} [{bi_str}] [{k_str}]", flush=True)
 
     def stats(self):
         return {
