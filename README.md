@@ -219,6 +219,26 @@ target probability and deviating tokens are resampled from the target's residual
 avoiding the SP recommit cost. Greedy MTP matches plain autoregressive generation except for rare
 fp16 near-tie flips between the verify-window and single-token decode attention kernels on long prose.
 
+### GPU count (2 / 3 / 4 validated; 5+ head-count limit)
+
+TP shards the KV heads with a largest-remainder integer split, so **uneven GPU counts work** —
+the per-rank head counts need not be equal. On Gemma-4-31B the two attention geometries split
+independently (e.g. on **3 GPUs**: sliding kv 16 → 6/5/5, full-attention kv 4 → 2/1/1). The MP
+path is validated at **2, 3 and 4 GPUs** (3-GPU load + MTP + multi-batch + prompt-cache offload
+tested coherent and corruption-free; 4-GPU regression clean).
+
+Two uneven-split bugs were fixed for non-power-of-two counts: the device scratch estimate now
+selects each layer's geometry before sizing (it previously estimated with a stale split and
+overflowed at 3 GPUs), and the MTP K/V gather joins each rank's **actual** head width from the
+geometry split rather than assuming `total // world`.
+
+**5+ GPUs are limited by the model's KV-head count:** every rank must hold at least one KV head
+on every layer. Gemma-4's full-attention layers have only **4** KV heads, so across 5 GPUs one
+rank gets zero full-layer heads — the attention path has no KV-head replication for that case,
+so 5 GPUs is **not supported for Gemma-4** (the sliding layers' 16 heads would split fine). A
+model with ≥ `world_size` KV heads on every layer can use 5+ GPUs with the same generic split /
+gather path.
+
 ### DFlash block-diffusion drafting (experimental, MP)
 
 **Status: experimental.** First end-to-end runs are verified on the tested rig (Gemma-4-31B-IT,

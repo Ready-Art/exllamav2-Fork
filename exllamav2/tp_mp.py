@@ -1426,6 +1426,20 @@ class TPProcessGroup:
         st["sls"][r] = 0
         st["wbs"][r] = 0
 
+    def _kv_head_widths(self, layer_idx):
+        """Per-rank KV head counts for one layer, from the target's geometry split.
+
+        The TP cache shards KV heads with integer_split (largest-remainder), so on
+        non-power-of-two GPU counts the ranks hold DIFFERENT widths (Gemma-4 on 3
+        GPUs: full kv 4 -> 2/1/1, SWA kv 16 -> 6/5/5). The MTP gather joins the
+        ranks' actual slices along the head axis, so it must unpack each rank's real
+        width -- not total // world (which only matched when every rank held the
+        same count). A rank absent from the split holds 0 heads of that geometry
+        (e.g. full kv 4 across 5 GPUs -> 1/1/1/1/0); callers use .get(dev, 0)."""
+        hd, qh, kvh, full = self.config.get_layer_attn_geometry(layer_idx)
+        split = self.model.tp_context.geometry_splits[(hd, qh, kvh, full)]["kv"][0]
+        return {dev: b - a for dev, a, b in split}
+
     def gather_kv_mtp(self):
         """Give the drafter the target's last full (59) and sliding (58) K/V, joined
         along the kv-head axis, on the drafter's device.
@@ -1497,11 +1511,12 @@ class TPProcessGroup:
         # tensor (async D2H + single sync); the parent unpacks zero-copy views, joins the
         # ranks along the kv-head axis on CPU (a few KB), and copies straight into the
         # device shadow -- 4 H2D total instead of 8 H2D + 4 device cats + 4 assigns.
-        world = len(self.workers) + 1
-        assert d.num_global_kv_heads % world == 0 and d.num_kv_heads % world == 0, \
-            "kv-pack: kv heads must divide evenly across ranks"
-        fkh = d.num_global_kv_heads // world
-        skh = d.num_kv_heads // world
+        # Per-rank KV head widths (uneven splits on 3/5 GPUs: integer_split gives e.g.
+        # full kv 4 -> 2/1/1, SWA kv 16 -> 6/5/5). The worker packs its ACTUAL slice;
+        # the parent must unpack each rank's real width and join in device order, not
+        # assume total // world. The master (device 0) slice is appended directly.
+        fw = self._kv_head_widths(lf)
+        sw = self._kv_head_widths(ls)
         df = seq_len - st["fl"]
         ds = swa_len - swa_start
         # issue every request first (workers copy in parallel), then collect
@@ -1518,6 +1533,7 @@ class TPProcessGroup:
         for device, w in sorted(self.workers.items()):
             flat = w.recv()
             o = 0
+            fkh, skh = fw.get(device, 0), sw.get(device, 0)
             for rows, kh, hd, acc in ((df, fkh, d.global_head_dim, full_k),
                                       (df, fkh, d.global_head_dim, full_v),
                                       (ds, skh, d.head_dim, swa_k),
@@ -1579,11 +1595,9 @@ class TPProcessGroup:
         st = self._mtp_kv
         assert st is not None and st["kf"].dim() == 4, "batch gather needs max_batch > 1"
         ring = mc.kv_state_size
-        world = len(self.workers) + 1
-        assert d.num_global_kv_heads % world == 0 and d.num_kv_heads % world == 0, \
-            "kv-pack-batch: kv heads must divide evenly across ranks"
-        fkh = d.num_global_kv_heads // world
-        skh = d.num_kv_heads // world
+        # Per-rank KV head widths (uneven splits on 3/5 GPUs); see gather_kv_mtp.
+        fw = self._kv_head_widths(lf)
+        sw = self._kv_head_widths(ls)
 
         specs, meta = [], []
         for r in rows:
@@ -1624,6 +1638,7 @@ class TPProcessGroup:
         for device, w in sorted(self.workers.items()):
             flat = w.recv()
             o = 0
+            fkh, skh = fw.get(device, 0), sw.get(device, 0)
             for bi in range(len(specs)):
                 df, ds = meta[bi][3], meta[bi][4]
                 for rows_n, kh, hd, acc in ((df, fkh, d.global_head_dim, parts[bi][0]),

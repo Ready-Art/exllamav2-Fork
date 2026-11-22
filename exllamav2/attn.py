@@ -3322,6 +3322,17 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 
         cfg = self.model.config
         ctx = self.model.tp_context
+
+        # Select THIS layer's geometry before any get_split() call, exactly as tp_split()
+        # and tp_load_rank() do. The sizing pass in load_tp_rank() iterates every module
+        # without setting the geometry, so without this the estimate uses a stale/default
+        # split while tp_load_rank() allocates with the correct per-layer split. At even
+        # world sizes (2/4) the per-rank max happens to cover the discrepancy; at uneven
+        # splits (3/5 GPUs: kv 16 -> 6/5/5, kv 4 -> 2/1/1) the estimate undersizes the
+        # rank and tp_load_rank() overflows the device scratch ("start + length exceeds
+        # dimension size"). Estimator and allocator must use the same geometry.
+        ctx.set_geometry(self.layer_idx)
+
         devs = ctx.num_devices
         scratch = [0] * devs
 
