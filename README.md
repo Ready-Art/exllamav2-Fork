@@ -48,8 +48,10 @@ architectures are untested here — treat them as experimental and verify correc
 > allgather+RMSNorm+residual kernel (`EXL2_TP_FUSE_AGNR=1`) collapses the decode block tail into
 > one collective. These are **latency** optimizations — on the 200 W-cap rig the cards are
 > compute-limited by quantized-GEMM dequant, so throughput gains are small; the remaining big
-> lever is the GEMM dequant path itself. A row-parallel decode variant (`EXL2_TP_ROW_REPL`) is
-> present but **disabled (correctness bug under investigation — do not enable)**.
+> lever is the GEMM dequant path itself. `EXL2_TP_ROW_REPL=1` fuses the **o_proj** block into a
+> single allreduce (fp16 logical-order row shard; greedy-parity verified). The down row-parallel
+> variant is **disabled** (`EXL2_TP_ROW_REPL_DOWN=0` default — its remap path has a correctness
+> bug and an fp16 down shard is VRAM-prohibitive); down stays column-parallel.
 > `EXL2_MTP_COST_TRACE=1` prints a per-phase gather cost breakdown for profiling.
 
 - **Tested hardware:** **4× RTX 3090 (sm86) on a PCI switch with P2P enabled**
