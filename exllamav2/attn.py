@@ -3278,15 +3278,14 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                     del _shard
                 else:
                     self._o_fp16_row = _shard
-            # Stage 3 (EXL2_TP_ROW_REPL): GPU-resident fp16 logical-order o_proj shard for a
+            # Stage 3 (EXL2_TP_ROW_REPL): GPU-resident fp16 logical-order o_proj shard for the
             # row-parallel decode_repl path (matmul(attn shard, shard) -> partial -> allreduce,
-            # 2 collectives -> 1). **DISABLED / BROKEN — DO NOT ENABLE.** Greedy parity fails:
-            # output is coherent but the model never enters the thought channel (148/150 tokens
-            # differ from baseline, IDENTICAL with P2P on/off -> a projection input-ordering
-            # bug in the decode_repl row path, NOT the allreduce). Root cause unresolved; the
-            # gate is force-off until fixed. See theplan.md §12 (stage 3).
+            # 2 collectives -> 1). Logical order avoids the q_perm trap (same correct path as
+            # the O_RS prefill shard). The earlier "never thinks" parity bug was the DOWN
+            # output_map remap, fixed in mlp.py (down now uses the same fp16 logical matmul).
             self._o_fp16_row_repl = None
-            if False and os.environ.get("EXL2_TP_ROW_REPL", "0") == "1":
+            if os.environ.get("EXL2_TP_ROW_REPL", "0") == "1" \
+                    and os.environ.get("EXL2_TP_ROW_REPL_O", "1") != "0":
                 _rshard = self._build_o_fp16_row(rank)
                 if _rshard is not None:
                     self._o_fp16_row_repl = _rshard

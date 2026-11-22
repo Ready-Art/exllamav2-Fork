@@ -505,9 +505,9 @@ class ExLlamaV2MLP(ExLlamaV2Module):
         if ctx.seqpar and ctx.decode_repl and q_len <= 32 \
                 and getattr(self, "_down_row_repl", False) and not loras:
             # Stage 3 row-parallel down (EXL2_TP_ROW_REPL=1): outputs[0] is this rank's
-            # gate/up shard in down's q_perm input order (output_map baked at load), so the
-            # row GEMM runs locally -> full-hidden partial -> one allreduce. Eliminates the
-            # intermediate allgather AND the RS-shard allgather (2 -> 1). Mirrors o_proj.
+            # gate/up shard remapped into down's row-shard input order (output_map=down_perm
+            # baked at load); the quantized row GEMM runs locally -> full-hidden partial ->
+            # one allreduce. Eliminates the intermediate AG + the RS-shard AG (2 -> 1).
             partial = self.down_proj.forward(outputs[0], loras = loras)
             out_full = ctx.all_reduce_hidden(partial, "down")
             if self.post_layernorm is not None:
@@ -539,12 +539,10 @@ class ExLlamaV2MLP(ExLlamaV2Module):
 
         if ctx.seqpar and (getattr(self, "_down_rs_row", False)
                            or getattr(self, "_down_row_repl", False)):
-            # Row-parallel down_proj: this rank's activation shard IS its input slice, so
-            # the GEMM runs locally (no intermediate allgather -- that moved 4x the bytes
-            # of the reduce-scatter which replaces it). The full-hidden partial sums are
-            # reduce-scattered on the RS split straight into the residual shard. Serves
-            # prefill (q_len>32) for both DOWN_RS and ROW_REPL (decode_repl ROW_REPL uses
-            # the allreduce branch above; the row handle needs this RS path for prefill).
+            # Row-parallel down_proj (DOWN_RS / ROW_REPL): this rank's activation shard IS its
+            # input slice (output_map remap), so the quantized row GEMM runs locally (no
+            # intermediate allgather). Full-hidden partial reduce-scattered to the residual
+            # shard. Serves prefill (q_len>32); decode_repl ROW_REPL uses the allreduce branch.
             partial = self.down_proj.forward(outputs[0], loras = loras)
             out_shard = ctx.reduce_scatter_hidden(partial)
             if self.post_layernorm is not None:
@@ -785,12 +783,22 @@ class ExLlamaV2MLP(ExLlamaV2Module):
         # used column-parallel + allgather). Default OFF restores that verified layout;
         # =1 re-enables the reduce-scatter win for A/B once correctness is re-confirmed.
         self._down_rs_row = False
-        # Stage 3 (EXL2_TP_ROW_REPL): row-parallel down for decode_repl (gate/up output remapped
-        # by down's q_perm -> row GEMM local -> partial all-reduced, 2 collectives -> 1).
-        # **DISABLED / BROKEN — DO NOT ENABLE** (same parity bug as the o_proj row path; see
-        # attn.py tp_load_rank + theplan.md §12 stage 3). Gate force-off until root-caused.
+        # Stage 3 (EXL2_TP_ROW_REPL): row-parallel down via an fp16 LOGICAL-order shard
+        # (mirrors the o_proj O_RS path). matmul(gate/up shard in NATURAL column order,
+        # down_fp16_shard logical rows [a,b)) -> full-hidden partial -> allreduce (decode_repl)
+        # / reduce_scatter (prefill). This REPLACES the quantized row-handle + output_map
+        # q_perm remap, which mis-ordered the down input and broke parity from token 0 (the
+        # "coherent but never thinks" bug). gate/up load natural (no remap); the down fp16
+        # shard is built below. 2 collectives -> 1 per block, same as the o_proj row path.
         self._down_row_repl = False
-        if False and self.model.tp_context.seqpar and os.environ.get("EXL2_TP_ROW_REPL", "0") == "1":
+        self._down_fp16_row_repl = None
+        # ROW_REPL down row-parallel defaults OFF: the quantized row-handle + output_map
+        # remap path breaks greedy parity (the o_proj fp16 row path is verified EXACT, down
+        # is not), and an fp16 logical down shard is VRAM-prohibitive (~3.4 GB/rank). So
+        # ROW_REPL fuses the o_proj block only (down stays column-parallel). EXL2_TP_ROW_REPL_DOWN=1
+        # re-enables the experimental down row path for debugging.
+        if self.model.tp_context.seqpar and os.environ.get("EXL2_TP_ROW_REPL", "0") == "1" \
+                and os.environ.get("EXL2_TP_ROW_REPL_DOWN", "0") != "0":
             down_perm = self.down_proj.tp_load_rank_row(rank, BROADCAST_ID, BROADCAST_RS)
             self._down_row_repl = True
         elif self.model.tp_context.seqpar and os.environ.get("EXL2_TP_DOWN_RS", "0") != "0":
