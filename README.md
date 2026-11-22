@@ -42,6 +42,16 @@ architectures are untested here — treat them as experimental and verify correc
 > NCCL for the small decode/verify all-gathers and all-reduces, which is where most of the
 > recent performance work has landed.
 
+> **Collective fusion (in progress).** The P2P rendezvous is being fused to cut per-op PCIe
+> latency: a warp-parallel flag/ack protocol (one lane per peer) and a graph-safe deferred-ack
+> allreduce with per-key double-buffered scratch are landed; an optional fused
+> allgather+RMSNorm+residual kernel (`EXL2_TP_FUSE_AGNR=1`) collapses the decode block tail into
+> one collective. These are **latency** optimizations — on the 200 W-cap rig the cards are
+> compute-limited by quantized-GEMM dequant, so throughput gains are small; the remaining big
+> lever is the GEMM dequant path itself. A row-parallel decode variant (`EXL2_TP_ROW_REPL`) is
+> present but **disabled (correctness bug under investigation — do not enable)**.
+> `EXL2_MTP_COST_TRACE=1` prints a per-phase gather cost breakdown for profiling.
+
 - **Tested hardware:** **4× RTX 3090 (sm86) on a PCI switch with P2P enabled**
   (`NCCL_P2P_LEVEL=PXB`), no NVLink. The P2P collective path and the performance numbers in this
   README are validated on exactly this topology.
