@@ -150,3 +150,56 @@ def test_hadamard_dims(min_dim: int, max_dim: int, step: int):
             assert_hadamard(h)
 
 # test_hadamard_dims(128, 16384, 128)
+
+
+# ---- EXL2.5 K-side incoherence rotation ----------------------------------------------
+#
+# Convention (matches the exl25 GEMM kernel exactly):
+#   kernel activations : x' = x @ H_int          (UNNORMALIZED +/-1 butterfly, exact fp16)
+#   stored weights     : W' = H_int @ W / block  (the 1/block folds into the quant scales)
+#   identity           : (x H_int)(H_int W / block) = x W   since H_int^2 = block * I
+#   inverse (unpack)   : W = H_int @ W' / block
+# H_int is symmetric, so row-vector and column-vector forms use the same matrix.
+
+def _had_int(block: int, device, dtype):
+    h = get_hadamard(block)
+    assert h is not None, f"No Hadamard matrix for block {block}"
+    return h.to(device = device, dtype = dtype)
+
+
+def had_rotate_activations(x: torch.Tensor, block: int = 128):
+    """x: (..., k) -> x @ H_int block-diagonal along the last dim (k % block == 0)."""
+    k = x.shape[-1]
+    assert k % block == 0
+    h = _had_int(block, x.device, x.dtype)
+    shape = x.shape
+    return (x.reshape(-1, k // block, block) @ h).reshape(shape)
+
+
+def had_rotate_weights(w: torch.Tensor, block: int = 128, inverse: bool = False):
+    """w: (k, n) -> H_int @ w / block (forward, stored space) or H_int @ w / block
+    (inverse -- the transform is an involution up to the same 1/block)."""
+    k = w.shape[0]
+    assert k % block == 0
+    h = _had_int(block, w.device, w.dtype)
+    y = torch.matmul(h, w.reshape(k // block, block, w.shape[1]))
+    return (y / block).reshape(w.shape)
+
+
+def had_rotate_hessian(hess: torch.Tensor, block: int = 128):
+    """Hessian of x @ H_int activations: H' = H_int @ H @ H_int (block-diagonal congruence).
+    Chunked over row-blocks: a full (nb*nb, 128, 128) batched form would peak several GB
+    of temporaries on top of the Hessian itself (down_proj k=21504 -> OOM next to a model
+    replica). Per-chunk temporaries are ~nb*128*128 instead."""
+    k = hess.shape[0]
+    assert k % block == 0 and hess.shape[1] == k
+    h = _had_int(block, hess.device, hess.dtype)
+    nb = k // block
+    out = torch.empty_like(hess)
+    hv = hess.view(nb, block, nb, block)
+    ov = out.view(nb, block, nb, block)
+    for ib in range(nb):
+        x = hv[ib].permute(1, 0, 2).contiguous()
+        y = h @ x @ h
+        ov[ib].copy_(y.permute(1, 0, 2))
+    return out

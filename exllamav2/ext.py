@@ -218,6 +218,7 @@ if build_jit:
         "ext_sampling.cpp",
         "ext_element.cpp",
         "ext_tp.cpp",
+        "ext_ngram.cpp",
         "cuda/graph.cu",
         "cuda/h_add.cu",
         "cuda/h_gemm.cu",
@@ -228,6 +229,10 @@ if build_jit:
         "cuda/q_attn.cu",
         "cuda/q_mlp.cu",
         "cuda/q_gemm.cu",
+        "cuda/exl25_gemm.cu",
+        "cuda/exl25_gemm_a.cu",
+        "cuda/exl25_gemm_b.cu",
+        "cuda/ngram.cu",
         "cuda/rms_norm.cu",
         "cuda/head_norm.cu",
         "cuda/layer_norm.cu",
@@ -321,6 +326,16 @@ def make_group_map(q_groups: torch.Tensor, num_qrows: int) -> torch.Tensor:
     return safe_move_tensor(group_map, q_groups.device)
 
 
+# EXL2.5 per-tensor tags (absent -> legacy EXL2 path, byte-identical)
+
+def exl25_tags(w: dict):
+    def _i(k):
+        v = w.get(k, None)
+        if v is None: return 0
+        return int(v.item() if torch.is_tensor(v) else v)
+    return _i("q_uniform_bits"), _i("q_group_size"), _i("q_hadamard")
+
+
 # Create Q matrix
 
 def make_q_matrix(w: dict,
@@ -341,10 +356,25 @@ def make_q_matrix(w: dict,
         if "q_group_map" not in w:
             w["q_group_map"] = make_group_map(w["q_groups"], w["q_weight"].shape[0])
 
+        # EXL2.5 uniform fast lane: the kernel ignores q_perm, so the stored permutation
+        # must be identity (the converter guarantees this; verify loudly at load).
+        exl25_bits, exl25_gs, exl25_had = exl25_tags(w)
+        awq_scale = w.get("q_awq_scale", none_tensor)
+        if exl25_bits:
+            if "q_invperm" in w:
+                ip = w["q_invperm"]
+                if not torch.equal(ip, torch.arange(ip.numel(), dtype = ip.dtype, device = ip.device)):
+                    raise ValueError(f"EXL2.5 uniform tensor {key} has non-identity q_invperm")
+            perm_arg = none_tensor
+            invperm_arg = none_tensor
+        else:
+            perm_arg = w.get("q_perm", none_tensor)
+            invperm_arg = w.get("q_invperm", none_tensor)
+
         return ext_c.make_q_matrix(
             w["q_weight"],
-            w.get("q_perm", none_tensor),
-            w.get("q_invperm", none_tensor),
+            perm_arg,
+            invperm_arg,
             w["q_scale"],
             w["q_scale_max"],
             w["q_groups"],
@@ -354,7 +384,11 @@ def make_q_matrix(w: dict,
             none_tensor,
             w.get("bias", none_tensor),
             temp_dq,
-            max_dq_rows
+            max_dq_rows,
+            awq_scale,
+            exl25_bits,
+            exl25_gs,
+            exl25_had
         )
 
     # GPTQ

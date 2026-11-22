@@ -1,6 +1,8 @@
 # ReadyArt ExLlamaV2
 
-**Tensor-parallel, speculative-decoding ExLlamaV2 for multi-GPU rigs.**
+**ReadyArt Exllamav2.5 v1.0** — tensor-parallel, speculative-decoding ExLlamaV2 for multi-GPU
+rigs, with the **EXL2.5** quantization format (fast-path GEMM + Hadamard/AWQ quality upgrades;
+see [EXL2.5 quantization format](#exl25-quantization-format-new)).
 
 ReadyArt ExLlamaV2 is a performance-focused fork of [ExLlamaV2](https://github.com/turboderp/exllamav2)
 that adds **multi-GPU tensor parallelism**, **MTP (multi-token prediction) speculative decoding**,
@@ -426,6 +428,91 @@ python convert.py -i <hf_fp16_model> -o <work_dir> -cf <out_dir> \
 
 See **[doc/convert.md](doc/convert.md)** for all arguments, the multi-GPU process, hardware
 requirements, and how to run the converted model tensor-parallel.
+
+## EXL2.5 quantization format (new)
+
+**EXL2.5** is this fork's next-generation quant format: same EXL2 file container, plus
+per-tensor opt-in upgrades for **speed** (a branchless fast-path GEMM built for Ampere /
+RTX 3090, with a 16-row cap so batch-4 MTP verify reads the weights once) and **quality**
+(Hadamard incoherence rotation + AWQ channel protection + Hessian-guided rounding at the
+same bits-per-weight). Plain EXL2 models keep loading and running exactly as before.
+
+### The one rule to understand (please read)
+
+> **EXL2.5's new features require the EXL2.5 fast path. Mixed-bpw tensors revert to EXL2.**
+
+Spelled out:
+
+- A tensor converted **with** `--exl25_uniform_bits N` is an **EXL2.5 tensor**: one
+  bit-width for the whole tensor, uniform groups, served by the new fast-path kernel.
+  Hadamard (`--exl25_hadamard`) and AWQ (`--exl25_awq`) **only work on such tensors** —
+  the fast path is what applies their activation transforms, and the loader refuses
+  (loudly) to run them anywhere else.
+- A tensor converted **without** `--exl25_uniform_bits` is a **classic mixed-bpw EXL2
+  tensor** and runs on the **original EXL2 kernel**, byte-for-byte unchanged. Nothing
+  about EXL2.5 slows it down or changes its output.
+- You can **mix both kinds in one model**. You still choose any model-wide BPW you like:
+  either classic per-tensor mixed-bit allocation (EXL2 path), or different uniform
+  bit-widths per tensor/type (EXL2.5 path), e.g. attention 6-bit + MLP 4-bit + fp16 head.
+  What you cannot do is put Hadamard/AWQ on a mixed-bpw tensor — those require the uniform
+  fast path by design.
+- `EXL2_EXL25=0` is an A/B kill switch: it serves **plain uniform** tensors with the legacy
+  kernel (same weights, slower) so you can measure the speedup. Hadamard/AWQ tensors are
+  exempt — they always use the fast path, because the legacy kernel cannot produce correct
+  results for them.
+
+### Hadamard requires an fp16 head (HB16)
+
+> **With `--exl25_hadamard`, use `-hb 16`.** If you quantize the head (`-hb 6` etc.), the
+> converter **skips Hadamard on the lm_head tensor** (prints a warning; the head is
+> quantized unrotated). The output head is the most quality-sensitive tensor in the model;
+> keep it fp16 when using Hadamard.
+
+### Converting to EXL2.5
+
+```sh
+# Uniform 6-bit fast path + Hadamard + AWQ, fp16 head (recommended quality preset)
+python convert.py -i <hf_fp16_model> -o <work_dir> -cf <out_dir> \
+    -b 6.0 -hb 16 -x25u 6 -x25h -x25a
+
+# Uniform 4-bit fast path (speed/size preset), no rotation
+python convert.py -i <hf_fp16_model> -o <work_dir> -cf <out_dir> \
+    -b 4.0 -hb 16 -x25u 4
+```
+
+| Flag | Meaning |
+|---|---|
+| `-x25u / --exl25_uniform_bits N` | EXL2.5 uniform fast path at N bits (2/3/4/5/6/8). 0/absent = classic EXL2. |
+| `-x25g / --exl25_group_size G` | Uniform group size along K (32/64/128/256; K must divide). Default 128. Hadamard/AWQ tensors use ≤128. |
+| `-x25h / --exl25_hadamard` | K-side Hadamard incoherence: weights pre-rotated at conversion, activations rotated inside the GEMM (free at inference). Lower quant error at the same bpw. Requires `-x25u` and `-hb 16`. |
+| `-x25a / --exl25_awq` | AWQ-style per-channel protection from calibration data. Requires `-x25u`. |
+
+The converted model runs on the normal load path — tags are self-describing, no config
+switch needed. MoE expert tensors get the same treatment automatically (the fused MoE
+kernel serves EXL2.5 experts with routing weights). Engram (hashed n-gram) tables have
+their own scalar row format + converter (`python -m exllamav2.conversion.convert_ngram`)
+and module (`exllamav2.ngram_embedding`), RAM-resident or disk-streaming — no trellis,
+Ampere-friendly.
+
+Validation harnesses (developer): `mtp/exl25_gemm_test.py` (parity m=1..16 + cuBLAS path,
+quality A/B, speed A/B vs legacy, CUDA-graph capture/replay), `mtp/exl25_moe_test.py`
+(fused MoE parity), `mtp/exl25_ngram_test.py` (engram converter/kernel/hashing parity).
+
+### EXL2.5 validation status (2026-11-22, RTX 3090 / sm86, same-session A/B at 200 W)
+
+- **Correctness: ALL PASS** — GEMM parity m=1..16 + prefill cuBLAS+transform path (fp32
+  oracle, fp16 noise floor), CUDA-graph capture/replay m=1/4/16, fused MoE with EXL2.5
+  experts (plain + Hadamard/AWQ, rows 1/2/4), engram converter/kernel/hashing (RAM +
+  disk-streaming, 4/8-bit). Hadamard butterfly verified against an exact-answer probe.
+- **Quality (same bpw, synthetic outlier stress test)**: Hadamard+AWQ cuts quantization
+  rel_l2 ~30-45% (e.g. 6-bit 0.0236 → 0.0133; 4-bit 0.095 → 0.054). Real-model perplexity /
+  MTP-acceptance measurement pending the first EXL2.5 conversion.
+- **Kernel speed vs legacy (plain uniform, identical weights)**: decode m=1 **1.05-1.27×**,
+  m=4 up to **2.13×** (6-bit gate/up), m=8 mixed (0.42-2.22× by shape/bit-width), m=16
+  currently slower than legacy's two m=8 passes on most shapes — **m=8/16 register-pressure
+  / block-size tuning is the next lever** (the 16-row one-pass design is in place; occupancy
+  tuning pending). Hadamard/AWQ add an in-kernel butterfly cost on top (quality feature).
+- EXL2.5 is **opt-in per tensor**; existing EXL2 models and the legacy kernel are untouched.
 
 ## Performance (this fork)
 

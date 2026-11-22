@@ -72,14 +72,23 @@ QMatrix::QMatrix
     half* _temp_dq,
     const int _max_dq_rows,
 
-    bool no_map
+    bool no_map,
+
+    int _exl25_bits,
+    int _exl25_groupsize,
+    int _had_k,
+    half* _awq_scale
 ) :
     device(_device),
     height(_height),
     width(_width),
     groups(_groups),
     temp_dq(_temp_dq),
-    max_dq_rows(_max_dq_rows)
+    max_dq_rows(_max_dq_rows),
+    exl25_bits(_exl25_bits),
+    exl25_groupsize(_exl25_groupsize),
+    had_k(_had_k),
+    cuda_awq_scale(_awq_scale)
 {
     cudaSetDevice(device);
 
@@ -97,6 +106,34 @@ QMatrix::QMatrix
     cuda_bias = _bias;
 
     is_gptq = (_gptq_qzeros != NULL);
+
+    // EXL2.5 tag validation: a malformed tag must fail loudly at load, never silently
+    // dispatch a wrong kernel. Legacy tensors (all tags 0/NULL) skip this entirely.
+    if (exl25_bits)
+    {
+        if (is_gptq || exl25_bits < 2 || exl25_bits > 8 || exl25_bits == 7 ||
+            exl25_groupsize < 32 || exl25_groupsize > 256 || exl25_groupsize % 32 != 0 ||
+            height % exl25_groupsize != 0 || groups != height / exl25_groupsize ||
+            (had_k != 0 && had_k != 128) || (had_k && height % 128 != 0) ||
+            // had/awq tensors MUST always be servable by the fast lane: the legacy kernel
+            // cannot apply the activation transform, so a shape fallback would be silently
+            // wrong. gs <= 128 guarantees a 128-kn dispatch for any height % 128 == 0.
+            ((had_k || cuda_awq_scale) && exl25_groupsize > 128))
+        {
+            fprintf(stderr, " ## EXL2.5 invalid tags: bits=%d gs=%d had=%d height=%d groups=%d\n",
+                    exl25_bits, exl25_groupsize, had_k, height, groups);
+            failed = true;
+            return;
+        }
+    }
+    else if (had_k || cuda_awq_scale)
+    {
+        // Hadamard/AWQ on a mixed-bit tensor: the legacy kernel has no activation
+        // transform, so these tags require the uniform fast lane. Converter enforces it.
+        fprintf(stderr, " ## EXL2.5 hadamard/awq require the uniform fast lane (q_uniform_bits)\n");
+        failed = true;
+        return;
+    }
 
     if (is_gptq)
     {

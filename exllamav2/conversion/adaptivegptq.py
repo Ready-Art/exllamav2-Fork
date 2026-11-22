@@ -162,6 +162,18 @@ class AdaptiveGPTQ:
         self.stager = None
         self.stager_key = 0
 
+        # EXL2.5 options (set by conversion.quantize._configure_exl25 from job["exl25"]).
+        # had: K-side Hadamard block (0 = off). Quantization runs in the kernel's stored
+        # space: activations x @ H_int, weights H_int @ W / block. awq: per-channel
+        # protection scale derived from the calibration Hessian diagonal. uniform_bits:
+        # single bit-width fast lane (identity permutation, uniform groups).
+        self.exl25_had = 0
+        self.exl25_awq = False
+        self.exl25_identity_perm = False
+        self.exl25_uniform_bits = 0
+        self.exl25_groupsize = 0
+        self.awq_inv_scale = None
+
 
     def out_dev(self) -> torch.device:
         """Device that packed/scaled outputs are gathered onto. quant-plan.md §6.4 (M2)."""
@@ -261,6 +273,9 @@ class AdaptiveGPTQ:
 
             self.num_batches += 1
             inputs = inputs.view((-1, inputs.shape[-1])).float().to(self.hessian.device)
+            if self.exl25_had:
+                from exllamav2.hadamard.hadamard import had_rotate_activations
+                inputs = had_rotate_activations(inputs, self.exl25_had)
             self.hessian.addmm_(inputs.T, inputs)
 
 
@@ -282,6 +297,16 @@ class AdaptiveGPTQ:
                 self.weights = stager.get(key, self.layer.weight.data)
             else:
                 self.weights = self.layer.weight.data.cpu().T.clone().float().contiguous()
+
+            # EXL2.5: move the weights into the stored space, W' = H_int @ (S @ W) / block.
+            # The AWQ scale comes from prepare_hessian (must run first); the Hadamard
+            # rotation is an involution up to 1/block, so the same call un-rotates in
+            # apply_quant.
+            if self.awq_inv_scale is not None:
+                self.weights *= (1.0 / self.awq_inv_scale).to(self.weights.device)[:, None]
+            if self.exl25_had:
+                from exllamav2.hadamard.hadamard import had_rotate_weights
+                self.weights = had_rotate_weights(self.weights, self.exl25_had).contiguous()
 
             # Zero weights that have no impact. Disabling this since it feels a little drastic based on just the calibration
             # data. It likely never triggers, anyway.
@@ -312,11 +337,27 @@ class AdaptiveGPTQ:
                 self.hessian = torch.eye(self.rows, device = self.device, dtype = torch.float)
             else:
                 self.hessian /= self.num_batches
+
+            # EXL2.5: move H into the stored (rotated) activation space, then derive the
+            # AWQ protection scale from its diagonal and congruence-scale H by S^-1.
+            if self.exl25_had:
+                from exllamav2.hadamard.hadamard import had_rotate_hessian
+                self.hessian = had_rotate_hessian(self.hessian, self.exl25_had)
             diagonal = torch.diag(self.hessian)
+            if self.exl25_awq:
+                rms = diagonal.clamp_min(1e-12).sqrt()
+                s = (rms / rms.mean()).pow(0.5).clamp(0.25, 4.0)
+                self.awq_inv_scale = 1.0 / s
+                self.hessian = self.hessian / s[:, None] / s[None, :]
+                diagonal = torch.diag(self.hessian)
 
-            # Activation order
+            # Activation order (identity for the EXL2.5 fast lane: Hadamard makes every
+            # group tight, so act-order permutation is redundant and the kernel drops it)
 
-            self.perm = torch.argsort(diagonal, descending = True)
+            if self.exl25_identity_perm:
+                self.perm = torch.arange(self.rows, device = self.hessian.device)
+            else:
+                self.perm = torch.argsort(diagonal, descending = True)
             self.perm_cpu = self.perm.cpu()
 
             if self.hessian.numel() > 6e8:
@@ -449,6 +490,8 @@ class AdaptiveGPTQ:
 
     def quantize_rtn_inplace(self, keep_qweight = False, apply = False):
         assert apply and keep_qweight
+        assert not (self.exl25_had or self.exl25_awq or self.exl25_uniform_bits), \
+            "EXL2.5 extensions are not supported on the RTN path (large lm_head); keep it legacy"
 
         with torch.inference_mode():
 
@@ -667,6 +710,12 @@ class AdaptiveGPTQ:
 
         with torch.inference_mode():
 
+            # EXL2.5 stores rotated/scaled weights; the raw-space comparison below is
+            # meaningless there (the conversion sanity check uses the transformed-identity
+            # forward instead).
+            if self.exl25_had or self.awq_inv_scale is not None:
+                return 0.0, 0.0, 0.0
+
             q = self.quant[self.invperm, :]
             diff = torch.abs(q - self.layer.weight.data.T)
             mat_error_1 = (diff > 0.01).sum().item() / diff.numel()
@@ -682,6 +731,19 @@ class AdaptiveGPTQ:
         qc = self.quant.cpu()
         invperm = self.invperm.cpu()
         q = qc[invperm, :].T
+
+        # EXL2.5: back to logical space so the live model (and every later calibration
+        # forward) keeps using ordinary weights. q is (n, k): unscale AWQ along k, then
+        # un-rotate each 128-block (W = H_int @ W' / block).
+        if self.awq_inv_scale is not None:
+            q = q * self.awq_inv_scale.cpu()[None, :]
+        if self.exl25_had:
+            from exllamav2.hadamard.hadamard import _had_int
+            b = self.exl25_had
+            h = _had_int(b, q.device, q.dtype)
+            n, k = q.shape
+            q = ((q.reshape(n, k // b, b) @ h) / b).reshape(n, k)
+
         q = q.reshape(self.quant.T.shape)
 
         gc.collect()
@@ -764,6 +826,17 @@ class AdaptiveGPTQ:
 
         qwt_packed = torch.cat(qwt_packed, dim = 0)
         output[key + ".q_weight"] = qwt_packed
+
+        # EXL2.5 tags (self-describing; absent = legacy EXL2). q_groups/q_group_map and
+        # the identity q_invperm stay in the file, so the legacy kernel remains a valid
+        # fallback for any shape the fast lane can't serve.
+        if self.exl25_uniform_bits:
+            output[key + ".q_uniform_bits"] = torch.tensor(self.exl25_uniform_bits, dtype = torch.int32)
+            output[key + ".q_group_size"] = torch.tensor(self.exl25_groupsize, dtype = torch.int32)
+            if self.exl25_had:
+                output[key + ".q_hadamard"] = torch.tensor(self.exl25_had, dtype = torch.int32)
+            if self.awq_inv_scale is not None:
+                output[key + ".q_awq_scale"] = self.awq_inv_scale.to(torch.float16).to(self.out_dev())
 
         return output
 

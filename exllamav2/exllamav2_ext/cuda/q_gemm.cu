@@ -7,6 +7,7 @@
 #include "comp_units/kernel_select.cuh"
 #include "q_gemm_autotune.cuh"
 #include "h_add.cuh"
+#include "exl25_transform.cuh"
 
 enum KernelSublabels
 {
@@ -36,6 +37,26 @@ void gemm_half_q_half_cuda_part
 {
     if (!b->is_gptq)
     {
+        // EXL2.5 uniform-bit fast lane. kn == 0 -> shape not servable -> legacy EXL2
+        // kernel below (uniform tensors keep valid q_groups/q_group_map, so the legacy
+        // path is always a correct fallback).
+        int exl25_kn = exl25_serve_kn(b, size_m, size_n, size_k);
+        if (exl25_kn)
+        {
+            exl25_gemm_cuda_part(stream, a, b, c, size_m, size_n, size_k, m_count, clear,
+                                 r_weights, r_weights_stride, mul_r_weights, graph, label, exl25_kn);
+            return;
+        }
+        // had/awq tensors can NEVER fall back to legacy (no activation transform there).
+        // Load-time validation makes this unreachable; fail loudly rather than silently
+        // computing unrotated math.
+        if (b->had_k || b->cuda_awq_scale)
+        {
+            fprintf(stderr, " ## EXL2.5 FATAL: had/awq tensor not servable (m=%d n=%d k=%d gs=%d)\n",
+                    size_m, size_n, size_k, b->exl25_groupsize);
+            abort();
+        }
+
         int block_kn_size;
         bool measure = false;
         AT_Result* atr;
@@ -246,6 +267,20 @@ void gemm_half_q_half_cuda
 
     int row_step = (b->max_dq_rows / 128) * 128;
 
+    // EXL2.5 hadamard/awq: the reconstruct+cuBLAS path (large-m prefill) must see
+    // (a * S^-1 * H) to match the pre-rotated stored weights. Transform out-of-place
+    // into grow-only scratch; the small-m lane does this in-kernel instead.
+    if (b->exl25_bits && (b->had_k || b->cuda_awq_scale) &&
+        size_m > MAX_Q_GEMM_ROWS && !force_cuda && size_k <= row_step)
+    {
+        half* ta = exl25_get_scratch(b->device, (size_t) size_m * size_k);
+        if (ta)
+        {
+            exl25_transform_a(stream, a, ta, size_m, size_k, b->cuda_awq_scale, b->had_k);
+            a = ta;
+        }
+    }
+
     if (size_m > MAX_Q_GEMM_ROWS && !force_cuda && size_k <= row_step)
     {
         if (graph) printf(" ## Labeling graph in reconstruct/cuBLAS matmul");
@@ -302,7 +337,9 @@ void gemm_half_q_half_cuda
     {
         // Quantized matmul
 
-        int block_m_size_max = b->is_gptq ? GPTQ_BLOCK_M_SIZE_MAX : EXL2_BLOCK_M_SIZE_MAX;
+        // EXL2.5 fast lane serves m up to 16 in one weight pass (B=4 MTP verify);
+        // legacy EXL2/GPTQ keep their proven caps.
+        int block_m_size_max = b->is_gptq ? GPTQ_BLOCK_M_SIZE_MAX : (b->exl25_bits ? 16 : EXL2_BLOCK_M_SIZE_MAX);
         int block_m = min(size_m, block_m_size_max);
         gemm_half_q_half_cuda_part
         (

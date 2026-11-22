@@ -24,6 +24,7 @@
 #include "ext_prefill.h"
 #include "ext_verify.h"
 #include "ext_p2p.h"
+#include "ext_ngram.h"
 
 #include "cuda/cache.cuh"
 
@@ -59,8 +60,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
     // qmatrix
 
-    m.def("make_q_matrix", &make_q_matrix, "make_q_matrix");
-    m.def("make_q_matrix_split", &make_q_matrix_split, "make_q_matrix_split");
+    m.def("make_q_matrix", &make_q_matrix, "make_q_matrix",
+          py::arg("q_weight"), py::arg("q_perm"), py::arg("q_invperm"), py::arg("q_scale"),
+          py::arg("q_scale_max"), py::arg("q_groups"), py::arg("q_group_map"),
+          py::arg("gptq_qzeros"), py::arg("gptq_scales"), py::arg("gptq_g_idx"),
+          py::arg("bias"), py::arg("temp_dq"), py::arg("max_dq_rows"),
+          py::arg("awq_scale") = torch::Tensor(), py::arg("exl25_bits") = 0,
+          py::arg("exl25_groupsize") = 0, py::arg("had_k") = 0);
+    m.def("make_q_matrix_split", &make_q_matrix_split, "make_q_matrix_split",
+          py::arg("q_weight"), py::arg("q_perm"), py::arg("q_invperm"), py::arg("q_scale"),
+          py::arg("q_scale_max"), py::arg("q_groups"), py::arg("q_group_map"),
+          py::arg("gptq_qzeros"), py::arg("gptq_scales"), py::arg("gptq_g_idx"),
+          py::arg("bias"), py::arg("temp_dq"), py::arg("max_dq_rows"),
+          py::arg("awq_scale") = torch::Tensor(), py::arg("exl25_bits") = 0,
+          py::arg("exl25_groupsize") = 0, py::arg("had_k") = 0);
     m.def("free_q_matrix", &free_q_matrix, "free_q_matrix");
     m.def("prefill_hd512", &prefill_hd512, "prefill_hd512");
     m.def("verify_hd512", &verify_hd512, "verify_hd512");
@@ -77,6 +90,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("matrix_fp16_to_q4", &matrix_fp16_to_q4, "matrix_fp16_to_q4");
     m.def("matrix_q4_to_fp16", &matrix_q4_to_fp16, "matrix_q4_to_fp16");
     m.def("make_group_map", &make_group_map, "make_group_map");
+
+    // EXL2.5 engram (hashed n-gram embedding tables)
+    m.def("ngram_dequant_rows", &ngram_dequant_rows, "ngram_dequant_rows");
 
     // qattn
 

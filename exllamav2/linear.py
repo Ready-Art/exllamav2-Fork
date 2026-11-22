@@ -18,6 +18,27 @@ if TYPE_CHECKING:
     from exllamav2.model import ExLlamaV2
 
 
+def _exl25_bind_args(q_tensors: dict, row_a: int | None = None, row_b: int | None = None):
+    """
+    Trailing make_q_matrix[_split] args for the EXL2.5 extensions, derived from a tensor
+    dict. Column splits keep K intact (tags pass through); row splits slice the AWQ scale
+    and must stay group- and Hadamard-block-aligned. Legacy tensors return all-zero args.
+    """
+    from exllamav2.ext import exl25_tags
+    bits, gs, had = exl25_tags(q_tensors)
+    if not bits:
+        return (none_tensor, 0, 0, 0)
+    awq = q_tensors.get("q_awq_scale", none_tensor)
+    if row_a is not None:
+        if gs and (row_a % gs or row_b % gs):
+            raise ValueError(f"EXL2.5 row split [{row_a}, {row_b}) not group-aligned (gs={gs})")
+        if had and (row_a % 128 or (row_b - row_a) % 128):
+            raise ValueError(f"EXL2.5 hadamard row split [{row_a}, {row_b}) not 128-aligned")
+        if awq.numel() > 1:
+            awq = awq[row_a:row_b].contiguous()
+    return (awq, bits, gs, had)
+
+
 class ExLlamaV2Linear(ExLlamaV2Module):
 
     name: str = "Linear"
@@ -673,7 +694,8 @@ class ExLlamaV2Linear(ExLlamaV2Module):
                     none_tensor,
                     w.get("bias", none_tensor),
                     new_temp_dq[-1],
-                    max_dq_rows
+                    max_dq_rows,
+                    *_exl25_bind_args(self.q_tensors)
                 )
             )
 
@@ -794,6 +816,12 @@ class ExLlamaV2Linear(ExLlamaV2Module):
                 shard["q_perm"] = w["q_perm"].contiguous()
                 shard["q_invperm"] = w["q_invperm"].contiguous()
 
+        # EXL2.5 tags before the host copy is freed; the AWQ scale (if any) rides to the
+        # rank with the shard. Column split: K intact, no row slicing.
+        _exl25_args = _exl25_bind_args(w)
+        if _exl25_args[0].numel() > 1:
+            _exl25_args = (safe_move_tensor(_exl25_args[0], rank), *_exl25_args[1:])
+
         # Free the host copy before moving the shard.
         del w
 
@@ -849,7 +877,8 @@ class ExLlamaV2Linear(ExLlamaV2Module):
             none_tensor, none_tensor, none_tensor,
             shard.get("bias", none_tensor),
             self.temp_dq[0],
-            cfg.max_dq_size // s
+            cfg.max_dq_size // s,
+            *_exl25_args
         )
         self.prev_prescale = self.prescale
         self.prescale = 1
@@ -1008,6 +1037,12 @@ class ExLlamaV2Linear(ExLlamaV2Module):
         if "q_perm" in w:
             self._tp_row_q_perm = w["q_perm"].to(torch.int64).clone()
 
+        # EXL2.5 tags before the host copy is freed; row split slices the AWQ scale and
+        # enforces group / Hadamard-block alignment.
+        _exl25_args = _exl25_bind_args(w, a, b)
+        if _exl25_args[0].numel() > 1:
+            _exl25_args = (safe_move_tensor(_exl25_args[0], rank), *_exl25_args[1:])
+
         del w
 
         dev = self.model.get_device_context(rank)
@@ -1038,7 +1073,8 @@ class ExLlamaV2Linear(ExLlamaV2Module):
             none_tensor,
             shard.get("bias", none_tensor),
             self.temp_dq[0],
-            cfg.max_dq_size
+            cfg.max_dq_size,
+            *_exl25_args
         )
         self.prev_prescale = self.prescale
         self.prescale = 1
@@ -1207,7 +1243,8 @@ class ExLlamaV2Linear(ExLlamaV2Module):
             none_tensor,
             self.q_tensors.get("bias", none_tensor),
             self.temp_dq[0],
-            self.model.config.max_dq_size // self.out_features
+            self.model.config.max_dq_size // self.out_features,
+            *_exl25_bind_args(self.q_tensors)
         )
 
         self.out_features_tp = []
@@ -1317,7 +1354,8 @@ class ExLlamaV2Linear(ExLlamaV2Module):
                     none_tensor,
                     w.get("bias", none_tensor),
                     new_temp_dq[-1],
-                    max_dq_rows
+                    max_dq_rows,
+                    *_exl25_bind_args(self.q_tensors, a, b)
                 )
             )
 

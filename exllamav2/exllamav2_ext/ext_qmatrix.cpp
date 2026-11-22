@@ -32,10 +32,16 @@ uintptr_t make_q_matrix
     torch::Tensor gptq_g_idx,
     torch::Tensor bias,
     torch::Tensor temp_dq,
-    int max_dq_rows
+    int max_dq_rows,
+    torch::Tensor awq_scale,
+    int exl25_bits,
+    int exl25_groupsize,
+    int had_k
 )
 {
     TORCH_CHECK_DTYPE(q_weight, kInt);
+    TORCH_CHECK(!awq_scale.defined() || awq_scale.device().is_meta() || awq_scale.dtype() == torch::kHalf,
+                "awq_scale is incorrect datatype, must be Half");
     TORCH_CHECK_DTYPE_OPT(q_perm, kShort);
     TORCH_CHECK_DTYPE_OPT(q_invperm, kShort);
     TORCH_CHECK_DTYPE_OPT(q_scale, kInt);
@@ -102,7 +108,12 @@ uintptr_t make_q_matrix
         gptq_g_idx.device().is_meta() ? NULL : (uint32_t*) gptq_g_idx.data_ptr(),
         bias.device().is_meta() ? NULL : (half*) bias.data_ptr(),
         (half*) temp_dq.data_ptr(),
-        max_dq_rows
+        max_dq_rows,
+        false,
+        exl25_bits,
+        exl25_groupsize,
+        had_k,
+        (awq_scale.defined() && !awq_scale.device().is_meta()) ? (half*) awq_scale.data_ptr() : NULL
     );
 
     if (m->failed) throw std::runtime_error("CUDA out of memory");
@@ -124,7 +135,11 @@ uintptr_t make_q_matrix_split
     torch::Tensor gptq_g_idx,
     torch::Tensor bias,
     torch::Tensor temp_dq,
-    int max_dq_rows
+    int max_dq_rows,
+    torch::Tensor awq_scale,
+    int exl25_bits,
+    int exl25_groupsize,
+    int had_k
 )
 {
     TORCH_CHECK(
@@ -176,7 +191,11 @@ uintptr_t make_q_matrix_split
         bias.device().is_meta() ? NULL : (half*) bias.data_ptr(),
         (half*) temp_dq.data_ptr(),
         max_dq_rows,
-        true
+        true,
+        exl25_bits,
+        exl25_groupsize,
+        had_k,
+        (awq_scale.defined() && !awq_scale.device().is_meta()) ? (half*) awq_scale.data_ptr() : NULL
     );
 
     if (m->failed) throw std::runtime_error("CUDA out of memory");

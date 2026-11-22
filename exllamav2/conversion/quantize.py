@@ -51,6 +51,28 @@ def list_live_tensors():
 
 # Quantize
 
+def _configure_exl25(lq: AdaptiveGPTQ, job: dict):
+    """
+    Apply job["exl25"] options to a fresh quantizer. Must run BEFORE calibration
+    (add_batch transforms activations) and before prepare_hessian (AWQ scale, identity
+    permutation). Options: uniform_bits (2..8, fast lane), group_size (default 128),
+    hadamard (bool, K-side incoherence; requires uniform_bits), awq (bool).
+    """
+    ex = job.get("exl25") or {}
+    if not ex: return
+    had = 128 if ex.get("hadamard") else 0
+    ub = int(ex.get("uniform_bits") or 0)
+    if had and not ub:
+        raise ValueError("exl25: hadamard requires uniform_bits (the fast lane carries the rotation)")
+    if ub and ub not in (2, 3, 4, 5, 6, 8):
+        raise ValueError(f"exl25: unsupported uniform_bits {ub}")
+    lq.exl25_had = had
+    lq.exl25_awq = bool(ex.get("awq"))
+    lq.exl25_uniform_bits = ub
+    lq.exl25_groupsize = int(ex.get("group_size", 128))
+    lq.exl25_identity_perm = bool(ub or had)
+
+
 def quant_linear(job: dict,
                  source: ExLlamaV2Linear,
                  lq: AdaptiveGPTQ or None,
@@ -72,6 +94,12 @@ def quant_linear(job: dict,
     """
 
     qp = QParams.from_dict(qparams)
+
+    # EXL2.5 uniform fast lane: single bit-width, uniform groups (the per-tensor mixed-bit
+    # strategy is overridden; arbitrary BPW is preserved across tensors via uniform_bits).
+    if getattr(lq, "exl25_uniform_bits", 0):
+        qp = QParams(lq.exl25_groupsize, [lq.exl25_uniform_bits], [1.0], qp.scale_bits)
+
     print(f" -- Linear: {source.key} -> {qp.get_desc()}, {qp.bpw(source.linear.weight.T.shape):.2f} bpw")
 
     # Pin this tensor to its assigned device. quant_device is the compute device, output_device the gather
@@ -122,6 +150,8 @@ def quant_linear(job: dict,
     recons_linear.device_idx = source.device_idx
     recons_dict = {}
     recons_keys = ["q_weight", "q_invperm", "q_scale", "q_scale_max", "q_groups"]
+    recons_keys += [k for k in ("q_uniform_bits", "q_group_size", "q_hadamard", "q_awq_scale")
+                    if source.key + "." + k in packed_dict]
     if source.has_bias: recons_keys += ["bias"]
     r_device = packed_dict[source.key + ".q_weight"].device
     recons_linear.set_device_idx(r_device.index)
@@ -384,6 +414,12 @@ def quant(job, save_fn, model):
     states_filename = os.path.join(job["out_dir"], "hidden_states.safetensors")
     strategy = job["strategy"]
 
+    # EXL2.5: every quantizer gets the job's exl25 options at creation, before calibration.
+    def mk_q(layer):
+        lq = AdaptiveGPTQ(layer)
+        _configure_exl25(lq, job)
+        return lq
+
     # Multi-GPU setup. quant-plan.md §6.
     #
     # ``devices`` is the ordered list of CUDA indices this job may use; the first entry is the primary and
@@ -452,33 +488,39 @@ def quant(job, save_fn, model):
         if isinstance(module, ExLlamaV2Attention):
             mode = "self_attn"
             # if index > 1: testc(module, hidden_states, hidden_i_states, module.input_layernorm, [module.q_proj, module.k_proj, module.v_proj])
-            quantizers["q_proj"] = AdaptiveGPTQ(module.q_proj.linear)
-            quantizers["k_proj"] = AdaptiveGPTQ(module.k_proj.linear)
+            quantizers["q_proj"] = mk_q(module.q_proj.linear)
+            quantizers["k_proj"] = mk_q(module.k_proj.linear)
             # v_proj is None for attention_k_eq_v layers (Gemma-4 full attention).
             # PLAN.md §2.5 / §2.7.
             if module.v_proj is not None:
-                quantizers["v_proj"] = AdaptiveGPTQ(module.v_proj.linear)
-            quantizers["o_proj"] = AdaptiveGPTQ(module.o_proj.linear)
+                quantizers["v_proj"] = mk_q(module.v_proj.linear)
+            quantizers["o_proj"] = mk_q(module.o_proj.linear)
 
         elif isinstance(module, ExLlamaV2MLP):
             mode = "mlp"
             has_mlp = model.config.arch.lm.mlp_gate
             # testc(module, hidden_states, hidden_i_states, module.post_attention_layernorm, [module.gate_proj, module.up_proj])
-            if has_mlp: quantizers["gate_proj"] = AdaptiveGPTQ(module.gate_proj.linear)
-            quantizers["up_proj"] = AdaptiveGPTQ(module.up_proj.linear)
-            quantizers["down_proj"] = AdaptiveGPTQ(module.down_proj.linear)
+            if has_mlp: quantizers["gate_proj"] = mk_q(module.gate_proj.linear)
+            quantizers["up_proj"] = mk_q(module.up_proj.linear)
+            quantizers["down_proj"] = mk_q(module.down_proj.linear)
 
         elif isinstance(module, ExLlamaV2MoEMLP):
             mode = "block_sparse_moe"
             for i in range(model.config.num_experts):
-                quantizers[f"w1.{i}"] = AdaptiveGPTQ(module.w1[i].linear)
-                quantizers[f"w3.{i}"] = AdaptiveGPTQ(module.w3[i].linear)
-                quantizers[f"w2.{i}"] = AdaptiveGPTQ(module.w2[i].linear)
+                quantizers[f"w1.{i}"] = mk_q(module.w1[i].linear)
+                quantizers[f"w3.{i}"] = mk_q(module.w3[i].linear)
+                quantizers[f"w2.{i}"] = mk_q(module.w2[i].linear)
 
         elif isinstance(module, ExLlamaV2Linear):
             mode = "linear"
             assert module.key == model.config.arch.lm_prefix + "lm_head"
-            quantizers["lm_head"] = AdaptiveGPTQ(module.linear)
+            quantizers["lm_head"] = mk_q(module.linear)
+            # EXL2.5: Hadamard requires an fp16 head (-hb 16). With a quantized head, skip
+            # the rotation on the head tensor. Decided HERE, before calibration, so the
+            # head's Hessian is collected in the same space its weights are quantized in.
+            if quantizers["lm_head"].exl25_had and job["head_bits"] != 16:
+                print(" !! EXL2.5 hadamard requires -hb 16 (fp16 head); skipping hadamard on the quantized lm_head")
+                quantizers["lm_head"].exl25_had = 0
 
         elif isinstance(module, ExLlamaV2RMSNorm) or isinstance(module, ExLlamaV2LayerNorm):
             mode = "norm"
@@ -492,14 +534,14 @@ def quant(job, save_fn, model):
 
         elif isinstance(module, ExLlamaV2ParallelDecoder):
             mode = "parallel_decoder"
-            quantizers["q_proj"] = AdaptiveGPTQ(module.attn.q_proj.linear)
-            quantizers["k_proj"] = AdaptiveGPTQ(module.attn.k_proj.linear)
-            quantizers["v_proj"] = AdaptiveGPTQ(module.attn.v_proj.linear)
-            quantizers["o_proj"] = AdaptiveGPTQ(module.attn.o_proj.linear)
+            quantizers["q_proj"] = mk_q(module.attn.q_proj.linear)
+            quantizers["k_proj"] = mk_q(module.attn.k_proj.linear)
+            quantizers["v_proj"] = mk_q(module.attn.v_proj.linear)
+            quantizers["o_proj"] = mk_q(module.attn.o_proj.linear)
             has_gate = module.model.config.arch.lm.mlp_gate
-            if has_gate: quantizers["gate_proj"] = AdaptiveGPTQ(module.mlp.gate_proj.linear)
-            quantizers["up_proj"] = AdaptiveGPTQ(module.mlp.up_proj.linear)
-            quantizers["down_proj"] = AdaptiveGPTQ(module.mlp.down_proj.linear)
+            if has_gate: quantizers["gate_proj"] = mk_q(module.mlp.gate_proj.linear)
+            quantizers["up_proj"] = mk_q(module.mlp.up_proj.linear)
+            quantizers["down_proj"] = mk_q(module.mlp.down_proj.linear)
 
         # Reference forward pass
 

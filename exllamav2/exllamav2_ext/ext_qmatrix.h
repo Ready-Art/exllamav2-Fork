@@ -15,7 +15,11 @@ uintptr_t make_q_matrix
     torch::Tensor gptq_g_idx,
     torch::Tensor bias,
     torch::Tensor temp_dq,
-    int max_dq_rows
+    int max_dq_rows,
+    torch::Tensor awq_scale = torch::Tensor(),
+    int exl25_bits = 0,
+    int exl25_groupsize = 0,
+    int had_k = 0
 );
 
 uintptr_t make_q_matrix_split
@@ -32,7 +36,11 @@ uintptr_t make_q_matrix_split
     torch::Tensor gptq_g_idx,
     torch::Tensor bias,
     torch::Tensor temp_dq,
-    int max_dq_rows
+    int max_dq_rows,
+    torch::Tensor awq_scale = torch::Tensor(),
+    int exl25_bits = 0,
+    int exl25_groupsize = 0,
+    int had_k = 0
 );
 
 void free_q_matrix

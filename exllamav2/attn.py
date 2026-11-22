@@ -3153,6 +3153,15 @@ class ExLlamaV2Attention(ExLlamaV2Module):
         if not isinstance(w, dict) or "q_perm" not in w:
             return None
 
+        # EXL2.5 had/awq: reconstruct() returns the STORED (rotated/scaled) space, and this
+        # shortcut matmuls raw attention output against it. Fall back to the quantized row
+        # GEMM, which applies the activation transform in-kernel. Plain uniform tensors
+        # (no rotation) reconstruct to logical weights and stay servable here.
+        from exllamav2.ext import exl25_tags
+        _b25, _g25, _h25 = exl25_tags(w)
+        if _b25 and (_h25 or w.get("q_awq_scale") is not None):
+            return None
+
         if "q_group_map" not in w:
             w["q_group_map"] = make_group_map(w["q_groups"], w["q_weight"].shape[0])
         w["q_perm"] = w["q_perm"].short()

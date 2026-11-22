@@ -49,6 +49,18 @@ parser.add_argument("-ps", "--pinned_staging", type = str, default = "on", choic
                     help = "Stage weights to the host through pinned memory on a side stream instead of a "
                            "synchronous pageable copy. Single-GPU win; produces bit-identical output. "
                            "quant-plan.md §6.8")
+parser.add_argument("-x25u", "--exl25_uniform_bits", type = int, default = 0,
+                    help = "EXL2.5: quantize every linear at a single bit-width (2/3/4/5/6/8) with uniform "
+                           "groups, served by the branchless fast-lane GEMM (m-cap 16). 0 = legacy mixed-bit EXL2.")
+parser.add_argument("-x25g", "--exl25_group_size", type = int, default = 128,
+                    help = "EXL2.5: uniform group size along K (32/64/128/256; K must divide). Default 128.")
+parser.add_argument("-x25h", "--exl25_hadamard", action = "store_true",
+                    help = "EXL2.5: K-side Hadamard incoherence (requires --exl25_uniform_bits). Weights are "
+                           "pre-rotated at conversion; the GEMM rotates activations in-kernel. Lower quant error "
+                           "at the same bpw.")
+parser.add_argument("-x25a", "--exl25_awq", action = "store_true",
+                    help = "EXL2.5: AWQ-style per-channel protection scaling from calibration activations "
+                           "(requires --exl25_uniform_bits).")
 
 args = parser.parse_args()
 
@@ -170,7 +182,18 @@ job = {"in_dir": args.in_dir,
        "device_ratios": _device_ratios,
        "pinned_staging": args.pinned_staging == "on",
        "calib_row_shards": args.calib_row_shards == "on",
+       "exl25": ({"uniform_bits": args.exl25_uniform_bits,
+                 "group_size": args.exl25_group_size,
+                 "hadamard": args.exl25_hadamard,
+                 "awq": args.exl25_awq}
+                if args.exl25_uniform_bits or args.exl25_hadamard or args.exl25_awq else None),
        "progress": "begin"}
+
+if job["exl25"]:
+    if (job["exl25"]["hadamard"] or job["exl25"]["awq"]) and not job["exl25"]["uniform_bits"]:
+        print(" ## Error: --exl25_hadamard / --exl25_awq require --exl25_uniform_bits (fast lane)")
+        sys.exit()
+    print(f" -- EXL2.5: {job['exl25']}")
 
 if args.measurement is not None:
     with open(args.measurement, "r", encoding = "utf8") as f:

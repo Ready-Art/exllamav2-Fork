@@ -42,6 +42,12 @@ public:
     half* temp_dq;
     int max_dq_rows;
 
+    // EXL2.5 per-tensor extensions (0/NULL = legacy EXL2 path, byte-identical)
+    int exl25_bits = 0;        // uniform-bit fast lane: single bit-width (2..8)
+    int exl25_groupsize = 0;   // uniform group size along K (32/64/128/256)
+    int had_k = 0;             // K-side Hadamard incoherence block (0 or 128)
+    half* cuda_awq_scale = NULL;  // per-input-channel inverse protection scale (K,)
+
     bool failed;
 
     QMatrix
@@ -70,7 +76,12 @@ public:
         half* _temp_dq,
         const int _max_dq_rows,
 
-        bool no_map = false
+        bool no_map = false,
+
+        int _exl25_bits = 0,
+        int _exl25_groupsize = 0,
+        int _had_k = 0,
+        half* _awq_scale = NULL
     );
 
     ~QMatrix();

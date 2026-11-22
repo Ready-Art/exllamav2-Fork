@@ -373,6 +373,9 @@ class ExLlamaV2:
             If True, create a rich progress bar in the console while loading. Cannot be used with callbacks
         """
 
+        from exllamav2.version import __version_string__
+        print(f" -- {__version_string__}")
+
         if progress:
             progressbar = get_basic_progress()
             progressbar.start()

@@ -116,7 +116,8 @@ class ExLlamaV2Module:
             # EXL2
 
             if key + ".q_weight" in self.model.config.tensor_file_map:
-                qtensors = self.load_multi(key, ["q_weight", "q_invperm", "q_scale", "q_scale_max", "q_groups", "q_perm", "bias"], cpu = cpu)
+                qtensors = self.load_multi(key, ["q_weight", "q_invperm", "q_scale", "q_scale_max", "q_groups", "q_perm", "bias",
+                                                 "q_uniform_bits", "q_group_size", "q_hadamard", "q_awq_scale"], cpu = cpu)
                 qtensors["q_perm"] = torch.argsort(qtensors["q_invperm"]).to(torch.int)
                 return qtensors
 

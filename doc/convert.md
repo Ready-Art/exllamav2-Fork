@@ -210,6 +210,37 @@ python convert.py \
 
 A ready-made wrapper for this exact job is in [`scripts/remote_convert_2gpu_hb16.sh`](../scripts/remote_convert_2gpu_hb16.sh).
 
+### EXL2.5 format arguments (ReadyArt fork)
+
+EXL2.5 adds per-tensor opt-in upgrades on top of EXL2. **The one rule: EXL2.5's new features
+require the EXL2.5 fast path; mixed-bpw tensors revert to the original EXL2 kernel.** A tensor
+converted with `-x25u` is served by the new fast-path GEMM (Ampere-optimized, 16-row cap);
+a tensor converted without it is classic mixed-bpw EXL2 and runs unchanged on the original
+kernel. Both kinds can coexist in one model, and any model-wide BPW remains achievable.
+Hadamard/AWQ tensors always use the fast path (the loader rejects them elsewhere);
+`EXL2_EXL25=0` is an A/B kill switch that only affects plain uniform tensors.
+
+- **-x25u / --exl25_uniform_bits *int***: Quantize every linear at a single bit-width
+  (2/3/4/5/6/8) with uniform groups — the EXL2.5 fast lane. 0/absent = classic EXL2 mixed-bit.
+- **-x25g / --exl25_group_size *int***: Uniform group size along K (32/64/128/256; K must
+  divide). Default 128. Hadamard/AWQ tensors are restricted to ≤128 (always servable).
+- **-x25h / --exl25_hadamard**: K-side Hadamard incoherence rotation (weights pre-rotated at
+  conversion, activations rotated inside the GEMM — free at inference). Lower quantization
+  error at the same bpw. Requires `-x25u`. **Requires `-hb 16` (fp16 head): with a quantized
+  head the converter skips Hadamard on the lm_head tensor** (warning printed).
+- **-x25a / --exl25_awq**: AWQ-style per-channel protection scaling derived from calibration
+  activations. Requires `-x25u`.
+
+```sh
+# EXL2.5 quality preset: uniform 6-bit + Hadamard + AWQ, fp16 head
+python convert.py -i <hf_model> -o <work> -cf <out> -b 6.0 -hb 16 -x25u 6 -x25h -x25a
+```
+
+Engram (hashed n-gram embedding) tables use a separate scalar-row converter:
+`python -m exllamav2.conversion.convert_ngram -i <model_dir> -o <out> -k <table_key>
+--bits 8 --ngram-size N --heads-per-ngram H --ple-embed-dim D --eos <id>`
+(4 or 8 bits per row; no trellis; RAM or disk-streaming lookup at inference).
+
 Notes:
 - Without `-crs on`, the measurement pass is single-device (the primary); `-d` still distributes the
   quantization of independent tensors. With `-crs on`, both passes use all listed devices.

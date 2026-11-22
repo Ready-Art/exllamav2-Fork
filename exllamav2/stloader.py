@@ -14,6 +14,7 @@ def convert_dtype(dt: str):
         Torch type, element size in bytes
     """
     if dt == "I32": return torch.int, 4
+    elif dt == "I64": return torch.long, 8
     elif dt == "I16": return torch.short, 2
     elif dt == "F16": return torch.float16, 2
     elif dt == "BF16": return torch.bfloat16, 2
