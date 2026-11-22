@@ -1,4 +1,4 @@
-# ReadyArt ExLlamaV2
+# ReadyArt ExLlamaV2.5
 
 **ReadyArt Exllamav2.5 v1.0** — tensor-parallel, speculative-decoding ExLlamaV2 for multi-GPU
 rigs, with the **EXL2.5** quantization format (fast-path GEMM + Hadamard/AWQ quality upgrades;
