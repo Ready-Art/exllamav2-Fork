@@ -1,0 +1,34 @@
+# Sample tabbyAPI config for mtp/offload_smoke_client.py (prompt-cache RAM offload).
+# Copy to tabbyAPI-Fork/config.yml and start the server, then run the client against
+# port 5002. Paths below match the tested 4x RTX 3090 rig (~/exl2work); adjust
+# model_dir / gpu_split for your machine. max_batch_size: 2 with 4 conversations in
+# phase O1 forces cold restores; prompt_cache_ram_limit_mb is a WHOLE-SERVER cap.
+network:
+  host: 127.0.0.1
+  port: 5002
+  disable_auth: true
+
+model:
+  model_dir: /home/westfox35/exl2work/models
+  model_name: Gemma-4-31B-IT-EXL2-6.0BPW-HB16
+  backend: exllamav2
+  max_seq_len: 32768
+  cache_size: 32768
+  chunk_size: 2048
+  tensor_parallel: true
+  tensor_parallel_backend: mp
+  gpu_split: [22, 22, 22, 22]
+  tp_graphs: true
+  reasoning: true
+  tool_format: gemma4
+  max_batch_size: 2
+  prompt_cache_offload: true
+  prompt_cache_ram_limit_mb: 16384
+draft_model:
+  draft_model_dir: /home/westfox35/exl2work/models
+  draft_mode: mtp
+  draft_model_name: gemma-4-31B-it-assistant
+  draft_num_tokens: 3
+  draft_device: 0
+  sparse_draft_head: 16384
+  mtp_draft_graph: true

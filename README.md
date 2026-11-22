@@ -94,6 +94,7 @@ architectures are untested here — treat them as experimental and verify correc
 | **MTP speculative decoding** | A Gemma-4 *assistant* drafter proposes a window of tokens; the target verifies them in one forward. Works **with TP and MP** (the drafter gathers the target's sharded K/V). |
 | **DFlash block-diffusion drafting (experimental)** | A [z-lab DFlash](https://huggingface.co/z-lab/gemma-4-31B-it-DFlash) drafter denoises a whole block (anchor + up to 15 mask tokens) in **one parallel pass**, conditioned on the target's hidden states; FlashInfer attention. **MP only**, batch size 1; see [DFlash](#dflash-block-diffusion-drafting-experimental-mp). |
 | **Multi-batch (experimental)** | Slot-based concurrency on the **MP + MTP** path (`TPProcessGroup(max_batch=N)` + `MTPMPBatchDriver`): one cache row per job, batched graphed verify rounds, per-slot append-only prompt caching. Opt-in; see [Multi-batch](#multi-batch-experimental-mp--mtp). |
+| **Prompt-cache RAM offload (experimental)** | Tier idle prompt-cache lineages to host RAM under a **whole-server** byte cap, so the VRAM context budget is not a hard limit on cached conversations (API sharing). `TPProcessGroup.offload_row` / `restore_row`; restores the MTP shadow + boundary ring snapshot (thought-stripped and long conversations). Opt-in; see [Prompt-cache RAM offload](#prompt-cache-ram-offload-experimental-mp--mtp). |
 | **Gemma-4-31B-IT support** | Text-only. Handles the model's two attention geometries (head_dim 256 sliding / 512 full), `k_eq_v` layers, proportional RoPE and per-layer norms. |
 | **Sliding-window + TP KV cache** | `ExLlamaV2Cache_SWA` / `ExLlamaV2Cache_TP`: ring buffers for sliding layers make long context fit (≈22.5 GB instead of ≈236 GB at 256k for Gemma-4-31B). |
 | **TP CUDA graphs** | Whole-step decode graphs (`tp_graph`) remove per-op launch latency on the tensor-parallel path. |
@@ -303,6 +304,49 @@ table). **On 2 GPUs each rank holds twice the KV heads**, so halve the per-slot 
 ~11.7 GB/rank on 2 GPUs). Through TabbyAPI, enable it with `model.max_batch_size` (see the
 TabbyAPI fork docs); the exllamav2-side knobs are `TPProcessGroup(max_batch=...)` and the
 `forward_batch` / `gather_kv_mtp_batch` / `clone_row` protocol.
+
+### Prompt-cache RAM offload (experimental, MP + MTP)
+
+**Status: experimental.** Row-level tiering of idle prompt-cache lineages to host RAM, so the
+VRAM context budget is not a hard cap on how many conversations stay cached (e.g. when sharing
+the API). The VRAM rows keep the hot lineages; an idle lineage whose row is needed by a new job
+is copied to RAM and a later matching request restores it in milliseconds instead of
+re-prefilling. Works at batch 1 and multi-batch; MTP only (DFlash keeps its own draft K/V).
+
+The `TPProcessGroup` primitives (`exllamav2/tp_mp.py`):
+
+- `offload_row(row, pos, wb, entry_id)` → a bundle. Each rank D2Hs its own slice of the row's
+  committed K/V (full layers `[0, pos)`, SWA ring valid prefix) into **worker-local host
+  storage** — the K/V never crosses the process pipe, only metadata does. The master keeps its
+  own slice plus the joined MTP draft shadow row; the prompt-boundary ring snapshot is re-keyed
+  to the entry (zero-copy, it is already host-resident). Returns `None` on host-allocation
+  failure (the caller skips the offload).
+- `restore_row(row, bundle, p=None, attach_snapshot=False)` → H2Ds the stored prefixes back into
+  the row at position `p` (default the full committed position), restores the shadow gather
+  frontiers (so the next gather pulls only the delta), and optionally re-attaches the boundary
+  ring snapshot. `truncate_cache(p)` is the batch-1 partial-prefix rewind.
+- `drop_offload_bundle(bundle)` frees the worker-local storage + detached snapshot (idempotent).
+
+Semantics and safety:
+
+- **No VRAM allocation** anywhere in these paths — every copy targets the preallocated cache
+  rows / shadow buffers, so offload/restore cannot OOM VRAM and never touch the CUDA graphs
+  (they run between rounds, like `clone_row`).
+- The **RAM cap is global to the server**, enforced by the scheduler's cold store (TabbyAPI
+  `model.prompt_cache_ram_limit_mb`): it sums every rank's stored slice + snapshots + shadow per
+  lineage and evicts oldest/least-used first. Per-process RSS also includes uncapped working
+  buffers (hot-row ring snapshots, grow-only pinned pack staging, CUDA context, the master's
+  drafter host embed), so it exceeds `cap / num_gpus`.
+- `cache_size` stays the per-row VRAM depth; RAM extends the *number* of cached lineages, not a
+  single conversation's attendable depth (full-attention K/V must be VRAM-resident for attention).
+- **Thought-stripped / long conversations**: restoring the full lineage + re-attaching the
+  boundary snapshot lets the scheduler rewind the SWA ring to the prompt boundary even after a
+  long generation shifted the ring past it, so a re-rendered continuation restores its document
+  instead of re-prefilling it.
+- Failure-soft: a failed restore drops the entry and re-prefills; the job never fails because of
+  the offload system. Through TabbyAPI: `model.prompt_cache_offload: true` (+
+  `prompt_cache_ram_limit_mb`); `EXL2_PROMPT_OFFLOAD=0` kill switch, `EXL2_OFFLOAD_DEBUG=1`
+  decision logging. See the TabbyAPI fork docs for the config and the global-cap details.
 
 ## Gemma-4-31B-IT
 

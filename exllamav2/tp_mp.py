@@ -297,6 +297,43 @@ def mp_worker(conn, device, world_size, rank, init_method, uuid_hex, model_dir, 
                                   ctx["ring_backup_rows"][r], seq,
                                   ctx["ring_backup_rows_wb"][r])
                 conn.send(("ok", None))
+            elif cmd == "offload-row":
+                # Prompt-cache RAM offload: D2H this rank's slice of ONE idle row
+                # into worker-local host storage (the KV never crosses the pipe --
+                # each rank keeps its own slice; the parent stores only metadata +
+                # its own master slice + the MTP shadow). The row's prompt-boundary
+                # ring snapshot, if any, is re-keyed to the entry id (zero-copy).
+                # args: (row, pos, wb, entry_id). Reply: (meta, nbytes, snap_bytes)
+                # or None when host allocation fails (parent skips the offload).
+                row, pos, wb, entry_id = args
+                try:
+                    flat, meta = _pack_row_offload(ctx, row, pos, wb)
+                    store = flat.clone()   # pageable storage; staging is reusable
+                except Exception:
+                    conn.send(("ok", None))
+                    continue
+                ctx.setdefault("cold_bundles", {})[entry_id] = (store, meta)
+                snap_bytes = _detach_ring_snapshot(ctx, row, entry_id)
+                conn.send(("ok", (meta, store.numel() * store.element_size(), snap_bytes)))
+            elif cmd == "restore-row":
+                # H2D a stored offload bundle back into ONE idle row, truncated to
+                # position p (>= the bundle's ring origin). args:
+                # (row, entry_id, p, wb, attach_snapshot). The bundle's meta carries
+                # the ORIGINAL packed shapes; only the [0, p) / [0, p - wb) prefixes
+                # are copied (the rest of the row is unread until overwritten).
+                row, entry_id, p, wb, attach_snapshot = args
+                store, meta = ctx["cold_bundles"][entry_id]
+                _restore_row_offload(ctx["cache"], row, store, meta, p, wb)
+                if attach_snapshot:
+                    _attach_ring_snapshot(ctx, row, entry_id)
+                conn.send(("ok", None))
+            elif cmd == "drop-cold-bundle":
+                # Free one offloaded lineage's worker-local storage + detached ring
+                # snapshot (RAM-cap eviction / entry consumed by a full restore).
+                entry_id = args[0]
+                ctx.get("cold_bundles", {}).pop(entry_id, None)
+                ctx.get("ring_backup_cold", {}).pop(entry_id, None)
+                conn.send(("ok", None))
             elif cmd == "sync":
                 torch.cuda.synchronize()
                 conn.send(("ok", None))
@@ -450,6 +487,134 @@ def _restore_swa_ring(cache, backup, seq, wb):
         torch.cuda.synchronize()
     cache.current_seq_len = seq
     cache.window_beg = wb
+
+
+# ---------------------------------------------------------------------------
+# Prompt-cache RAM offload (opt-in): row-level D2H / H2D of committed K/V.
+#
+# Each rank stores its OWN slice of an offloaded lineage in host RAM (worker:
+# ctx["cold_bundles"], master: the parent's bundle dict). The KV never crosses
+# the process pipe -- only metadata does. The MTP drafter's joined shadow row
+# and the prompt-boundary ring snapshots travel with the lineage (the snapshots
+# are already host-resident per rank; offload/restore just re-keys ownership).
+#
+# VRAM safety: every copy targets the PREALLOCATED cache rows / shadow buffers.
+# Nothing here allocates device memory, so offload/restore cannot OOM VRAM.
+# Host safety: storage allocation failures abort the offload gracefully (the
+# scheduler falls back to a full re-prefill); the RAM cap is enforced by the
+# scheduler's cold store BEFORE it calls offload_row.
+# ---------------------------------------------------------------------------
+
+def _pack_row_offload(ctx, row, pos, wb):
+    """D2H one idle cache row's committed K/V into a flat pinned staging tensor.
+
+    Full-attention layers: [0, pos). SWA layers: the ring's valid prefix
+    [0, min(pos - wb, ring)) -- the stale tail beyond the fill is never read
+    (attention is bounded by swa_len; the same invariant clone_row relies on).
+    Layout: per layer in index order, K block then V block, each (rows, kvh, hd).
+    meta = (pos, wb, [(layer, rows, kvh, hd), ...]) lets the restore unpack the
+    ORIGINAL shapes even when restoring a truncated prefix p < pos.
+
+    Grow-only pinned staging (one allocation amortized across offloads), async
+    copies + a single sync -- the kv-pack pattern. The caller clones the returned
+    view into storage before the staging is reused."""
+    cache = ctx["cache"]
+    ring = cache.kv_state_size
+    n = max(0, min(pos - wb, ring))
+    blocks = []
+    total = 0
+    for l in range(len(cache.key_states)):
+        kc = cache.key_states[l]
+        if kc is None:
+            continue
+        rows = n if kc.shape[1] == ring else pos
+        if rows <= 0:
+            continue
+        kh, hd = kc.shape[2], kc.shape[3]
+        blocks.append((l, rows, kh, hd))
+        total += 2 * rows * kh * hd
+    stag = ctx.get("offload_staging")
+    if stag is None or stag.numel() < total:
+        stag = ctx["offload_staging"] = torch.empty(max(total, 1), dtype = torch.half,
+                                                    pin_memory = True)
+    o = 0
+    for (l, rows, kh, hd) in blocks:
+        for t in (cache.key_states[l][row, :rows], cache.value_states[l][row, :rows]):
+            stag[o:o + t.numel()].view(t.shape).copy_(t, non_blocking = True)
+            o += t.numel()
+    torch.cuda.current_stream().synchronize()
+    return stag[:total], (pos, wb, blocks)
+
+
+def _restore_row_offload(cache, row, flat, meta, p, wb):
+    """H2D an offloaded bundle's prefixes into one idle row at position p.
+
+    Unpacks with the ORIGINAL packed shapes (meta), copies full layers [0, p)
+    and the SWA ring prefix [0, p - wb), then adopts the bookkeeping. At
+    batch_size 1 the scalar current_seq_len / window_beg fields are synced too
+    (the verified single-sequence path reads those, not the row lists)."""
+    pos0, wb0, blocks = meta
+    assert wb <= p <= pos0, f"restore_row_offload: bad position {p} (wb {wb}, pos0 {pos0})"
+    ring = cache.kv_state_size
+    o = 0
+    with torch.inference_mode():
+        for (l, rows, kh, hd) in blocks:
+            kc, vc = cache.key_states[l], cache.value_states[l]
+            take = min(p - wb, rows) if kc.shape[1] == ring else min(p, rows)
+            k = flat[o:o + rows * kh * hd].view(rows, kh, hd)
+            o += rows * kh * hd
+            v = flat[o:o + rows * kh * hd].view(rows, kh, hd)
+            o += rows * kh * hd
+            if take > 0:
+                kc[row, :take].copy_(k[:take], non_blocking = True)
+                vc[row, :take].copy_(v[:take], non_blocking = True)
+        torch.cuda.current_stream().synchronize()
+    cache.seq_lens[row] = p
+    cache.window_begs[row] = wb
+    if cache.batch_size == 1:
+        cache.current_seq_len = p
+        cache.window_beg = wb
+
+
+def _detach_ring_snapshot(ctx, row, entry_id):
+    """Move a row's prompt-boundary ring snapshot into cold storage keyed by the
+    offload entry id (zero-copy -- the snapshot is already pinned host RAM).
+    Returns the snapshot's byte size (0 when the row had none). Handles both the
+    per-row batch snapshots and the scalar batch-1 snapshot."""
+    cache = ctx["cache"]
+    cold = ctx.setdefault("ring_backup_cold", {})
+    backups = ctx.get("ring_backup_rows", {})
+    if row in backups:
+        backup = backups.pop(row)
+        wb = ctx["ring_backup_rows_wb"].pop(row)
+        seq = ctx.get("ring_backup_rows_seq", {}).pop(row, None)
+    elif cache.batch_size == 1 and ctx.get("ring_backup") is not None:
+        backup = ctx.pop("ring_backup")
+        wb = ctx.pop("ring_backup_wb")
+        seq = None   # the scalar restore takes the position as an argument
+    else:
+        return 0
+    cold[entry_id] = (backup, wb, seq)
+    return sum(k.numel() * k.element_size() + v.numel() * v.element_size()
+               for k, v in backup.values())
+
+
+def _attach_ring_snapshot(ctx, row, entry_id):
+    """Move a detached ring snapshot back to a row (full-lineage restore). The
+    snapshot keeps its ORIGINAL prompt-boundary position -- exactly the state a
+    hot row would carry, so the thought-stripping restore path works unchanged."""
+    cold = ctx.get("ring_backup_cold", {})
+    if entry_id not in cold:
+        return
+    backup, wb, seq = cold.pop(entry_id)
+    if ctx["cache"].batch_size == 1:
+        ctx["ring_backup"] = backup
+        ctx["ring_backup_wb"] = wb
+    else:
+        ctx.setdefault("ring_backup_rows", {})[row] = backup
+        ctx.setdefault("ring_backup_rows_wb", {})[row] = wb
+        if seq is not None:
+            ctx.setdefault("ring_backup_rows_seq", {})[row] = seq
 
 
 def _worker_kv_pack(ctx, lf, fl0, fl1, ls, sl0, sl1):
@@ -1674,6 +1839,26 @@ class TPProcessGroup:
         for device, w in sorted(self.workers.items()):
             w.recv()
 
+    def truncate_cache(self, p):
+        """Scalar (batch-1) partial prefix reuse: rewind to ``p`` on every rank,
+        keeping the K/V. The scalar current_seq_len / window_beg fields are the
+        batch-1 path's authoritative bookkeeping (the per-row lists are not
+        maintained by the scalar forwards), so this moves those -- not the rows.
+        p must sit inside the live ring (>= window_beg); the ring is untouched
+        (its valid fill shrinks to p - window_beg). The scalar shadow frontiers
+        truncate so the next gather pulls only the suffix delta."""
+        mc = self.cache
+        assert mc.window_beg <= p <= mc.current_seq_len, \
+            f"truncate_cache: bad position {p}"
+        for device, w in sorted(self.workers.items()):
+            w.send("set-seqlen", (p,))
+            w.recv()
+        mc.current_seq_len = p
+        st = self._mtp_kv
+        if st is not None and "fls" not in st:
+            st["fl"] = min(st["fl"], p)
+            st["sl"] = min(st["sl"], p)
+
     def snapshot_prompt_ring_row(self, row):
         """Per-slot prompt-boundary ring snapshot (pinned CPU on every rank)."""
         seq = self.cache.seq_lens[row]
@@ -1704,6 +1889,213 @@ class TPProcessGroup:
             w.recv()
         self._reset_mtp_kv_row(row)
         return True
+
+    # ------------------------------------------------------------------ prompt-cache RAM offload
+
+    def offload_row(self, row, pos = None, wb = None, entry_id = None):
+        """Offload ONE idle row's committed K/V state to host RAM (opt-in prompt
+        cache tiering). Returns a bundle dict the scheduler stores; the KV slices
+        stay rank-local (workers keep theirs in ctx["cold_bundles"], the master's
+        flat copy is in the bundle), so nothing large crosses the pipe. The MTP
+        drafter's joined shadow row and the prompt-boundary ring snapshot travel
+        with the lineage. Returns None when host allocation fails anywhere (the
+        caller skips the offload; any partial worker storage is cleaned up).
+
+        pos/wb default to the row's batch bookkeeping; the scalar batch-1 path
+        passes cache.current_seq_len / window_beg explicitly (it owns those).
+        NEVER allocates device memory -- VRAM cannot OOM from this path."""
+        mc = self.cache
+        if pos is None:
+            pos = mc.seq_lens[row]
+        if wb is None:
+            wb = mc.window_begs[row]
+        assert 0 < pos <= mc.max_seq_len and 0 <= wb <= pos, \
+            f"offload_row: bad position {pos} / window origin {wb}"
+        if entry_id is None:
+            entry_id = uuid.uuid4().hex
+        for device, w in sorted(self.workers.items()):
+            w.send("offload-row", (row, pos, wb, entry_id))
+        try:
+            flat, meta = _pack_row_offload(self.master_ctx, row, pos, wb)
+            master_flat = flat.clone()
+        except Exception:
+            master_flat = None
+        metas = {}
+        nbytes = 0
+        snap_bytes = 0
+        failed = master_flat is None
+        for device, w in sorted(self.workers.items()):
+            r = w.recv()
+            if r is None:
+                failed = True
+                continue
+            wmeta, wn, wsn = r
+            metas[device] = wmeta
+            nbytes += wn
+            snap_bytes += wsn
+        if failed:
+            self.drop_offload_bundle({"entry_id": entry_id})
+            return None
+        nbytes += master_flat.numel() * master_flat.element_size()
+
+        # Master's own ring snapshot (kept on the pg object, not master_ctx).
+        local_snap = None
+        local_snap_bytes = 0
+        backups = getattr(self, "_ring_backup_rows", None)
+        if backups is not None and row in backups:
+            backup = backups.pop(row)
+            local_snap = (backup, self._ring_backup_rows_wb.pop(row),
+                          self._ring_backup_rows_seq.pop(row))
+        elif self.max_batch == 1 and self._ring_backup_local is not None:
+            local_snap = (self._ring_backup_local, self._ring_backup_wb,
+                          self._ring_backup_seq)
+            self._ring_backup_local = None
+            self._ring_backup_seq = -1
+        if local_snap is not None:
+            local_snap_bytes = sum(
+                k.numel() * k.element_size() + v.numel() * v.element_size()
+                for k, v in local_snap[0].values())
+
+        shadow = self._save_shadow_row(row)
+        shadow_bytes = 0
+        if shadow is not None:
+            shadow_bytes = sum(t.numel() * t.element_size()
+                               for t in shadow.values() if torch.is_tensor(t))
+        return {
+            "entry_id": entry_id,
+            "ranks": metas,
+            "master_flat": master_flat,
+            "master_meta": meta,
+            "pos": pos,
+            "wb": wb,
+            "local_snap": local_snap,
+            "shadow": shadow,
+            "bytes": nbytes + snap_bytes + local_snap_bytes + shadow_bytes,
+        }
+
+    def restore_row(self, row, bundle, p = None, attach_snapshot = False):
+        """Restore an offloaded lineage into ONE idle row at position p (default:
+        the bundle's full committed position). p must sit inside the bundle's ring
+        (>= bundle wb). Every rank H2Ds its own stored slice; the master restores
+        its slice + the MTP shadow row; attach_snapshot=True also moves the
+        prompt-boundary ring snapshot back to the row (full-lineage adoption --
+        partial prefixes keep it in cold storage). Copies target preallocated
+        buffers only: no device allocation, no graph interaction (runs between
+        rounds, like clone_row). Raises on worker failure -- the caller drops the
+        bundle and falls back to a full re-prefill."""
+        if p is None:
+            p = bundle["pos"]
+        wb = bundle["wb"]
+        assert wb <= p <= bundle["pos"], \
+            f"restore_row: bad position {p} (wb {wb}, pos {bundle['pos']})"
+        eid = bundle["entry_id"]
+        for device, w in sorted(self.workers.items()):
+            w.send("restore-row", (row, eid, p, wb, attach_snapshot))
+        _restore_row_offload(self.cache, row, bundle["master_flat"],
+                             bundle["master_meta"], p, wb)
+        if attach_snapshot and bundle.get("local_snap") is not None:
+            backup, swb, sseq = bundle["local_snap"]
+            if self.max_batch > 1:
+                self._ring_backup_rows[row] = backup
+                self._ring_backup_rows_wb[row] = swb
+                if sseq is not None:
+                    self._ring_backup_rows_seq[row] = sseq
+            else:
+                self._ring_backup_local = backup
+                self._ring_backup_wb = swb
+                self._ring_backup_seq = sseq if sseq is not None else -1
+            bundle["local_snap"] = None   # ownership moved to the row
+        self._restore_shadow_row(row, bundle.get("shadow"), p)
+        for device, w in sorted(self.workers.items()):
+            w.recv()
+        return True
+
+    def drop_offload_bundle(self, bundle):
+        """Free an offloaded lineage: worker-local KV storage + detached ring
+        snapshots on every rank, then the parent's own tensors (GC). Idempotent;
+        safe on partially-created bundles (offload failure cleanup)."""
+        eid = bundle.get("entry_id")
+        if eid is not None:
+            for device, w in sorted(self.workers.items()):
+                try:
+                    w.send("drop-cold-bundle", (eid,))
+                except Exception:
+                    pass
+            for device, w in sorted(self.workers.items()):
+                try:
+                    w.recv()
+                except Exception:
+                    pass
+        bundle["master_flat"] = None
+        bundle["local_snap"] = None
+        bundle["shadow"] = None
+
+    def _save_shadow_row(self, row):
+        """D2H the MTP drafter's joined shadow prefix for one row (the gathered
+        K/V of its two source layers) + the gather frontiers. Restoring these lets
+        the next gather pull only the small post-restore delta instead of a full
+        context re-pull through the pipes. None when there is no shadow (DFlash)."""
+        st = self._mtp_kv
+        if st is None:
+            return None
+        ring = self.cache.kv_state_size
+        batched = "fls" in st
+        if batched:
+            fl, sl, wb = st["fls"][row], st["sls"][row], st["wbs"][row]
+            n = max(0, min(sl - wb, ring))
+            out = {
+                "kf": st["kf"][row, :fl].detach().cpu(),
+                "vf": st["vf"][row, :fl].detach().cpu(),
+                "ks": st["ks"][row, :n].detach().cpu(),
+                "vs": st["vs"][row, :n].detach().cpu(),
+            }
+        else:
+            fl, sl, wb = st["fl"], st["sl"], st["wb"]
+            n = max(0, min(sl - wb, ring))
+            out = {
+                "kf": st["kf"][:fl].detach().cpu(),
+                "vf": st["vf"][:fl].detach().cpu(),
+                "ks": st["ks"][:n].detach().cpu(),
+                "vs": st["vs"][:n].detach().cpu(),
+            }
+        out.update(fl = fl, sl = sl, wb = wb, batched = batched)
+        return out
+
+    def _restore_shadow_row(self, row, shadow, p):
+        """H2D a saved shadow prefix back, truncated to position p (the clone_row
+        frontier contract: gather frontiers land at min(p, fl), the next gather
+        pulls the delta). Re-zeros the row first -- the zero-init contract keeps
+        unwritten tail rows finite for the drafter's full-depth attention reads."""
+        st = self._mtp_kv
+        if st is None or shadow is None:
+            return
+        ring = self.cache.kv_state_size
+        f = min(p, shadow["fl"])
+        n = max(0, min(f - shadow["wb"], ring))
+        if shadow["batched"]:
+            self._reset_mtp_kv_row(row)
+            with torch.inference_mode():
+                if f > 0:
+                    st["kf"][row, :f].copy_(shadow["kf"][:f])
+                    st["vf"][row, :f].copy_(shadow["vf"][:f])
+                if n > 0:
+                    st["ks"][row, :n].copy_(shadow["ks"][:n])
+                    st["vs"][row, :n].copy_(shadow["vs"][:n])
+            st["fls"][row] = f
+            st["sls"][row] = f
+            st["wbs"][row] = shadow["wb"]
+        else:
+            self._reset_mtp_kv()
+            with torch.inference_mode():
+                if f > 0:
+                    st["kf"][:f].copy_(shadow["kf"][:f])
+                    st["vf"][:f].copy_(shadow["vf"][:f])
+                if n > 0:
+                    st["ks"][:n].copy_(shadow["ks"][:n])
+                    st["vs"][:n].copy_(shadow["vs"][:n])
+            st["fl"] = f
+            st["sl"] = f
+            st["wb"] = shadow["wb"]
 
     def close(self):
         # Stop any in-flight prefill at its next chunk boundary so workers reach the
