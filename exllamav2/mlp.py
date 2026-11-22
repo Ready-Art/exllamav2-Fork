@@ -502,23 +502,49 @@ class ExLlamaV2MLP(ExLlamaV2Module):
             # output.clamp_(min = -65504.0, max = 65504.0)
             outputs.append(output)
 
-        if ctx.seqpar and ctx.decode_repl and q_len <= 32:
-            # decode_repl: gather the down RS output shard to FULL width, post-norm
-            # full-width (no stat all_reduce), add the full residual. Mirrors attn.py.
-            outputs = ctx.allgather(1, outputs, BROADCAST_ID, BROADCAST_ID)
-            down = self.down_proj.forward_tp(outputs, output_split = True)
-            out_full = ctx.allgather(1, [down[0]], BROADCAST_RS, BROADCAST_RS)
+        if ctx.seqpar and ctx.decode_repl and q_len <= 32 \
+                and getattr(self, "_down_row_repl", False) and not loras:
+            # Stage 3 row-parallel down (EXL2_TP_ROW_REPL=1): outputs[0] is this rank's
+            # gate/up shard in down's q_perm input order (output_map baked at load), so the
+            # row GEMM runs locally -> full-hidden partial -> one allreduce. Eliminates the
+            # intermediate allgather AND the RS-shard allgather (2 -> 1). Mirrors o_proj.
+            partial = self.down_proj.forward(outputs[0], loras = loras)
+            out_full = ctx.all_reduce_hidden(partial, "down")
             if self.post_layernorm is not None:
                 out_full = self.post_layernorm.forward(out_full)
             if self.has_residual:
                 out_full = out_full + residual
             return out_full.view(batch_size, q_len, out_full.shape[-1])
 
-        if ctx.seqpar and getattr(self, "_down_rs_row", False):
+        if ctx.seqpar and ctx.decode_repl and q_len <= 32:
+            # decode_repl: gather the down RS output shard to FULL width, post-norm
+            # full-width (no stat all_reduce), add the full residual. Mirrors attn.py.
+            outputs = ctx.allgather(1, outputs, BROADCAST_ID, BROADCAST_ID)
+            down = self.down_proj.forward_tp(outputs, output_split = True)
+            # Fused AG+post-norm+residual (EXL2_TP_FUSE_AGNR=1), mirrors attn.py.
+            _fused = None
+            if os.environ.get("EXL2_TP_FUSE_AGNR", "0") == "1" \
+                    and self.post_layernorm is not None and self.has_residual:
+                _fused = ctx.ag_norm_res(down[0], 3, self.post_layernorm.weight,
+                                         residual, self.post_layernorm.variance_epsilon)
+            if _fused is not None:
+                out_full = _fused
+            else:
+                out_full = ctx.allgather(1, [down[0]], BROADCAST_RS, BROADCAST_RS)
+                if self.post_layernorm is not None:
+                    out_full = self.post_layernorm.forward(out_full)
+                if self.has_residual:
+                    out_full = out_full + residual
+            return out_full.view(batch_size, q_len, out_full.shape[-1])
+
+        if ctx.seqpar and (getattr(self, "_down_rs_row", False)
+                           or getattr(self, "_down_row_repl", False)):
             # Row-parallel down_proj: this rank's activation shard IS its input slice, so
             # the GEMM runs locally (no intermediate allgather -- that moved 4x the bytes
             # of the reduce-scatter which replaces it). The full-hidden partial sums are
-            # reduce-scattered on the RS split straight into the residual shard.
+            # reduce-scattered on the RS split straight into the residual shard. Serves
+            # prefill (q_len>32) for both DOWN_RS and ROW_REPL (decode_repl ROW_REPL uses
+            # the allreduce branch above; the row handle needs this RS path for prefill).
             partial = self.down_proj.forward(outputs[0], loras = loras)
             out_shard = ctx.reduce_scatter_hidden(partial)
             if self.post_layernorm is not None:
@@ -759,7 +785,15 @@ class ExLlamaV2MLP(ExLlamaV2Module):
         # used column-parallel + allgather). Default OFF restores that verified layout;
         # =1 re-enables the reduce-scatter win for A/B once correctness is re-confirmed.
         self._down_rs_row = False
-        if self.model.tp_context.seqpar and os.environ.get("EXL2_TP_DOWN_RS", "0") != "0":
+        # Stage 3 (EXL2_TP_ROW_REPL): row-parallel down for decode_repl (gate/up output remapped
+        # by down's q_perm -> row GEMM local -> partial all-reduced, 2 collectives -> 1).
+        # **DISABLED / BROKEN — DO NOT ENABLE** (same parity bug as the o_proj row path; see
+        # attn.py tp_load_rank + theplan.md §12 stage 3). Gate force-off until root-caused.
+        self._down_row_repl = False
+        if False and self.model.tp_context.seqpar and os.environ.get("EXL2_TP_ROW_REPL", "0") == "1":
+            down_perm = self.down_proj.tp_load_rank_row(rank, BROADCAST_ID, BROADCAST_RS)
+            self._down_row_repl = True
+        elif self.model.tp_context.seqpar and os.environ.get("EXL2_TP_DOWN_RS", "0") != "0":
             down_perm = self.down_proj.tp_load_rank_row(rank, BROADCAST_ID, BROADCAST_RS)
             self._down_rs_row = True
         else:

@@ -22,6 +22,7 @@
 #include "ext_element.h"
 #include "ext_tp.h"
 #include "ext_prefill.h"
+#include "ext_verify.h"
 #include "ext_p2p.h"
 
 #include "cuda/cache.cuh"
@@ -62,11 +63,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("make_q_matrix_split", &make_q_matrix_split, "make_q_matrix_split");
     m.def("free_q_matrix", &free_q_matrix, "free_q_matrix");
     m.def("prefill_hd512", &prefill_hd512, "prefill_hd512");
+    m.def("verify_hd512", &verify_hd512, "verify_hd512");
     m.def("p2p_enable_peer_access", &p2p_enable_peer_access, "p2p_enable_peer_access");
     m.def("p2p_ipc_handle", &p2p_ipc_handle, "p2p_ipc_handle");
     m.def("p2p_ipc_open", &p2p_ipc_open, "p2p_ipc_open");
     m.def("p2p_allgather", &p2p_allgather, "p2p_allgather");
     m.def("p2p_barrier", &p2p_barrier, "p2p_barrier");
+    m.def("p2p_ag_norm_res", &p2p_ag_norm_res, "p2p_ag_norm_res");
     m.def("p2p_allreduce", &p2p_allreduce, "p2p_allreduce");
     m.def("reconstruct", &reconstruct, "reconstruct");
     m.def("gemm_half_q_half", &gemm_half_q_half, "gemm_half_q_half");

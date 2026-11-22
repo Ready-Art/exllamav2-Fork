@@ -1575,6 +1575,40 @@ class TPContext:
         full = self._gather_nccl(x2, BROADCAST_RS, 1, tag = 2)
         return full.view(*shape[:-1], full.shape[-1])
 
+    def ag_norm_res(self, shard: torch.Tensor, tag: int, weight: torch.Tensor,
+                    residual: torch.Tensor, eps: float):
+        """
+        Fused decode_repl block tail: allgather this rank's RS output shard to full hidden
+        width, RMSNorm (full weight), add full residual -- one P2P kernel instead of
+        AG + norm + add. Returns the full-width fp16 result, or None to fall back to the
+        unfused path (P2P off / unsupported shape / non-fp16). ``tag`` separates the attn
+        and mlp call sites (distinct arena slots + output buffers). The output buffer is
+        cached per (tag, rows, hidden) and graph-stable (BUG 82/110 pattern).
+        """
+        p2p = self.p2p
+        if p2p is None or not p2p.enabled:
+            return None
+        if shard.dtype != torch.half or residual.dtype != torch.half \
+                or weight.dtype != torch.half:
+            return None
+        split = self.get_split_full(BROADCAST_RS)
+        widths = [(b - a) for _, a, b in split]
+        if len(set(widths)) != 1 or shard.shape[1] != widths[0]:
+            return None
+        rows = shard.shape[0]
+        hidden = widths[0] * len(split)
+        key = (tag, rows, hidden)
+        bufs = getattr(self, "_agnr_cache", None)
+        if bufs is None:
+            bufs = self._agnr_cache = {}
+        out = bufs.get(key)
+        if out is None:
+            with torch.inference_mode(False):
+                out = torch.empty((rows, hidden), dtype=torch.half, device=shard.device)
+            bufs[key] = out
+        return p2p.ag_norm_res(shard, (tag, BROADCAST_RS, widths[0], torch.half),
+                               (rows, hidden), weight, residual, out, eps)
+
     def reduce_scatter_hidden(self, partial: torch.Tensor) -> torch.Tensor:
         """
         Sequence-parallel row-parallel reduction: sum full-width partial outputs across
@@ -1616,6 +1650,26 @@ class TPContext:
             dist.all_reduce(partial, op = dist.ReduceOp.SUM)
         _, a, b = self.get_split(BROADCAST_RS)[0]
         return partial[:, a:b].contiguous()
+
+    def all_reduce_hidden(self, partial: torch.Tensor, key: str = "__ar__") -> torch.Tensor:
+        """
+        Full-width SUM all-reduce of a row-parallel projection's (rows, hidden) partial,
+        for the decode_repl row-parallel path (EXL2_TP_ROW_REPL): replaces the reassembly
+        allgather + RS-shard allgather (2 collectives) with ONE allreduce. Uses the PCIe
+        P2P allreduce (per-key slotted scratch, deferred-ack, graph-safe) when available,
+        else NCCL. ``key`` separates call sites (o_proj vs down) so their captured scratch
+        regions never alias. In-place on the P2P path; returns the reduced full tensor.
+        """
+        import torch.distributed as dist
+        assert self.rank is not None, "all_reduce_hidden requires rank-local (MP) mode"
+        if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() == 1:
+            return partial
+        p2p = self.p2p
+        if p2p is not None and p2p.enabled and p2p.allreduce(partial, key):
+            return partial
+        with _CollTimer(_PREFILL_TRACE and partial.shape[0] > 32 and not self.graph_mode):
+            dist.all_reduce(partial, op = dist.ReduceOp.SUM)
+        return partial
 
     def gather_dev(
         self,

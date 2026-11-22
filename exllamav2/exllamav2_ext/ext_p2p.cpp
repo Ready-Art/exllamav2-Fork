@@ -105,6 +105,58 @@ void p2p_barrier
     );
 }
 
+void p2p_ag_norm_res
+(
+    int64_t arena_ptr,
+    int64_t peer_ptrs_ptr,
+    int64_t shard_ptr,
+    int64_t slot_off,
+    int64_t shard_bytes,
+    int64_t row_bytes,
+    int64_t world,
+    int64_t rank,
+    int64_t flags_off,
+    int64_t acks_off,
+    int64_t counter_off,
+    int64_t wait_ack,
+    torch::Tensor weight,
+    torch::Tensor residual,
+    torch::Tensor out,
+    int64_t rows,
+    int64_t hidden,
+    double eps
+)
+{
+    TORCH_CHECK(weight.is_cuda() && weight.dtype() == torch::kHalf
+                && residual.dtype() == torch::kHalf && out.dtype() == torch::kHalf,
+                "p2p_ag_norm_res: weight/residual/out must be CUDA fp16");
+    TORCH_CHECK(weight.is_contiguous() && residual.is_contiguous() && out.is_contiguous(),
+                "p2p_ag_norm_res: weight/residual/out must be contiguous");
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    p2p_ag_norm_res_cuda
+    (
+        (char*)arena_ptr,
+        (const int64_t*)peer_ptrs_ptr,
+        (const char*)shard_ptr,
+        (int)slot_off,
+        (int)shard_bytes,
+        (int)row_bytes,
+        (int)world,
+        (int)rank,
+        (int)flags_off,
+        (int)acks_off,
+        (int)counter_off,
+        (int)wait_ack,
+        weight.data_ptr(),
+        residual.data_ptr(),
+        out.data_ptr(),
+        (int)rows,
+        (int)hidden,
+        (float)eps,
+        stream
+    );
+}
+
 void p2p_allreduce
 (
     int64_t arena_ptr,
@@ -118,7 +170,8 @@ void p2p_allreduce
     int64_t flags_off,
     int64_t acks_off,
     int64_t counter_off,
-    int64_t dtype
+    int64_t dtype,
+    int64_t wait_ack
 )
 {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -136,6 +189,7 @@ void p2p_allreduce
         (int)acks_off,
         (int)counter_off,
         (int)dtype,
+        (int)wait_ack,
         stream
     );
 }

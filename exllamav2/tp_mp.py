@@ -1248,6 +1248,17 @@ class TPProcessGroup:
         if st is None:
             st = self._alloc_mtp_kv()
 
+        # Opt-in sub-phase cost trace (EXL2_MTP_COST_TRACE=1): separates the mirror
+        # device copy, the master D2H + pipe sends, the worker-reply wait (worker pack
+        # + stream sync), and the shadow H2D -- pins where the long-ctx gather cost
+        # lives. No overhead when unset.
+        _trace = os.environ.get("EXL2_MTP_COST_TRACE", "0") == "1"
+        if _trace:
+            import time as _time
+            _tc = _time.perf_counter
+            _t0 = _tc()
+            _tm = {}
+
         # ---- SWA ring: mirror the page shift on the shadow, pull only new rows ----
         ring = mc.kv_state_size
         swa_shift = window_beg - st["wb"]
@@ -1265,6 +1276,9 @@ class TPProcessGroup:
         # swa_shift == ring is a full rotation: the ring data is unchanged and the valid
         # prefix consists only of rows written after it (window_beg > st["sl"] forces
         # swa_start == 0), so the delta pull below re-covers the whole prefix.
+        if _trace:
+            _tm["mirror"] = _tc() - _t0
+            _t0 = _tc()
 
         # ---- packed pull: ONE message per worker (was 2 commands + 2 replies each) ----
         # Each worker packs [K_full | V_full | K_swa | V_swa] deltas into one pinned CPU
@@ -1286,6 +1300,9 @@ class TPProcessGroup:
         full_v = [mc.value_states[lf][0, st["fl"]:seq_len].detach().cpu()]
         swa_k = [mc.key_states[ls][0, swa_start:swa_len].detach().cpu()]
         swa_v = [mc.value_states[ls][0, swa_start:swa_len].detach().cpu()]
+        if _trace:
+            _tm["cpu"] = _tc() - _t0
+            _t0 = _tc()
         for device, w in sorted(self.workers.items()):
             flat = w.recv()
             o = 0
@@ -1296,6 +1313,9 @@ class TPProcessGroup:
                 n = rows * kh * hd
                 acc.append(flat[o:o + n].view(rows, kh, hd))
                 o += n
+        if _trace:
+            _tm["recv"] = _tc() - _t0
+            _t0 = _tc()
         if df > 0:
             st["kf"][st["fl"]:seq_len].copy_(torch.cat(full_k, dim = 1))
             st["vf"][st["fl"]:seq_len].copy_(torch.cat(full_v, dim = 1))
@@ -1307,6 +1327,28 @@ class TPProcessGroup:
             st["vs"][swa_start:swa_len].copy_(torch.cat(swa_v, dim = 1))
         st["sl"] = seq_len
         st["wb"] = window_beg
+
+        if _trace:
+            _tm["h2d"] = _tc() - _t0
+            tr = getattr(self, "_kv_trace", None)
+            if tr is None:
+                tr = self._kv_trace = {"n": 0, "mirror": 0.0, "cpu": 0.0,
+                                       "recv": 0.0, "h2d": 0.0, "df": 0, "ds": 0,
+                                       "shifts": 0, "repulls": 0}
+            tr["n"] += 1
+            for _k in ("mirror", "cpu", "recv", "h2d"):
+                tr[_k] += _tm[_k]
+            tr["df"] += df
+            tr["ds"] += ds
+            tr["shifts"] += 1 if swa_shift > 0 else 0
+            tr["repulls"] += 1 if (swa_start == 0 and ds == swa_len and swa_len > 0) else 0
+            if tr["n"] % 50 == 0:
+                _n = tr["n"]
+                print(f"[kv-trace] {_n} gathers ctx={seq_len} ms/gather "
+                      f"mirror={tr['mirror']/_n*1000:.2f} cpu={tr['cpu']/_n*1000:.2f} "
+                      f"recv={tr['recv']/_n*1000:.2f} h2d={tr['h2d']/_n*1000:.2f} "
+                      f"avg_df={tr['df']/_n:.1f} avg_ds={tr['ds']/_n:.1f} "
+                      f"shifts={tr['shifts']} repulls={tr['repulls']}", flush=True)
 
         return (st["kf"][:seq_len], st["vf"][:seq_len],
                 st["ks"][:swa_len], st["vs"][:swa_len],

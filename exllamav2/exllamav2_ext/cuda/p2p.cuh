@@ -63,6 +63,39 @@ void p2p_barrier_cuda
     cudaStream_t stream
 );
 
+// Fused decode_repl tail collective: allgather this rank's RS output shard to full
+// hidden width, then RMSNorm (full-width weight, Gemma +1 bias already baked in) and
+// add the full residual -- the three ops (AG + post-norm + residual add) that close
+// every attention/MLP block in the decode_repl path, collapsed into ONE P2P rendezvous
+// + one kernel. Removes ~120 kernel launches/forward (norm + add per block) and the
+// intermediate full-width norm buffer. Same wire protocol/arena slots as p2p_allgather;
+// the norm+residual run after the flag wait proves all peers' shards are present.
+// hidden = full hidden width; shard_w = hidden/world; rows = batch*q_len. fp16 in/out,
+// fp32 norm reduction. weight/residual are full-width (rows, hidden). out may alias
+// neither shard nor residual. Graph-capturable (fixed arena + stable tensor pointers).
+void p2p_ag_norm_res_cuda
+(
+    char* arena,
+    const int64_t* peer_ptrs,
+    const char* shard,
+    int slot_off,
+    int shard_bytes,
+    int row_bytes,
+    int world,
+    int rank,
+    int flags_off,
+    int acks_off,
+    int counter_off,
+    int wait_ack,
+    const void* weight,
+    const void* residual,
+    void* out,
+    int rows,
+    int hidden,
+    float eps,
+    cudaStream_t stream
+);
+
 // dtype: 0 = half, 1 = float. In-place safe (input consumed before output written).
 void p2p_allreduce_cuda
 (
@@ -78,6 +111,7 @@ void p2p_allreduce_cuda
     int acks_off,
     int counter_off,
     int dtype,
+    int wait_ack,
     cudaStream_t stream
 );
 

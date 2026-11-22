@@ -2543,7 +2543,20 @@ class ExLlamaV2Attention(ExLlamaV2Module):
             # attention output. The post-attention norm runs on the shard (tiny cross-rank
             # RMS stat all_reduce), then the residual add is shard-local.
             _ctx = self.model.tp_context
-            if _ctx.decode_repl and q_len <= 32:
+            if _ctx.decode_repl and q_len <= 32 \
+                    and getattr(self, "_o_fp16_row_repl", None) is not None and not loras:
+                # Stage 3 row-parallel o_proj (EXL2_TP_ROW_REPL=1): this rank's attention
+                # output shard IS the fp16 shard's logical input range, so matmul produces
+                # the full-hidden partial with NO Q allgather and NO q_perm trap; one
+                # allreduce replaces the Q reassembly AG + the RS-shard AG (2 -> 1).
+                partial = torch.matmul(attn_outputs[0], self._o_fp16_row_repl)
+                out_full = _ctx.all_reduce_hidden(partial, "o_proj")
+                if self.post_layernorm is not None:
+                    out_full = self.post_layernorm.forward(out_full)
+                if self.has_residual:
+                    out_full = out_full + residual
+                hidden_states = out_full
+            elif _ctx.decode_repl and q_len <= 32:
                 # decode_repl: gather the RS output shard to FULL width, run the post-norm
                 # full-width (weight is loaded full; no stat all_reduce), add the full
                 # residual. One extra RS allgather replaces the tiny stat AR -- a win at
@@ -2552,12 +2565,23 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                     1, attn_outputs, BROADCAST_Q, BROADCAST_Q, dim = self.head_dim
                 )
                 out_shard = self.o_proj.forward_tp(gathered, loras = loras, output_split = True)[0]
-                out_full = _ctx.allgather(1, [out_shard], BROADCAST_RS, BROADCAST_RS)
-                if self.post_layernorm is not None:
-                    out_full = self.post_layernorm.forward(out_full)
-                if self.has_residual:
-                    out_full = out_full + residual
-                hidden_states = out_full
+                # Fused AG+post-norm+residual (EXL2_TP_FUSE_AGNR=1): one P2P kernel
+                # replaces the RS allgather + norm + add (3 launches -> 1). Falls back
+                # to the unfused path when P2P is off or the shape/dtype is unsupported.
+                _fused = None
+                if os.environ.get("EXL2_TP_FUSE_AGNR", "0") == "1" \
+                        and self.post_layernorm is not None and self.has_residual:
+                    _fused = _ctx.ag_norm_res(out_shard, 1, self.post_layernorm.weight,
+                                              residual, self.post_layernorm.variance_epsilon)
+                if _fused is not None:
+                    hidden_states = _fused
+                else:
+                    out_full = _ctx.allgather(1, [out_shard], BROADCAST_RS, BROADCAST_RS)
+                    if self.post_layernorm is not None:
+                        out_full = self.post_layernorm.forward(out_full)
+                    if self.has_residual:
+                        out_full = out_full + residual
+                    hidden_states = out_full
             else:
                 _o_row = getattr(self, "_o_fp16_row", None)
                 _o_row_cpu = getattr(self, "_o_fp16_row_cpu", None)
@@ -3254,6 +3278,18 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                     del _shard
                 else:
                     self._o_fp16_row = _shard
+            # Stage 3 (EXL2_TP_ROW_REPL): GPU-resident fp16 logical-order o_proj shard for a
+            # row-parallel decode_repl path (matmul(attn shard, shard) -> partial -> allreduce,
+            # 2 collectives -> 1). **DISABLED / BROKEN — DO NOT ENABLE.** Greedy parity fails:
+            # output is coherent but the model never enters the thought channel (148/150 tokens
+            # differ from baseline, IDENTICAL with P2P on/off -> a projection input-ordering
+            # bug in the decode_repl row path, NOT the allreduce). Root cause unresolved; the
+            # gate is force-off until fixed. See theplan.md §12 (stage 3).
+            self._o_fp16_row_repl = None
+            if False and os.environ.get("EXL2_TP_ROW_REPL", "0") == "1":
+                _rshard = self._build_o_fp16_row(rank)
+                if _rshard is not None:
+                    self._o_fp16_row_repl = _rshard
         elif self.o_proj_row_parallel:
             # Keep the full permutation: tp_load_rank_row drops q_perm from the shard, so the forward
             # path needs the original to build each device's column index.

@@ -84,11 +84,23 @@ class P2PComm:
         setup_ok = True
         try:
             self.ar_off = self.NSLOTS * self.SLOT_BYTES
-            self.flags_off = self.ar_off + world * self.SLOT_BYTES
+            # Per-key double-buffered AR scratch (2 regions x world x SLOT_BYTES per key),
+            # mirroring the allgather _slot contract: each AR call site (key) owns a pair
+            # of regions and alternates between them, so a peer's round-r+1 contribution
+            # cannot clobber a still-unread round-r region of the SAME key -> the per-op
+            # ack spin can be deferred inside graphs (graph-start barrier covers the
+            # cross-replay hazard). A GLOBAL counter would alias distinct keys onto the
+            # same region across capture warmup vs capture (the ROW_REPL parity bug).
+            self.ar_region_bytes = world * self.SLOT_BYTES
+            self._ar_nkeys = 8
+            self.flags_off = self.ar_off + self._ar_nkeys * 2 * self.ar_region_bytes
             self.acks_off = self.flags_off + world * 8
             self.counter_off = self.acks_off + world * 8
             self.ptrs_off = self.counter_off + 8
             total = self.ptrs_off + world * 8
+            self._ar_slots = {}
+            self._ar_alt = {}
+            self._ar_next = 0
             self.arena = torch.empty(total, dtype = torch.uint8, device = rank)
             self.arena.zero_()
             torch.cuda.synchronize(rank)
@@ -243,16 +255,59 @@ class P2PComm:
         nbytes = full_numel * shard.element_size()
         return self.arena[off:off + nbytes].view(shard.dtype).reshape(full_shape)
 
-    def allreduce(self, t: torch.Tensor) -> bool:
+    def ag_norm_res(self, shard: torch.Tensor, key, full_shape, weight, residual, out, eps):
+        """
+        Fused allgather + RMSNorm + residual add for the decode_repl block tail. Gathers
+        this rank's RS output shard to full width (same arena slot/protocol as allgather),
+        then out = RMSNorm(gathered, weight, eps) + residual in ONE kernel. ``out`` is a
+        caller-owned graph-stable (rows, hidden) fp16 buffer. Returns ``out`` or None if
+        the shape/dtype does not fit (caller falls back to the unfused AG+norm+add).
+        """
+        if not self.enabled:
+            return None
+        from exllamav2.ext import exllamav2_ext as ext_c
+        if shard.dtype != torch.half or weight.dtype != torch.half \
+                or residual.dtype != torch.half or out.dtype != torch.half:
+            return None
+        shard_bytes = shard.numel() * shard.element_size()
+        full_numel = 1
+        for d in full_shape:
+            full_numel *= d
+        if shard_bytes * self.world > self.SLOT_BYTES or shard_bytes == 0:
+            return None
+        slot = self._slot(key)
+        if slot is None:
+            return None
+        if not shard.is_contiguous():
+            shard = shard.contiguous()
+        rows = full_shape[0] if len(full_shape) > 1 else 1
+        if rows < 1 or shard_bytes % rows != 0:
+            return None
+        row_bytes = shard_bytes // rows
+        hidden = full_shape[-1]
+        if not weight.is_contiguous():
+            weight = weight.contiguous()
+        if not residual.is_contiguous():
+            residual = residual.contiguous()
+        ext_c.p2p_ag_norm_res(
+            self.arena.data_ptr(), self.peer_ptrs_dev.data_ptr(), shard.data_ptr(),
+            slot * self.SLOT_BYTES, shard_bytes, row_bytes, self.world, self.rank,
+            self.flags_off, self.acks_off, self.counter_off,
+            1 if self._epoch == 0 else 0,
+            weight, residual, out, rows, hidden, eps)
+        return out
+
+    def allreduce(self, t: torch.Tensor, key="__ar__") -> bool:
         """
         In-place SUM all-reduce of a small half/float32 tensor. Returns False if
-        the tensor is too large or unsupported (caller falls back to NCCL).
+        the tensor is too large or unsupported (caller falls back to NCCL). ``key``
+        identifies the call site for the per-key double-buffered scratch (graph-safe).
         """
         if not self.enabled:
             return False
-        return self._ar_raw(t)
+        return self._ar_raw(t, key)
 
-    def _ar_raw(self, t: torch.Tensor) -> bool:
+    def _ar_raw(self, t: torch.Tensor, key="__ar__") -> bool:
         from exllamav2.ext import ext_c
         if t.dtype == torch.half:
             dtype = 0
@@ -265,8 +320,22 @@ class P2PComm:
             return False
         if not t.is_contiguous():
             return False
+        # Per-key double-buffered region (epoch-scoped like the AG slots): each captured
+        # graph owns distinct regions; alternate the pair per call for deferred-ack safety.
+        k = (self._epoch, key)
+        s = self._ar_slots.get(k)
+        if s is None:
+            if self._ar_next >= self._ar_nkeys:
+                return False
+            s = self._ar_next
+            self._ar_next += 1
+            self._ar_slots[k] = s
+            self._ar_alt[k] = 0
+        self._ar_alt[k] ^= 1
+        scratch_off = self.ar_off + (s * 2 + self._ar_alt[k]) * self.ar_region_bytes
         ext_c.p2p_allreduce(
             self.arena.data_ptr(), self.peer_ptrs_dev.data_ptr(), t.data_ptr(),
-            self.ar_off, self.SLOT_BYTES // t.element_size(), elems,
-            self.world, self.rank, self.flags_off, self.acks_off, self.counter_off, dtype)
+            scratch_off, self.SLOT_BYTES // t.element_size(), elems,
+            self.world, self.rank, self.flags_off, self.acks_off, self.counter_off, dtype,
+            1 if self._epoch == 0 else 0)
         return True

@@ -1404,6 +1404,11 @@ class ExLlamaV2:
         ctx = self.tp_context
         if not use_flashinfer(cfg) or cfg.attn_logit_softcapping:
             return
+        # Full-hd512 verify (q_len > 1) uses single-pass paged-PREFILL: it reads the KV
+        # prefix ONCE for all rows. Per-row split-KV decode (EXL2_VERIFY_PREFILL=0) reads
+        # the prefix q_len times -- MEASURED SLOWER at long ctx (79k: verify 31.6->43.0 ms,
+        # 2026-11-21), the extra KV traffic outweighs the prefill kernel's small-q
+        # inefficiency. Keep prefill the default; =0 remains for A/B only.
         verify_prefill = os.environ.get("EXL2_VERIFY_PREFILL", "1") != "0"
         planned = False
         seen = set()
