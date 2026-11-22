@@ -724,6 +724,25 @@ class AdaptiveGPTQ:
             return mat_error_1, mat_error_5, mat_error_10
 
 
+    def stored_to_logical(self, w):
+        """
+        EXL2.5 inverse transform, w in (k, n) packed/dequant space -> logical weights.
+        stage_weights stores W' = H_int @ (S @ W) / block, so the inverse is
+        W = S^-1 @ (H_int @ W'): un-rotate FIRST with NO /block (H_int^2 = block*I
+        cancels it), then undo the AWQ scale. Order matters: H_int and the diagonal
+        S do not commute. No-op for legacy tensors.
+        """
+        if self.exl25_had:
+            from exllamav2.hadamard.hadamard import _had_int
+            b = self.exl25_had
+            k, n = w.shape
+            h = _had_int(b, w.device, w.dtype)
+            w = torch.matmul(h, w.reshape(k // b, b, n)).reshape(k, n)
+        if self.awq_inv_scale is not None:
+            w = w * self.awq_inv_scale.to(device = w.device, dtype = w.dtype)[:, None]
+        return w
+
+
     def apply_quant(self):
 
         self.hessian = None
@@ -733,16 +752,9 @@ class AdaptiveGPTQ:
         q = qc[invperm, :].T
 
         # EXL2.5: back to logical space so the live model (and every later calibration
-        # forward) keeps using ordinary weights. q is (n, k): unscale AWQ along k, then
-        # un-rotate each 128-block (W = H_int @ W' / block).
-        if self.awq_inv_scale is not None:
-            q = q * self.awq_inv_scale.cpu()[None, :]
-        if self.exl25_had:
-            from exllamav2.hadamard.hadamard import _had_int
-            b = self.exl25_had
-            h = _had_int(b, q.device, q.dtype)
-            n, k = q.shape
-            q = ((q.reshape(n, k // b, b) @ h) / b).reshape(n, k)
+        # forward) keeps using ordinary weights. q is (n, k).
+        if self.exl25_had or self.awq_inv_scale is not None:
+            q = self.stored_to_logical(q.T).T
 
         q = q.reshape(self.quant.T.shape)
 
@@ -756,6 +768,8 @@ class AdaptiveGPTQ:
     def apply_temp(self):
 
         q = self.quant[self.invperm, :].T
+        if self.exl25_had or self.awq_inv_scale is not None:
+            q = self.stored_to_logical(q.T).T
         temp_layer = nn.Linear(self.layer.in_features, self.layer.out_features, False, device = "meta", dtype = torch.float16)
         temp_layer.weight = nn.Parameter(q.reshape(self.layer.weight.shape).type_as(self.layer.weight.data))
         return temp_layer

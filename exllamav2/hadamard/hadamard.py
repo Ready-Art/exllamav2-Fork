@@ -158,7 +158,7 @@ def test_hadamard_dims(min_dim: int, max_dim: int, step: int):
 #   kernel activations : x' = x @ H_int          (UNNORMALIZED +/-1 butterfly, exact fp16)
 #   stored weights     : W' = H_int @ W / block  (the 1/block folds into the quant scales)
 #   identity           : (x H_int)(H_int W / block) = x W   since H_int^2 = block * I
-#   inverse (unpack)   : W = H_int @ W' / block
+#   inverse (unpack)   : W = H_int @ W'          (NO /block: H_int^2 = block*I cancels it)
 # H_int is symmetric, so row-vector and column-vector forms use the same matrix.
 
 def _had_int(block: int, device, dtype):
@@ -177,8 +177,9 @@ def had_rotate_activations(x: torch.Tensor, block: int = 128):
 
 
 def had_rotate_weights(w: torch.Tensor, block: int = 128, inverse: bool = False):
-    """w: (k, n) -> H_int @ w / block (forward, stored space) or H_int @ w / block
-    (inverse -- the transform is an involution up to the same 1/block)."""
+    """w: (k, n) -> H_int @ w / block (forward, stored space). NOT an involution:
+    applying it twice yields w/block. The inverse (stored -> logical) is H_int @ w
+    with NO /block -- see AdaptiveGPTQ.stored_to_logical (which also undoes AWQ)."""
     k = w.shape[0]
     assert k % block == 0
     h = _had_int(block, w.device, w.dtype)

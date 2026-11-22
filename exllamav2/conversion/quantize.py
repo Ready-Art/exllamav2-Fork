@@ -166,6 +166,14 @@ def quant_linear(job: dict,
     # from the worker device under multi-GPU. `.to()` also makes this a copy rather than a view of the live weight,
     # which the in-place `sub_` below would otherwise mutate. Stage K bug 8.
     recons_w = recons_linear.get_weight_tensor_dq()
+
+    # EXL2.5 had/awq: reconstruct() returns the STORED space (H_int @ S @ W / block).
+    # Bring it back to logical space before the sanity checks AND the write-back below --
+    # otherwise diff1 compares rotated vs logical weights (fatal false positive) and the
+    # live model would keep rotated weights, corrupting every later calibration forward.
+    if getattr(lq, "exl25_had", 0) or getattr(lq, "awq_inv_scale", None) is not None:
+        recons_w = lq.stored_to_logical(recons_w.float()).half()
+
     quant_w = source.linear.weight.T.to(recons_w.device)
 
     try:
