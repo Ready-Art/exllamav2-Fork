@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import torch
 import torch.nn.functional as F
 from exllamav2.module import ExLlamaV2Module
@@ -52,6 +53,14 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
         self.num_experts = cfg.num_experts
         self.num_experts_per_token = cfg.num_experts_per_token
 
+        # CPU/RAM expert offload (opt-in EXL2_MOE_OFFLOAD / tabby model.moe_offload_experts):
+        # the LAST N experts of every MoE layer live in pinned host RAM; one shared GPU
+        # staging slot per layer is H2D-filled on demand when routing selects them.
+        # N >= num_experts offloads ALL experts. Forces the torch expert loop (the fused
+        # q_moe_mlp kernel needs every expert resident). Single-device load path only.
+        self.offload_experts = max(0, min(int(os.environ.get("EXL2_MOE_OFFLOAD", "0") or 0),
+                                          self.num_experts))
+
         if ap.norm == "layernorm":
             self.post_attention_layernorm = ExLlamaV2LayerNorm(model, key + km["norm_2"])
         elif ap.norm == "rmsnorm":
@@ -103,12 +112,26 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
 
         self.post_attention_layernorm.load()
         self.gate.load()
+        off = self.offload_experts
+        first_off = self.num_experts - off
+        # One shared staging slot per projection across the offloaded experts (all
+        # same-shape): GPU holds ONE expert's data, not N. _build_offload fills the
+        # shared dict from the first offloaded expert and reuses it for the rest.
+        shared = [{}, {}, {}] if off else None
         for e in range(self.num_experts):
+            is_off = off and e >= first_off
+            for wi, wl in enumerate((self.w1, self.w2, self.w3)):
+                wl[e].offload = bool(is_off)
+                if is_off:
+                    wl[e]._offload_shared = shared[wi]
             self.w1[e].load()
             self.w2[e].load()
             self.w3[e].load()
+        if off:
+            print(f"[moe-offload] layer {self.layer_idx}: {off}/{self.num_experts} experts "
+                  f"in pinned RAM (shared GPU staging slot)", flush = True)
 
-        if self.w1[0].is_quant():
+        if self.w1[0].is_quant() and not off:
             device_context = self.model.get_device_context(self.device_idx)
             device_context.begin_scratch_alloc()
             self.q_handle = ext_c.make_q_moe_mlp(
@@ -148,11 +171,17 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
 
     def weight_footprint(self) -> int:
 
-        return self.post_attention_layernorm.weight_footprint() + \
-               self.gate.weight_footprint() + \
-               sum(self.w1[e].weight_footprint() for e in range(self.num_experts)) + \
-               sum(self.w2[e].weight_footprint() for e in range(self.num_experts)) + \
-               sum(self.w3[e].weight_footprint() for e in range(self.num_experts))
+        # Offloaded experts: GPU holds one shared staging slot per projection (the
+        # first offloaded expert's footprint) + small resident constants; the rest
+        # lives in pinned host RAM.
+        off = self.offload_experts
+        n_gpu = self.num_experts - off
+        fp = self.post_attention_layernorm.weight_footprint() + self.gate.weight_footprint()
+        for wl in (self.w1, self.w2, self.w3):
+            fp += sum(wl[e].weight_footprint() for e in range(n_gpu))
+            if off:
+                fp += wl[n_gpu].weight_footprint()   # shared staging slot
+        return fp
 
 
     def scratch_space_fixed(self) -> int:
@@ -297,6 +326,11 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
             idx_list = idx.tolist()
 
             current_state = hidden_states[None, top_x_list].reshape(-1, hidden_dim)
+
+            if self.offload_experts and expert_idx >= self.num_experts - self.offload_experts:
+                self.w1[expert_idx]._stage_offload()
+                self.w3[expert_idx]._stage_offload()
+                self.w2[expert_idx]._stage_offload()
 
             gate = self.w1[expert_idx].forward(current_state, loras = loras)
             up = self.w3[expert_idx].forward(current_state, loras = loras)

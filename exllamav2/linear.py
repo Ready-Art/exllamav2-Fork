@@ -120,6 +120,9 @@ class ExLlamaV2Linear(ExLlamaV2Module):
         self.q4_weight = None
         self.q4_scales = None
         self.fp16_bias = None
+        self.offload = False
+        self.q_tensors_cpu = None
+        self._offload_shared = None
 
         self.lora_a_tensors = {}
         self.lora_b_tensors = {}
@@ -181,11 +184,16 @@ class ExLlamaV2Linear(ExLlamaV2Module):
                     w[k] = safe_move_tensor(w[k], self.device())
 
             self._stash_exl25(w)
+            _off = getattr(self, "offload", False)
+            if _off:
+                self._offload_pre_make(w, self.device())
             self.q_handle = ext.make_q_matrix(w,
                                               self.temp_dq,
                                               prescale = self.prescale,
                                               max_dq_rows = cfg.max_dq_size // self.out_features,
                                               offset_qzeros = cfg.checkpoint_offset_qzeros)
+            if _off:
+                self._offload_post_make()
             self.prev_prescale = self.prescale
             self.prescale = 1
 
@@ -235,6 +243,53 @@ class ExLlamaV2Linear(ExLlamaV2Module):
                 self.fp16_bias = wb
 
 
+    # CPU/RAM expert offload (MoE): the big quantized data tensors live in pinned host
+    # RAM; a GPU staging slot (optionally SHARED across same-shape experts of one MoE
+    # layer via _offload_shared) is filled by _stage_offload() right before the GEMM.
+    # Small per-expert constants (permutations, scale metadata, Hadamard/AWQ vectors)
+    # stay GPU-resident. The q_handle is built against the staging tensors once.
+    _OFFLOAD_STAGE_KEYS = ("q_weight", "q_scale", "q_zeros")
+
+    def _offload_pre_make(self, shard: dict, dev):
+        """Swap the big quantized data tensors for a GPU staging slot (shared across
+        same-shape experts of a layer via _offload_shared) and keep the data in pinned
+        host RAM. Call BEFORE the make_q_matrix call so the handle is built against the
+        staging slot. Small per-expert constants stay GPU-resident in the shard."""
+        shared = getattr(self, "_offload_shared", None)
+        self.q_tensors_cpu = {}
+        for k in self._OFFLOAD_STAGE_KEYS:
+            if k not in shard:
+                continue
+            v = shard[k]
+            self.q_tensors_cpu[k] = v.detach().to("cpu").pin_memory()
+            if shared is not None and k in shared:
+                shard[k] = shared[k]
+                shard[k].copy_(v)   # load THIS expert's raw data before make shuffles it
+            else:
+                staging = torch.empty_like(v, device = dev)
+                staging.copy_(v)
+                shard[k] = staging
+                if shared is not None:
+                    shared[k] = staging
+        return shard
+
+    def _offload_post_make(self):
+        """make_q_matrix reorders the staged data tensors IN PLACE at build time (the
+        bit-width shuffle touches q_weight and its matching scale/zero layout). Capture
+        the FINAL layout of every staged key back into the pinned CPU copies so forward's
+        H2D staging matches what the handle expects. (No-op for the row-parallel path,
+        whose tensors are already in final layout.)"""
+        if self.q_tensors_cpu:
+            for k in self._OFFLOAD_STAGE_KEYS:
+                if k in self.q_tensors_cpu and k in self.q_tensors:
+                    self.q_tensors_cpu[k].copy_(self.q_tensors[k])
+
+    def _stage_offload(self):
+        for k in self._OFFLOAD_STAGE_KEYS:
+            t = self.q_tensors.get(k) if self.q_tensors else None
+            if t is not None and k in self.q_tensors_cpu:
+                t.copy_(self.q_tensors_cpu[k], non_blocking = True)
+
     def normalize(self, w: torch.Tensor):
         return nn.functional.normalize(w)
 
@@ -265,6 +320,9 @@ class ExLlamaV2Linear(ExLlamaV2Module):
                 for k, v in t.items():
                     del v
             self.q_tensors = None
+
+        self.q_tensors_cpu = None
+        self._offload_shared = None
 
         if self.q4_weight is not None:
             del self.q4_weight
@@ -382,6 +440,8 @@ class ExLlamaV2Linear(ExLlamaV2Module):
 
         if self.q_handle is not None and not force_recons:
 
+            if getattr(self, "offload", False):
+                self._stage_offload()
             output_shape = hidden_states.shape[:-1] + (self.out_features,)
             hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
             output = torch.empty((hidden_states.shape[0], self.out_features), dtype = torch.half, device = self.device())
@@ -872,6 +932,9 @@ class ExLlamaV2Linear(ExLlamaV2Module):
 
         shard = {k: safe_move_tensor(v, rank) for k, v in shard.items()}
         self.q_tensors = shard
+        _off = getattr(self, "offload", False)
+        if _off:
+            self._offload_pre_make(shard, shard["q_scale_max"].device)
 
         # Use make_q_matrix, NOT make_q_matrix_split.
         #
@@ -903,6 +966,8 @@ class ExLlamaV2Linear(ExLlamaV2Module):
             cfg.max_dq_size // s,
             *_exl25_args
         )
+        if _off:
+            self._offload_post_make()
         self.prev_prescale = self.prescale
         self.prescale = 1
 
@@ -1083,6 +1148,9 @@ class ExLlamaV2Linear(ExLlamaV2Module):
 
         shard = {k: safe_move_tensor(v, rank) for k, v in shard.items()}
         self.q_tensors = shard
+        _off = getattr(self, "offload", False)
+        if _off:
+            self._offload_pre_make(shard, shard["q_scale_max"].device)
 
         # make_q_matrix_split, NOT make_q_matrix: the shuffle has already been applied above,
         # and make_q_matrix would apply it a second time. This is the exact inverse of the
@@ -1103,6 +1171,8 @@ class ExLlamaV2Linear(ExLlamaV2Module):
             cfg.max_dq_size,
             *_exl25_args
         )
+        if _off:
+            self._offload_post_make()
         self.prev_prescale = self.prescale
         self.prescale = 1
 

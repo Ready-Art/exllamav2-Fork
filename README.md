@@ -144,6 +144,9 @@ with `gpu_split: [22, 22, 22, 22]`, `cache_size: 32768`, `chunk_size: 2048`,
 `draft_num_tokens: 3`, `max_batch_size: 1`. `NCCL_P2P_LEVEL=PXB` enables PCIe peer-to-peer across
 the PCI switch on the tested box — **the right value depends on your topology** (not needed on
 NVLink). The fork's P2P kernel probes `canAccessPeer` and falls back to NCCL automatically.
+**Machines without P2P are supported:** forcing `EXL2_TP_P2P=0` (pure NCCL collectives) runs
+the MP path correctly — plain decode and MTP, short and long context, verified coherent
+(throughput is lower than the P2P kernel, but it works).
 
 Caveats:
 
@@ -425,6 +428,19 @@ Two independent gates for the MTP assistant drafter:
 
 Through TabbyAPI: `draft_model.mtp_int8_weights: true` / `draft_model.mtp_int8_kv: true`.
 Both default off; fp16 paths are unchanged when disabled.
+
+### MoE expert CPU/RAM offload (opt-in, by expert count)
+
+`EXL2_MOE_OFFLOAD=N` (TabbyAPI: `model.moe_offload_experts: N`) keeps the **last N
+experts of every MoE layer in pinned host RAM**; `N >= num_experts` offloads them all.
+One GPU staging slot per projection is **shared** across the offloaded experts of a
+layer (all same-shape), H2D-filled on demand when routing selects a cold expert — so
+GPU holds one expert's data, not N. Small per-expert constants (permutations, scale
+metadata) stay GPU-resident; the `q_handle` is built against the staging slot once.
+Offload forces the per-expert torch loop (the fused `q_moe_mlp` kernel needs every
+expert resident): slower decode, much lower VRAM — the trade-off for fitting large MoE
+models on small cards. Single-device load path (no TP sharding) in this release.
+Default 0 = off.
 
 ### Priority prompt scheduler (opt-in, MP + MTP multi-batch)
 
