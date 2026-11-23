@@ -64,29 +64,22 @@ __forceinline__ __device__ void exl25_dequant_8bit_8
     dq[3] = __halves2half2(__high2half(t2), __high2half(t3));
 }
 
-// Register-fed dot products. ALL chunk widths accumulate in fp32: the partial sums
-// multiply UNSCALED codes (6-bit spans -32..31) by activations, and the group scale is
-// applied only afterwards. Hadamard/AWQ activations spread each outlier channel across
-// a whole 128-block at ~1000+ magnitude, so a 16-term fp16 partial reaches ~1e5 > 65504
-// -> inf -> NaN on real Gemma-4 activations (randn-scale synthetics never overflowed,
-// which is why the original parity gates missed this). fp32 partials are magnitude-robust.
+// Register-fed dot products, fast hfma2 partials with an EXACT power-of-two guard:
+// activations arrive pre-scaled by 2^-12 (exact in fp16) and qs_h carries the matching
+// 2^12 factor. Raw codes span at most -128..127 (8-bit), so a wj-term partial is bounded
+// by 16 * (65504/4096) * 128 = 32768 < 65504 -- overflow is impossible for ANY fp16
+// activation, while the dot stays in the fast half2 FMA path (the fp32-partials version
+// was ~2x slower at m=4 from register pressure). Subnormal rounding of tiny scaled
+// activations contributes < ~1e-5 absolute to the output -- below the fp16 noise floor.
 
 template <int wj>
 __forceinline__ __device__ half exl25_dot(half2 (&dq)[wj / 2], const half2 (&a2)[wj / 2], const half g_result, const half qs_h)
 {
-    float result = {};
+    half2 result = {};
     #pragma unroll
-    for (int i = 0; i < wj / 2; i++)
-    {
-        float w0 = __low2float(dq[i]);
-        float w1 = __high2float(dq[i]);
-        float x0 = __low2float(a2[i]);
-        float x1 = __high2float(a2[i]);
-        result = fma(w0, x0, result);
-        result = fma(w1, x1, result);
-    }
-    result *= __half2float(qs_h);
-    return __hadd(__float2half_rn(result), g_result);
+    for (int i = 0; i < wj / 2; i++) result = __hfma2(dq[i], a2[i], result);
+    half result_h = __hadd(__low2half(result), __high2half(result));
+    return __hfma(result_h, qs_h, g_result);
 }
 
 typedef void (*fp_exl25_gemm_kernel)
@@ -301,10 +294,13 @@ __global__ void exl25_gemm_kernel
         qscales[2]++;
         qscales[3]++;
         half maxscale = b_q_scale_max[g0 + g];
-        scales[g][0] = __hmul(__int2half_rn(qscales[0] * qscales[0]), maxscale);
-        scales[g][1] = __hmul(__int2half_rn(qscales[1] * qscales[1]), maxscale);
-        scales[g][2] = __hmul(__int2half_rn(qscales[2] * qscales[2]), maxscale);
-        scales[g][3] = __hmul(__int2half_rn(qscales[3] * qscales[3]), maxscale);
+        // 2^12 factor pairs with the 2^-12 activation pre-scale in the dot loop (exact
+        // power-of-two guard against fp16 partial overflow; see exl25_dot).
+        const half resc = __float2half_rn(4096.0f);
+        scales[g][0] = __hmul(__hmul(__int2half_rn(qscales[0] * qscales[0]), maxscale), resc);
+        scales[g][1] = __hmul(__hmul(__int2half_rn(qscales[1] * qscales[1]), maxscale), resc);
+        scales[g][2] = __hmul(__hmul(__int2half_rn(qscales[2] * qscales[2]), maxscale), resc);
+        scales[g][3] = __hmul(__hmul(__int2half_rn(qscales[3] * qscales[3]), maxscale), resc);
     }
 
     int scales_idx = 0;
@@ -315,6 +311,7 @@ __global__ void exl25_gemm_kernel
 
     const uint32_t* b_ptr = b_q_weight + (offset_k * bits / 32) * size_n + n;
     half block_c[m_count][4] = {};
+    const half2 DOT_INV = __float2half2_rn(1.0f / 4096.0f);  // pairs with the 2^12 in scales
 
     int k = offset_k;
     while (k < end_k)
@@ -370,7 +367,7 @@ __global__ void exl25_gemm_kernel
                         // selects the chunk within the current 32-k iteration.
                         const half2* ap = (const half2*) &block_a[m0 + r][(k - offset_k) + j * wj];
                         #pragma unroll
-                        for (int i = 0; i < wj / 2; i++) a2[r][i] = ap[i];
+                        for (int i = 0; i < wj / 2; i++) a2[r][i] = __hmul2(ap[i], DOT_INV);
                     }
                 }
                 #pragma unroll

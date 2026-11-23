@@ -421,7 +421,8 @@ def make_q_matrix(w: dict,
                 w["g_idx"].cpu(),
                 w.get("bias", none_tensor),
                 temp_dq,
-                max_dq_rows
+                max_dq_rows,
+                none_tensor, 0, 0, 0
             )
 
         # GPTQ without g_idx
@@ -441,5 +442,6 @@ def make_q_matrix(w: dict,
                 none_tensor,
                 w.get("bias", none_tensor),
                 temp_dq,
-                max_dq_rows
+                max_dq_rows,
+                none_tensor, 0, 0, 0
             )

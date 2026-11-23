@@ -304,13 +304,25 @@ A/B, speed A/B vs legacy, CUDA-graph capture/replay), `mtp/exl25_moe_test.py` (f
 - **Real-weight verification:** compiled-checkpoint tensors reconstructed through the runtime
   kernels match the fp16 base at normal 6-bit quant error (rel_l2 ≈ 0.03–0.08), on both the fast
   lane and the prefill path, with real-magnitude calibration activations.
-- **fp32 kernel numerics (hardening):** the in-kernel Hadamard activation rotation and the
-  fast-lane dot partials now accumulate in **fp32**. The original fp16 stages overflowed
-  (inf → NaN) on large-magnitude activation probes — a latent risk, since real GEMM inputs are
-  post-norm (O(1–10)); the fp32 paths are magnitude-robust and verified against real
-  calibration activations at m=1/4/16 with zero NaN/inf. Cost: m=8/16 fast-lane throughput
-  regressed vs the fp16 partials (occupancy/register tuning is the next lever; m=1 and m=4 —
-  the verified decode and W=3 verify paths — are unaffected).
+- **Kernel numerics + speed (2026-11-23):** the Hadamard activation rotation accumulates in
+  fp32 (fp16 partial sums overflow on large-magnitude activations). The fast-lane dot uses
+  fast `hfma2` partials with an **exact power-of-two overflow guard**: activations are
+  pre-scaled by 2⁻¹² and the group scale carries 2¹², so a 16-term partial of raw codes is
+  bounded ≤ 32768 for *any* fp16 activation — no overflow, no fp32-FMA cost. Parity ALL PASS,
+  real-activation canary clean. Same-session greedy A/B on the test rig (4× RTX 3090, 200 W,
+  MP + MTP W=3): **EXL2.5 vs EXL2-6.0 ≈ +19% total tok/s at 100k context (70.9 vs 59.4) and
+  +13% at 1.3k (96.6 vs 85.7)**; verify round phase 31.6 vs 35.3 ms (100k), 23.2 vs 26.1 ms
+  (1.3k). Acceptance is also higher at equal bpw (Hadamard/AWQ quality).
+- **Load-path fixes:** the TP loaders retain the AWQ scale for the QMatrix's lifetime
+  (user-confirmed coherent on MP + MTP); the o_proj prefill shortcut and the GPTQ loaders
+  pass the full EXL2.5-era `make_q_matrix` signature (plain EXL2 / GPTQ MP loads crashed
+  with a TypeError before this).
+- **Experimental hd512 verify kernel (default OFF):** `EXL2_VERIFY_HD512_SPLIT=1` enables a
+  rewritten split-KV small-q GQA attention kernel (register-resident GQA group, cp.async
+  double-buffered KV; parity ALL PASS vs fp32 at kv up to 79k). Measured ~60 GB/s — it
+  matches FlashInfer's *ragged* prefill but loses to the *paged* prefill the live verify
+  path uses (verify 64.9 vs 31.6 ms at 100k), so it stays opt-in/dormant pending a better
+  small-q design.
 - **Converter fixes:** the Hessian is Hadamard-rotated exactly once (a double rotation had
   cancelled itself, leaving GPTQ error compensation in the wrong space), and tensors that share
   a Hessian (q/k/v, gate/up) now share the AWQ protection scale too. A module-by-module replay
@@ -318,11 +330,11 @@ A/B, speed A/B vs legacy, CUDA-graph capture/replay), `mtp/exl25_moe_test.py` (f
   multi-GPU quantization; per-module reconstruction error improved ~3× vs the original run.
 - **Quality (same bpw, synthetic outlier stress test):** Hadamard+AWQ cuts quantization rel_l2
   ~30–45% (e.g. 6-bit 0.0236 → 0.0133; 4-bit 0.095 → 0.054).
-- **Kernel speed vs legacy (plain uniform, identical weights, 200 W):** decode m=1 **≈1.0–1.28×**,
-  m=4 up to **2.27×** (6-bit down) — the verified decode and W=3 verify paths. m=8/16 currently
-  run **slower than legacy** (fp32 dot partials + register pressure; the 16-row one-pass design
-  is in place, occupancy/numerics tuning is the next lever). Hadamard/AWQ add an in-kernel
-  butterfly cost on top (quality feature).
+- **Kernel speed vs legacy (plain uniform, identical weights, 200 W, same session):** decode
+  m=1 **≈1.0–1.28×**, m=4 up to **2.27×** (6-bit down); m=8 mixed by shape (0.5–2.8×); m=16
+  still **0.5–0.8×** (occupancy/register tuning is the next lever; the 16-row one-pass design
+  is in place, graph capture/replay PASS). Hadamard/AWQ add an in-kernel butterfly cost on
+  top (quality feature); at m=4 the transform amortizes and had+awq ≈ plain.
 - **TP loader fix (user-confirmed 2026-11-23):** the tensor-parallel loaders stored the AWQ
   scale only in a local variable while the QMatrix kept a raw device pointer to it — the
   scale was freed on return and the GEMMs read recycled memory (gibberish, zero MTP

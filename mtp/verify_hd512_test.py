@@ -85,7 +85,7 @@ def bench():
                 q, k, v = make(ql, kv, nq, nkv)
                 kv_len_dev = torch.tensor([kv], device=dev, dtype=torch.int32)
                 kv_bytes = kv * nkv * 512 * 2 * 2
-                splits = max(1, min(64, kv // 2048))
+                splits = max(1, min(256, kv // 512))
                 po = torch.empty(splits, ql, nq, 512, device=dev, dtype=torch.float32)
                 pl = torch.empty(splits, ql, nq, 2, device=dev, dtype=torch.float32)
                 o = torch.empty_like(q)

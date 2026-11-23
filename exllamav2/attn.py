@@ -2265,6 +2265,19 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                                 _fi_key + (batch_size,), q[idx], k_cache[idx], v_cache[idx]
                             )
                         elif (q_len > 1 and _fi_hd and not self.sliding_window
+                                and batch_size == 1
+                                and os.environ.get("EXL2_VERIFY_HD512_SPLIT", "0") != "0"
+                                and q_len * self.num_key_value_groups <= 32):
+                            # Custom split-KV hd512 verify attention (FlashDecoding-style,
+                            # register-resident GQA group, cp.async double-buffered KV).
+                            # Reads the KV prefix once for all q_len rows like the paged
+                            # prefill below, but streams it at near-peak bandwidth at small
+                            # q (the fa2 paged-prefill kernel is ~230 GB/s here). Graph-safe:
+                            # device-side kv_len, persistent shared partial buffers.
+                            attn_output = self._attn_verify_split(
+                                q[idx], k_cache[idx], v_cache[idx], q_len, dev
+                            )
+                        elif (q_len > 1 and _fi_hd and not self.sliding_window
                                 and (_fi_key + (q_len, batch_size)) in _ctx.fi_prefill):
                             # Single-pass graphed verify: ONE paged-prefill run reads the
                             # KV prefix once for all q_len rows (fa2 causal aligns row i to
@@ -2469,6 +2482,13 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                             # (~5x faster than the torch GEMV at 16k, gap widens with ctx).
                             attn_output = self._attn_flashinfer_decode(
                                 q[idx], k_cache[idx], v_cache[idx], cache_b, dev
+                            )
+                        elif (_fi_hd and q_len > 1 and batch_size == 1
+                                and not self.sliding_window
+                                and os.environ.get("EXL2_VERIFY_HD512_SPLIT", "0") != "0"
+                                and q_len * self.num_key_value_groups <= 32):
+                            attn_output = self._attn_verify_split(
+                                q[idx], k_cache[idx], v_cache[idx], q_len, dev
                             )
                         elif _fi_hd:
                             # hd512 prefill / MTP verify window via FlashInfer prefill
@@ -2888,6 +2908,34 @@ class ExLlamaV2Attention(ExLlamaV2Module):
             return hidden_states
 
 
+    def _attn_verify_split(self, q, k_cache, v_cache, q_len, dev):
+        """
+        Custom split-KV hd512 verify attention (EXL2_VERIFY_HD512_SPLIT=1).
+        q (1, ql, nq, 512); caches (1, max_seq, nkv, 512), contiguous full-layer KV.
+        Graph-safe: device-side kv_len (pos + ql, recomputed on every replay), persistent
+        per-device partial buffers shared across layers (sequential execution).
+        """
+        ctx = self.model.tp_context
+        nq = q.shape[2]
+        nkv = k_cache.shape[2]
+        splits = 128
+        bufs = ctx.__dict__.get("_verify_split_bufs")
+        if bufs is None:
+            bufs = {}
+            ctx._verify_split_bufs = bufs
+        b = bufs.get((dev, q_len, nq))
+        if b is None:
+            b = (torch.empty(splits, q_len, nq, 512, device = dev, dtype = torch.float32),
+                 torch.empty(splits, q_len, nq, 2, device = dev, dtype = torch.float32))
+            bufs[(dev, q_len, nq)] = b
+        po, pl = b
+        pos = ctx.pos_tp.get(dev, ctx.pos)
+        kv_len_dev = (pos + q_len).to(torch.int32)
+        o = torch.empty(q_len, nq, 512, device = dev, dtype = torch.half)
+        ext_c.verify_hd512(q[0].contiguous(), k_cache[0], v_cache[0], o, po, pl,
+                           kv_len_dev, q_len, nq, nkv, splits, self.scaling)
+        return o.view(1, q_len, nq * 512)
+
     def _o_proj_perm_slice(self, dev: int, lo: int, hi: int) -> torch.Tensor:
         """
         Cached int64 column index for device ``dev``'s input slice [lo, hi) of o_proj.
@@ -3158,6 +3206,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
         # GEMM, which applies the activation transform in-kernel. Plain uniform tensors
         # (no rotation) reconstruct to logical weights and stay servable here.
         from exllamav2.ext import exl25_tags
+        from exllamav2.linear import _exl25_bind_args
         _b25, _g25, _h25 = exl25_tags(w)
         if _b25 and (_h25 or w.get("q_awq_scale") is not None):
             return None
@@ -3186,7 +3235,8 @@ class ExLlamaV2Attention(ExLlamaV2Module):
             none_tensor, none_tensor, none_tensor,
             w.get("bias", none_tensor),
             temp_dq,
-            cfg.max_dq_size // outf
+            cfg.max_dq_size // outf,
+            *_exl25_bind_args(w)
         )
         full = torch.empty((inf, outf), dtype = torch.half, device = rank)
         ext_c.reconstruct(handle, full)
