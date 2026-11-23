@@ -409,8 +409,9 @@ that repeatedly FULLY re-prefill from scratch (tracked by prompt fingerprint —
 length bucket, no API-key tracking) are deprioritized and held briefly; re-rendered last
 replies take the partial-reuse paths and never count. Aging bounds starvation. Through
 TabbyAPI: `model.priority_queue: true` (+ `batch_window_ms`, `reprocess_*` options). Default
-off. Mid-prefill preemption (`priority_preempt`) is experimental and **default off** — see the
-config description for the known batch-driver state-sync issue.
+off. Mid-prefill preemption (`priority_preempt`, **default off**, opt-in) admits short jobs
+between the chunks of a running long prefill; the earlier slot-reuse crash chain is fixed
+(a slot is free only when it holds no job) and verified under contention.
 
 ### Engram (n-gram) table storage modes
 
