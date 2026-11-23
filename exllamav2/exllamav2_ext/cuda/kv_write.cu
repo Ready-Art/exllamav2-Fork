@@ -196,3 +196,98 @@ void kv_quant_shadow_cuda
         pos, row_map, batch_size, q_len, kv_heads, head_dim, cache_len
     );
 }
+
+// Quantize a contiguous fp16 chunk (n, kvh, hd) into ONE row of a full-depth INT8
+// destination at absolute row dst_row (source and destination depths differ -- the
+// MTP gather stages deltas through a small fp16 buffer when INT8 is primary).
+__global__ void kv_quant_chunk_kernel
+(
+    const half* __restrict__ src_k,
+    const half* __restrict__ src_v,
+    int8_t* __restrict__ k_i8,
+    int8_t* __restrict__ v_i8,
+    half* __restrict__ k_scale,
+    half* __restrict__ v_scale,
+    int dst_row,
+    int n,
+    int kv_heads,
+    int head_dim,
+    int dst_depth
+)
+{
+    int idx = blockIdx.x;
+    int head = idx % kv_heads;
+    int t = idx / kv_heads;
+    if (t >= n) return;
+
+    long soff = ((long)t * kv_heads + head) * head_dim;
+    const half* kp = src_k + soff;
+    const half* vp = src_v + soff;
+
+    float mk = 0.0f, mv = 0.0f;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x)
+    {
+        mk = fmaxf(mk, fabsf(__half2float(kp[i])));
+        mv = fmaxf(mv, fabsf(__half2float(vp[i])));
+    }
+    __shared__ float red[512];
+    red[threadIdx.x] = mk;
+    red[blockDim.x + threadIdx.x] = mv;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (threadIdx.x < s)
+        {
+            red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
+            red[blockDim.x + threadIdx.x] = fmaxf(red[blockDim.x + threadIdx.x], red[blockDim.x + threadIdx.x + s]);
+        }
+        __syncthreads();
+    }
+    half shk = __float2half(red[0] / 127.0f);
+    half shv = __float2half(red[blockDim.x] / 127.0f);
+    float usk = __half2float(shk); if (usk == 0.0f) usk = 1e-8f;
+    float usv = __half2float(shv); if (usv == 0.0f) usv = 1e-8f;
+
+    long doff = (((long)dst_row + t) * kv_heads + head) * head_dim;
+    long ss = ((long)dst_row + t) * kv_heads + head;
+    if (threadIdx.x == 0)
+    {
+        k_scale[ss] = shk;
+        v_scale[ss] = shv;
+    }
+    float inv_k = 1.0f / usk, inv_v = 1.0f / usv;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x)
+    {
+        int qk = (int)rintf(__half2float(kp[i]) * inv_k);
+        int qv = (int)rintf(__half2float(vp[i]) * inv_v);
+        qk = max(-127, min(127, qk));
+        qv = max(-127, min(127, qv));
+        k_i8[doff + i] = (int8_t)qk;
+        v_i8[doff + i] = (int8_t)qv;
+    }
+}
+
+void kv_quant_chunk_cuda
+(
+    cudaStream_t stream,
+    const half* src_k,
+    const half* src_v,
+    int8_t* k_i8,
+    int8_t* v_i8,
+    half* k_scale,
+    half* v_scale,
+    int dst_row,
+    int n,
+    int kv_heads,
+    int head_dim,
+    int dst_depth
+)
+{
+    int blocks = n * kv_heads;
+    if (blocks <= 0) return;
+    kv_quant_chunk_kernel<<<blocks, 256, 0, stream>>>
+    (
+        src_k, src_v, k_i8, v_i8, k_scale, v_scale,
+        dst_row, n, kv_heads, head_dim, dst_depth
+    );
+}

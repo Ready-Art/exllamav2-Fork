@@ -820,7 +820,9 @@ class MTPMPBatchDriver:
         # gathered K/V, scalar RoPE position) and compare against the batch draft and
         # the target argmax. scalar==batch!=target -> verify logits wrong at B>1;
         # scalar==target!=batch -> batch draft compute wrong; all differ -> gather.
-        if os.environ.get("EXL2_BATCH_DRAFT_XCHECK", "0") == "1" and self.mtp_rounds % 25 == 0:
+        if (os.environ.get("EXL2_BATCH_DRAFT_XCHECK", "0") == "1"
+                and self.mtp_rounds % 25 == 0
+                and not (pg._mtp_kv or {}).get("i8p")):
             d_ = self.drafter
             st_ = pg._mtp_kv
             r0 = rows[0]
@@ -856,24 +858,26 @@ class MTPMPBatchDriver:
             # Force a FULL re-pull of row 0's shadow and diff against the incremental
             # gather's content: nonzero diff = the incremental multi-row gather left
             # stale/wrong K/V (the draft reads the shadow; the target reads the cache).
-            _seq0 = cache.seq_lens[r0]
-            _wb0 = cache.window_begs[r0]
-            _swa0 = min(_seq0 - _wb0, st_["ks"].shape[1])
-            _kf_b = st_["kf"][r0, :_seq0].clone()
-            _vf_b = st_["vf"][r0, :_seq0].clone()
-            _ks_b = st_["ks"][r0, :_swa0].clone()
-            _vs_b = st_["vs"][r0, :_swa0].clone()
-            st_["fls"][r0] = 0
-            st_["sls"][r0] = 0
-            st_["wbs"][r0] = _wb0
-            pg.gather_kv_mtp_batch([r0])
-            _dk = (st_["kf"][r0, :_seq0] - _kf_b).abs().max().item()
-            _dv = (st_["vf"][r0, :_seq0] - _vf_b).abs().max().item()
-            _dks = (st_["ks"][r0, :_swa0] - _ks_b).abs().max().item()
-            _dvs = (st_["vs"][r0, :_swa0] - _vs_b).abs().max().item()
-            print(f"[xcheck-gather] row {r0} re-pull diffs K={_dk:.5f} V={_dv:.5f} "
-                  f"Ks={_dks:.5f} Vs={_dvs:.5f} (seq={_seq0} swa={_swa0} wb={_wb0})",
-                  flush=True)
+            # Skipped under INT8-primary shadows (no full-depth fp16 buffer to diff).
+            if not st_.get("i8p"):
+                _seq0 = cache.seq_lens[r0]
+                _wb0 = cache.window_begs[r0]
+                _swa0 = min(_seq0 - _wb0, st_["ks"].shape[1])
+                _kf_b = st_["kf"][r0, :_seq0].clone()
+                _vf_b = st_["vf"][r0, :_seq0].clone()
+                _ks_b = st_["ks"][r0, :_swa0].clone()
+                _vs_b = st_["vs"][r0, :_swa0].clone()
+                st_["fls"][r0] = 0
+                st_["sls"][r0] = 0
+                st_["wbs"][r0] = _wb0
+                pg.gather_kv_mtp_batch([r0])
+                _dk = (st_["kf"][r0, :_seq0] - _kf_b).abs().max().item()
+                _dv = (st_["vf"][r0, :_seq0] - _vf_b).abs().max().item()
+                _dks = (st_["ks"][r0, :_swa0] - _ks_b).abs().max().item()
+                _dvs = (st_["vs"][r0, :_swa0] - _vs_b).abs().max().item()
+                print(f"[xcheck-gather] row {r0} re-pull diffs K={_dk:.5f} V={_dv:.5f} "
+                      f"Ks={_dks:.5f} Vs={_dvs:.5f} (seq={_seq0} swa={_swa0} wb={_wb0})",
+                      flush=True)
         for _bi in range(len(rows)):
             _s, _n = self.agree_bi.get(_bi, (0, 0))
             self.agree_bi[_bi] = (_s + int(_eq[_bi].sum()), _n + W)

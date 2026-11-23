@@ -14,6 +14,7 @@
 #include "cuda/cache.cuh"
 #include "cuda/kv_write.cuh"
 #include "cuda/int8_decode.cuh"
+#include "cuda/mtp_int8.cuh"
 
 #include "cpp/util.h"
 
@@ -46,7 +47,7 @@ void kv_quant_shadow
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     int cache_len = (int) cache_k.size(1);
     const int32_t* row_map_ptr = NULL;
-    if (row_map.defined() && row_map.numel() > 0)
+    if (row_map.defined() && !row_map.device().is_meta() && row_map.numel() > 0)
     {
         TORCH_CHECK_DTYPE(row_map, kInt);
         row_map_ptr = (const int32_t*) row_map.data_ptr();
@@ -83,7 +84,8 @@ void int8_decode
     int num_kv_heads,
     int num_splits,
     double sm_scale,
-    int head_dim
+    int head_dim,
+    torch::Tensor row_map
 )
 {
     TORCH_CHECK_DTYPE(q, kHalf);
@@ -95,11 +97,21 @@ void int8_decode
     TORCH_CHECK_DTYPE(po, kFloat);
     TORCH_CHECK_DTYPE(pl, kFloat);
     TORCH_CHECK_DTYPE(kv_len_dev, kInt);
-    TORCH_CHECK(kv_len_dev.numel() == 1, "int8_decode: kv_len_dev must be a scalar");
+    // Scalar (1,) for single-row decode, (batch_size,) for batched rounds -- the
+    // kernel reads kv_len_dev[b] per row.
+    TORCH_CHECK(kv_len_dev.numel() == 1 || kv_len_dev.numel() == batch_size,
+                "int8_decode: kv_len_dev must be scalar or per-batch-row");
 
     const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     int depth = (int) k_i8.size(1);
+    const int32_t* row_map_ptr = NULL;
+    if (row_map.defined() && !row_map.device().is_meta() && row_map.numel() > 0)
+    {
+        TORCH_CHECK_DTYPE(row_map, kInt);
+        TORCH_CHECK(row_map.numel() >= batch_size, "int8_decode: row_map too short");
+        row_map_ptr = (const int32_t*) row_map.data_ptr();
+    }
     int8_decode_cuda
     (
         (const half*) q.data_ptr(),
@@ -111,9 +123,146 @@ void int8_decode
         (float*) po.data_ptr(),
         (float*) pl.data_ptr(),
         (const int*) kv_len_dev.data_ptr(),
+        row_map_ptr,
         depth, batch_size, num_qo_heads, num_kv_heads, num_splits,
         (float) sm_scale, head_dim, stream
     );
+}
+
+// INT8 verify attention (q_len rows over the INT8 KV, causal per-row limit).
+// Graph-safe: device-side kv_len frontier, persistent partial buffers, optional row_map.
+void int8_verify
+(
+    torch::Tensor q,
+    torch::Tensor k_i8,
+    torch::Tensor v_i8,
+    torch::Tensor k_scale,
+    torch::Tensor v_scale,
+    torch::Tensor o,
+    torch::Tensor po,
+    torch::Tensor pl,
+    torch::Tensor kv_len_dev,
+    int batch_size,
+    int q_len,
+    int num_qo_heads,
+    int num_kv_heads,
+    int num_splits,
+    double sm_scale,
+    int head_dim,
+    torch::Tensor row_map
+)
+{
+    TORCH_CHECK_DTYPE(q, kHalf);
+    TORCH_CHECK_DTYPE(k_i8, kChar);
+    TORCH_CHECK_DTYPE(v_i8, kChar);
+    TORCH_CHECK_DTYPE(k_scale, kHalf);
+    TORCH_CHECK_DTYPE(v_scale, kHalf);
+    TORCH_CHECK_DTYPE(o, kHalf);
+    TORCH_CHECK_DTYPE(po, kFloat);
+    TORCH_CHECK_DTYPE(pl, kFloat);
+    TORCH_CHECK_DTYPE(kv_len_dev, kInt);
+    TORCH_CHECK(kv_len_dev.numel() == 1 || kv_len_dev.numel() == batch_size,
+                "int8_verify: kv_len_dev must be scalar or per-batch-row");
+
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    int depth = (int) k_i8.size(1);
+    const int32_t* row_map_ptr = NULL;
+    if (row_map.defined() && !row_map.device().is_meta() && row_map.numel() > 0)
+    {
+        TORCH_CHECK_DTYPE(row_map, kInt);
+        row_map_ptr = (const int32_t*) row_map.data_ptr();
+    }
+    int8_verify_cuda
+    (
+        (const half*) q.data_ptr(),
+        (const int8_t*) k_i8.data_ptr(),
+        (const int8_t*) v_i8.data_ptr(),
+        (const half*) k_scale.data_ptr(),
+        (const half*) v_scale.data_ptr(),
+        (half*) o.data_ptr(),
+        (float*) po.data_ptr(),
+        (float*) pl.data_ptr(),
+        (const int*) kv_len_dev.data_ptr(),
+        row_map_ptr,
+        depth, batch_size, q_len, num_qo_heads, num_kv_heads, num_splits,
+        (float) sm_scale, head_dim, stream
+    );
+}
+
+// Quantize a contiguous fp16 chunk (1, n, kvh, hd) into ONE shadow row at absolute
+// row dst_row of a full-depth INT8 destination (MTP gather staging path).
+void kv_quant_chunk
+(
+    torch::Tensor src_k,
+    torch::Tensor src_v,
+    torch::Tensor k_i8,
+    torch::Tensor v_i8,
+    torch::Tensor k_scale,
+    torch::Tensor v_scale,
+    int dst_row,
+    int n,
+    int kv_heads,
+    int head_dim
+)
+{
+    TORCH_CHECK_DTYPE(src_k, kHalf);
+    TORCH_CHECK_DTYPE(src_v, kHalf);
+    TORCH_CHECK_DTYPE(k_i8, kChar);
+    TORCH_CHECK_DTYPE(v_i8, kChar);
+    TORCH_CHECK_DTYPE(k_scale, kHalf);
+    TORCH_CHECK_DTYPE(v_scale, kHalf);
+
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(src_k));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    kv_quant_chunk_cuda
+    (
+        stream,
+        (const half*) src_k.data_ptr(),
+        (const half*) src_v.data_ptr(),
+        (int8_t*) k_i8.data_ptr(),
+        (int8_t*) v_i8.data_ptr(),
+        (half*) k_scale.data_ptr(),
+        (half*) v_scale.data_ptr(),
+        dst_row, n, kv_heads, head_dim, (int) k_i8.size(1)
+    );
+}
+
+// Weight-only INT8 GEMV for the MTP drafter: out(m,N) = x(m,K) fp16 @ w8(N,K)^T *
+// scale(N) fp16. m <= 8. Output allocated here (inside a graph capture it lands in
+// the capture pool, stable across replays -- same contract as torch matmul).
+torch::Tensor mtp_int8_gemm
+(
+    torch::Tensor x,
+    torch::Tensor w8,
+    torch::Tensor scale
+)
+{
+    TORCH_CHECK_DTYPE(x, kHalf);
+    TORCH_CHECK_DTYPE(w8, kChar);
+    TORCH_CHECK_DTYPE(scale, kHalf);
+    TORCH_CHECK(x.dim() == 2 && w8.dim() == 2, "mtp_int8_gemm: x (m,K), w8 (N,K)");
+    TORCH_CHECK(x.size(1) == w8.size(1), "mtp_int8_gemm: K mismatch");
+    TORCH_CHECK(x.size(0) >= 1 && x.size(0) <= 8, "mtp_int8_gemm: m must be 1..8");
+    TORCH_CHECK(scale.numel() == w8.size(0), "mtp_int8_gemm: scale rows mismatch");
+    TORCH_CHECK(x.is_contiguous() && w8.is_contiguous() && scale.is_contiguous(),
+                "mtp_int8_gemm: contiguous inputs required");
+
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    int m = (int) x.size(0);
+    int N = (int) w8.size(0);
+    int K = (int) w8.size(1);
+    torch::Tensor out = torch::empty({m, N}, x.options());
+    mtp_int8_gemm_cuda
+    (
+        (const half*) x.data_ptr(),
+        (const int8_t*) w8.data_ptr(),
+        (const half*) scale.data_ptr(),
+        (half*) out.data_ptr(),
+        m, N, K, stream
+    );
+    return out;
 }
 
 // CUDA-graph-safe KV cache write. The position comes from a device tensor, so the same
@@ -147,7 +296,7 @@ void kv_write
     // Optional per-sequence cache-row mapping (multi-batch slot graphs). An undefined
     // or empty tensor means identity (sequence b writes cache row b), the original path.
     const int32_t* row_map_ptr = NULL;
-    if (row_map.defined() && row_map.numel() > 0)
+    if (row_map.defined() && !row_map.device().is_meta() && row_map.numel() > 0)
     {
         TORCH_CHECK_DTYPE(row_map, kInt);
         row_map_ptr = (const int32_t*) row_map.data_ptr();

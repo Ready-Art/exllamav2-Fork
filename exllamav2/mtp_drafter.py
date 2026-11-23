@@ -173,8 +173,30 @@ class Gemma4AssistantDrafter:
         self.t_last_full = max(i for i, t in enumerate(types) if t == "full_attention")
         self.t_last_swa = max(i for i, t in enumerate(types) if t == "sliding_attention")
 
+        # INT8 opt-ins (default OFF, fp16 path unchanged):
+        #   EXL2_MTP_INT8_W  -- weight-only INT8 GEMVs (per-output-row fp16 scales,
+        #                       custom mtp_int8_gemm kernel; halves the drafter's
+        #                       weight-read bandwidth, the m=1 GEMV floor).
+        #   EXL2_MTP_INT8_KV -- INT8 copy of the gathered FULL-layer target K/V shadow,
+        #                       read by the int8 flash-decode kernel (halves the
+        #                       long-context cross-attention KV read). SWA stays fp16.
+        self._int8_w = os.environ.get("EXL2_MTP_INT8_W", "0") != "0"
+        self._int8_kv = os.environ.get("EXL2_MTP_INT8_KV", "0") != "0"
+        self._w8 = {}          # id(fp16 weight) -> (int8 (N,K), fp16 scale (N,))
+        self._i8bufs = {}      # (B, nq, splits) -> (po, pl) persistent partials
+        self._e_kvl = None     # eager scalar's persistent (1,) int32 kv_len
+        self._g_kvl = None     # scalar graph's persistent (1,) int32 kv_len
+        self._b_kvl = None     # batch's persistent (max_batch,) int32 kv_lens
+        self._b_rowmap = None  # batch's persistent (max_batch,) int32 shadow row map
+        if self._int8_kv and self.num_q_heads % self.num_global_kv_heads != 0:
+            print("[mtp-drafter] INT8 KV needs nq % global_kv_heads == 0; staying fp16",
+                  flush = True)
+            self._int8_kv = False
+
         # Drafter weights (fp16 on self.device).
         self._load_weights(draft_dir)
+        if self._int8_w:
+            self._quantize_weights()
 
         # Sparse draft head (opt-in): frequency-subset vocab columns for the draft
         # argmax; verification keeps the full head. None = full head always.
@@ -184,7 +206,7 @@ class Gemma4AssistantDrafter:
             self.sparse = SparseHead(
                 self.head, self.sparse_head_columns,
                 stats_key_for(getattr(self.tcfg, "model_dir", "model"), self.head.shape[0]),
-                self.vocab_size, self.dev)
+                self.vocab_size, self.dev, int8 = self._int8_w)
 
         # Per-round gathered target K/V (None until gather_target runs).
         self.kv_full = None   # (1, L, num_global_kv_heads, global_head_dim)
@@ -334,6 +356,72 @@ class Gemma4AssistantDrafter:
                 layer_scalar = g(f"{prefix}.layer_scalar").view(1),
             ))
 
+    # ------------------------------------------------------------------ INT8
+
+    @staticmethod
+    def _quant_rows(w: torch.Tensor):
+        """Per-output-row symmetric INT8 + fp16 scale (same scheme as the target's
+        INT8 KV shadow). Chunked to bound the fp16 transient on the vocab head."""
+        N, K = w.shape
+        q = torch.empty((N, K), dtype = torch.int8, device = w.device)
+        s = torch.empty(N, dtype = torch.half, device = w.device)
+        for i in range(0, N, 32768):
+            blk = w[i:i + 32768]
+            amax = blk.abs().amax(dim = 1, keepdim = True).clamp_min(1e-8)
+            sc = (amax / 127.0).half()
+            q[i:i + blk.shape[0]] = torch.round(blk / sc).clamp_(-127, 127).to(torch.int8)
+            s[i:i + blk.shape[0]] = sc.view(-1)
+        return q.contiguous(), s.contiguous()
+
+    def _quantize_weights(self):
+        """Quantize every drafter GEMV weight (fp16 originals kept: the sparse head
+        rebuilds its subset from the full head, and the fp16 path stays the fallback)."""
+        ws = [self.pre_projection, self.post_projection, self.head]
+        for L in self.layers:
+            ws += [L.q_proj, L.o_proj, L.gate, L.up, L.down]
+        with torch.inference_mode(False):
+            for w in ws:
+                self._w8[id(w)] = self._quant_rows(w)
+        print(f"[mtp-drafter] INT8 weight-only GEMVs enabled ({len(ws)} matrices)",
+              flush = True)
+
+    def _lin(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        """x @ w.t() with the INT8 weight-only kernel when quantized (m <= 8)."""
+        e = self._w8.get(id(w)) if self._int8_w else None
+        shp = x.shape
+        if e is None or x.numel() // shp[-1] > 8:
+            return x @ w.t()
+        return ext_c.mtp_int8_gemm(
+            x.reshape(-1, shp[-1]).contiguous(), e[0], e[1]).view(*shp[:-1], w.shape[0])
+
+    def _i8_partials(self, B: int, nq: int, hd: int, depth: int):
+        splits = max(8, min(256, depth // 512))
+        key = (B, nq, splits)
+        b = self._i8bufs.get(key)
+        if b is None:
+            with torch.inference_mode(False):
+                b = (torch.empty(B, splits, nq, hd, device = self.dev, dtype = torch.float32),
+                     torch.empty(B, splits, nq, 2, device = self.dev, dtype = torch.float32))
+            self._i8bufs[key] = b
+        return b, splits
+
+    def _cross_attn_int8(self, q: torch.Tensor, B: int, nq: int, hd: int,
+                         kv_len_dev: torch.Tensor, depth: int,
+                         row_map: torch.Tensor = None):
+        """INT8 flash-decode over the gathered FULL-layer shadow (the target's
+        int8_decode kernel: GQA, per-row device kv_len, split-KV, graph-safe).
+        q (B, nq, hd) already normed + RoPE'd; sm_scale 1.0 exactly as the FI path.
+        row_map: logical batch -> physical shadow row (batched draft over the active
+        slot subset); None = identity (scalar path, row 0)."""
+        st = self.target._mtp_kv
+        nkv = self.num_global_kv_heads
+        (po, pl), splits = self._i8_partials(B, nq, hd, depth)
+        o = torch.empty(B, nq, hd, device = self.dev, dtype = torch.half)
+        ext_c.int8_decode(q.contiguous(), st["kf8"], st["vf8"], st["kfs"], st["vfs"],
+                          o, po, pl, kv_len_dev, B, nq, nkv, splits, 1.0, hd,
+                          row_map if row_map is not None else none_tensor)
+        return o.view(B, 1, nq * hd)
+
     # ------------------------------------------------------------------ rope
 
     def _get_rope(self):
@@ -362,6 +450,8 @@ class Gemma4AssistantDrafter:
             return
         if hasattr(self.target, "gather_kv_mtp"):
             k_full, v_full, k_swa, v_swa, seq_len, window_beg = self.target.gather_kv_mtp()
+            # INT8-primary shadow: no full-depth fp16 full-layer buffer exists; the
+            # full-layer attention reads the INT8 copy directly (kv_full stays None).
             self.kv_full = (k_full, v_full)
             self.kv_full_len = seq_len
             self.kv_swa = (k_swa, v_swa)
@@ -376,8 +466,8 @@ class Gemma4AssistantDrafter:
             # address) with device-side length masks, not the per-round prefix slices.
             st = getattr(self.target, "_mtp_kv", None)
             if st is not None:
-                self._kf_base = st["kf"]
-                self._vf_base = st["vf"]
+                self._kf_base = None if st.get("i8p") else st["kf"]
+                self._vf_base = None if st.get("i8p") else st["vf"]
                 self._ks_base = st["ks"]
                 self._vs_base = st["vs"]
             return
@@ -454,7 +544,7 @@ class Gemma4AssistantDrafter:
         import flashinfer
         hd = layer.head_dim
         nq = layer.num_q_heads
-        q = x_norm @ layer.q_proj.t()                    # (1,1,nq*hd)
+        q = self._lin(x_norm, layer.q_proj)              # (1,1,nq*hd)
         q = q.view(1, 1, nq, hd)
         q = _head_rmsnorm(q, layer.q_norm, self.rms_norm_eps)
         # RoPE the query at absolute position pos (NEOX), matching the target's keys.
@@ -473,6 +563,17 @@ class Gemma4AssistantDrafter:
             # flash-attn's window_size=(W, W) on a causal decode only when passed as W-1.
             window_left = self.sliding_window - 1
 
+        # INT8 KV shadow decode (full layer): half the KV bytes, no prefix copy.
+        st = getattr(self.target, "_mtp_kv", None)
+        if layer.is_full and self._int8_kv and st is not None and "kf8" in st:
+            if self._e_kvl is None:
+                with torch.inference_mode(False):
+                    self._e_kvl = torch.zeros(1, dtype = torch.int32, device = self.dev)
+            self._e_kvl.fill_(kv_len)
+            out = self._cross_attn_int8(q.view(1, nq, hd), 1, nq, hd,
+                                        self._e_kvl, st["kf8"].shape[1])
+            return self._lin(out, layer.o_proj)          # (1,1,hidden)
+
         # FlashInfer single-request decode: q (H, D), k/v (S, HKV, D) NHD, no RoPE
         # (pos_encoding_mode NONE -- the query is already rotated, the keys were
         # rotated by the target). GQA is handled internally.
@@ -488,7 +589,7 @@ class Gemma4AssistantDrafter:
             sm_scale = 1.0,
         )                                                # (nq, hd)
         out = out.view(1, 1, nq * hd)
-        return out @ layer.o_proj.t()                    # (1,1,hidden)
+        return self._lin(out, layer.o_proj)              # (1,1,hidden)
 
     # ------------------------------------------------------------------ block
 
@@ -509,10 +610,10 @@ class Gemma4AssistantDrafter:
         x = x + a
         # MLP branch
         y = _rmsnorm(x, layer.pre_ff_ln, self.rms_norm_eps)
-        gate = y @ layer.gate.t()
-        up = y @ layer.up.t()
+        gate = self._lin(y, layer.gate)
+        up = self._lin(y, layer.up)
         y = _gelu_tanh(gate) * up
-        y = y @ layer.down.t()
+        y = self._lin(y, layer.down)
         y = _rmsnorm(y, layer.post_ff_ln, self.rms_norm_eps)
         x = x + y
         # Layer scalar
@@ -534,17 +635,17 @@ class Gemma4AssistantDrafter:
             state = self._target_final_norm(state)
         emb = self._target_embed(token_id)               # (1,1,backbone)
         y = torch.cat((emb, state), dim = -1)            # (1,1,2*backbone)
-        x = y @ self.pre_projection.t()                  # (1,1,hidden)
+        x = self._lin(y, self.pre_projection)            # (1,1,hidden)
         for layer in self.layers:
             x = self._block(layer, x, pos)
         x = _rmsnorm(x, self.final_norm, self.rms_norm_eps)
-        next_state = x @ self.post_projection.t()        # (1,1,backbone)
+        next_state = self._lin(x, self.post_projection)  # (1,1,backbone)
         if probe and self.sparse is not None:
             self.sparse.probe(x)
         if use_sparse and self.sparse is not None and self.sparse.active:
             logits = self.sparse.logits(x)               # (1,1,columns)
         else:
-            logits = x @ self.head.t()                   # (1,1,vocab)
+            logits = self._lin(x, self.head)             # (1,1,vocab)
         return logits, next_state
 
     # ------------------------------------------------------------------ draft window
@@ -573,7 +674,7 @@ class Gemma4AssistantDrafter:
         :param window: number of draft tokens to produce (default num_draft_tokens).
         :return: (1, window) tensor of drafted token ids.
         """
-        assert self.kv_full is not None and self.kv_swa is not None, \
+        assert (self.kv_full is not None or self._int8_kv) and self.kv_swa is not None, \
             "call gather_target(cache) before draft_window"
         window = self.num_draft_tokens if window is None else window
         # Change98: graph path (MP backend only). Default OFF -- eager FlashInfer drafting
@@ -590,7 +691,8 @@ class Gemma4AssistantDrafter:
         # when the caller needs logits for probabilistic acceptance (return_logits=True) we
         # must use the eager path, which returns (ids, logits). Otherwise the sampling caller
         # would unpack a single ids tensor and crash.
-        if (self._kf_base is not None and not self._graph_failed and not return_logits
+        if ((self._kf_base is not None or self._int8_kv)
+                and not self._graph_failed and not return_logits
                 and window == self.num_draft_tokens
                 and os.environ.get("EXL2_MTP_DRAFT_GRAPH", "0") == "1"):
             self._ensure_draft_graph()
@@ -641,6 +743,18 @@ class Gemma4AssistantDrafter:
         ring = st["ks"].shape[1]
         self._b_swa_lens = [min(cache.seq_lens[r] - cache.window_begs[r], ring)
                             for r in rows]
+        # INT8 KV: refresh the persistent per-row kv_lens + logical->physical row map
+        # (fixed within the round; the drafter writes no K/V). Normal tensors: mutated
+        # in place on the scheduler thread outside the loader's InferenceMode.
+        if self._int8_kv and "kf8" in st:
+            B = len(rows)
+            with torch.inference_mode(False):
+                if self._b_kvl is None or self._b_kvl.numel() < B:
+                    mb = max(B, getattr(self.target, "max_batch", B))
+                    self._b_kvl = torch.zeros(mb, dtype = torch.int32, device = self.dev)
+                    self._b_rowmap = torch.zeros(mb, dtype = torch.int32, device = self.dev)
+                self._b_kvl[:B].copy_(torch.tensor(self._b_full_lens, dtype = torch.int32))
+                self._b_rowmap[:B].copy_(torch.tensor(self._b_rows, dtype = torch.int32))
 
     def _b_ensure_wrappers(self):
         import flashinfer
@@ -664,6 +778,8 @@ class Gemma4AssistantDrafter:
             (self._b_wrap_swa, st["ks"], self._b_swa_lens,
              self.num_kv_heads, self.head_dim, self.sliding_window - 1),
         ):
+            if wrap is self._b_wrap_full and st.get("i8p"):
+                continue
             depth = tensor.shape[1]
             npages = depth // page
             indptr = [0]
@@ -700,7 +816,7 @@ class Gemma4AssistantDrafter:
         hd = layer.head_dim
         nq = layer.num_q_heads
         B = x_norm.shape[0]
-        q = x_norm @ layer.q_proj.t()                    # (B,1,nq*hd)
+        q = self._lin(x_norm, layer.q_proj)              # (B,1,nq*hd)
         q = q.view(B, 1, nq, hd)
         q = _head_rmsnorm(q, layer.q_norm, self.rms_norm_eps)
         sin, cos = self._get_rope()[layer.rope_index]
@@ -711,6 +827,11 @@ class Gemma4AssistantDrafter:
             k, v = st["kf"], st["vf"]
             wrap = self._b_wrap_full
             nkv = self.num_global_kv_heads
+            if self._int8_kv and "kf8" in st and self._b_kvl is not None:
+                out = self._cross_attn_int8(q.view(B, nq, hd), B, nq, hd,
+                                            self._b_kvl[:B], st["kf8"].shape[1],
+                                            self._b_rowmap[:B])
+                return self._lin(out, layer.o_proj)
         else:
             k, v = st["ks"], st["vs"]
             wrap = self._b_wrap_swa
@@ -756,11 +877,11 @@ class Gemma4AssistantDrafter:
                 vp = vv.view(-1, page, nk, hd_)
                 outs.append(wr.run(q[b:b + 1].view(1, nq, hd), (kp, vp)))
             out = torch.cat(outs, dim = 0)
-            return out.view(B, 1, nq * hd) @ layer.o_proj.t()
+            return self._lin(out.view(B, 1, nq * hd), layer.o_proj)
         k_pages = k.view(-1, page, nkv, hd)
         v_pages = v.view(-1, page, nkv, hd)
         out = wrap.run(q.view(B, nq, hd), (k_pages, v_pages))   # (B, nq, hd)
-        return out.view(B, 1, nq * hd) @ layer.o_proj.t()
+        return self._lin(out.view(B, 1, nq * hd), layer.o_proj)
 
     def _block_batch(self, layer: _DrafterLayer, x: torch.Tensor,
                      pos_t: torch.Tensor) -> torch.Tensor:
@@ -769,10 +890,10 @@ class Gemma4AssistantDrafter:
         a = _rmsnorm(a, layer.post_attn_ln, self.rms_norm_eps)
         x = x + a
         y = _rmsnorm(x, layer.pre_ff_ln, self.rms_norm_eps)
-        gate = y @ layer.gate.t()
-        up = y @ layer.up.t()
+        gate = self._lin(y, layer.gate)
+        up = self._lin(y, layer.up)
         y = _gelu_tanh(gate) * up
-        y = y @ layer.down.t()
+        y = self._lin(y, layer.down)
         y = _rmsnorm(y, layer.post_ff_ln, self.rms_norm_eps)
         x = x + y
         return x * layer.layer_scalar
@@ -797,17 +918,17 @@ class Gemma4AssistantDrafter:
             emb = emb * (self.backbone_hidden_size ** 0.5)
         emb = emb.to(self.dev, non_blocking = True).half()
         y = torch.cat((emb, state), dim = -1)
-        x = y @ self.pre_projection.t()
+        x = self._lin(y, self.pre_projection)
         for layer in self.layers:
             x = self._block_batch(layer, x, pos_t)
         x = _rmsnorm(x, self.final_norm, self.rms_norm_eps)
-        next_state = x @ self.post_projection.t()
+        next_state = self._lin(x, self.post_projection)
         if probe and self.sparse is not None:
             self.sparse.probe(x)
         if use_sparse and self.sparse is not None and self.sparse.active:
             logits = self.sparse.logits(x)               # (B,1,columns)
         else:
-            logits = x @ self.head.t()
+            logits = self._lin(x, self.head)
         return logits, next_state
 
     def draft_window_batch(self, base_tok: torch.Tensor, base_state: torch.Tensor,
@@ -893,10 +1014,15 @@ class Gemma4AssistantDrafter:
         run()'s addresses stay stable (the target's BUG 103 graph contract)."""
         page = 128
         ent = self._b_graphs[B]
+        if "kvl" in ent:
+            ent["kvl"].copy_(torch.tensor(full_lens, dtype = torch.int32))
+            ent["rowmap"].copy_(torch.tensor(self._b_rows, dtype = torch.int32))
         for e, lens, nkv, hd, window in (
             (ent["full"], full_lens, self.num_global_kv_heads, self.global_head_dim, -1),
             (ent["swa"], swa_lens, self.num_kv_heads, self.head_dim, self.sliding_window - 1),
         ):
+            if e is None:
+                continue
             npages = e["npages"]
             indptr = [0]
             indices = []
@@ -933,25 +1059,33 @@ class Gemma4AssistantDrafter:
         nq = layer.num_q_heads
         B = x.shape[0]
         y = _rmsnorm(x, layer.input_ln, self.rms_norm_eps)
-        q = y @ layer.q_proj.t()
+        q = self._lin(y, layer.q_proj)
         q = q.view(B, 1, nq, hd)
         q = _head_rmsnorm(q, layer.q_norm, self.rms_norm_eps)
         sin, cos = self._get_rope()[layer.rope_index]
         ext_c.rope_(q, sin, cos, -1, nq, hd, ent["pos"], True)
         kf_pages, vf_pages, ks_pages, vs_pages = self._bg_pages
         if layer.is_full:
-            e, pages = ent["full"], (kf_pages, vf_pages)
+            if self._int8_kv and "kvl" in ent:
+                out = self._cross_attn_int8(q.view(B, nq, hd), B, nq, hd,
+                                            ent["kvl"], self._b_st["kf8"].shape[1],
+                                            ent["rowmap"])
+                a = self._lin(out, layer.o_proj)
+            else:
+                e, pages = ent["full"], (kf_pages, vf_pages)
+                out = e["wrapper"].run(q.view(B, nq, hd), pages)
+                a = self._lin(out.view(B, 1, nq * hd), layer.o_proj)
         else:
             e, pages = ent["swa"], (ks_pages, vs_pages)
-        out = e["wrapper"].run(q.view(B, nq, hd), pages)
-        a = out.view(B, 1, nq * hd) @ layer.o_proj.t()
+            out = e["wrapper"].run(q.view(B, nq, hd), pages)
+            a = self._lin(out.view(B, 1, nq * hd), layer.o_proj)
         a = _rmsnorm(a, layer.post_attn_ln, self.rms_norm_eps)
         x = x + a
         y = _rmsnorm(x, layer.pre_ff_ln, self.rms_norm_eps)
-        gate = y @ layer.gate.t()
-        up = y @ layer.up.t()
+        gate = self._lin(y, layer.gate)
+        up = self._lin(y, layer.up)
         y = _gelu_tanh(gate) * up
-        y = y @ layer.down.t()
+        y = self._lin(y, layer.down)
         y = _rmsnorm(y, layer.post_ff_ln, self.rms_norm_eps)
         x = x + y
         return x * layer.layer_scalar
@@ -982,12 +1116,13 @@ class Gemma4AssistantDrafter:
             self._ensure_gpu_embed()
             st = self._b_st
             kf, vf, ks, vs = st["kf"], st["vf"], st["ks"], st["vs"]
-            if kf.dim() != 4 or kf.shape[1] % page or ks.shape[1] % page:
+            i8p = bool(st.get("i8p"))
+            if kf.dim() != 4 or (not i8p and kf.shape[1] % page) or ks.shape[1] % page:
                 raise RuntimeError(f"batch shadows not 4-D/page-aligned: {tuple(kf.shape)}")
             if self._bg_pages is None:
                 self._bg_pages = (
-                    kf.view(-1, page, kf.shape[2], kf.shape[3]),
-                    vf.view(-1, page, vf.shape[2], vf.shape[3]),
+                    None if i8p else kf.view(-1, page, kf.shape[2], kf.shape[3]),
+                    None if i8p else vf.view(-1, page, vf.shape[2], vf.shape[3]),
                     ks.view(-1, page, ks.shape[2], ks.shape[3]),
                     vs.view(-1, page, vs.shape[2], vs.shape[3]),
                 )
@@ -1015,13 +1150,16 @@ class Gemma4AssistantDrafter:
             with torch.inference_mode(False):
                 ent = {
                     "graph": None,
-                    "full": mk_entry(kf.shape[1] // page),
+                    "full": None if i8p else mk_entry(kf.shape[1] // page),
                     "swa": mk_entry(ks.shape[1] // page),
                     "state": torch.empty((B, 1, H), dtype = torch.half, device = dev),
                     "id_in": torch.empty((B, 1), dtype = torch.long, device = dev),
                     "ids": torch.empty((B, W), dtype = torch.long, device = dev),
                     "pos": torch.zeros((B,), dtype = torch.int32, device = dev),
                 }
+                if self._int8_kv and "kf8" in st:
+                    ent["kvl"] = torch.zeros(B, dtype = torch.int32, device = dev)
+                    ent["rowmap"] = torch.zeros(B, dtype = torch.int32, device = dev)
                 # Valid (non-degenerate) capture inputs: token 0's embed row, zero
                 # state (RMSNorm eps guards), lengths >= 1 avoid all-masked softmax.
                 ent["id_in"].zero_()
@@ -1037,15 +1175,15 @@ class Gemma4AssistantDrafter:
                     for k in range(W):
                         emb = self._gpu_embed[tok.view(-1)].view(B, 1, H)
                         y = torch.cat((emb, state), dim = -1)
-                        x = y @ self.pre_projection.t()
+                        x = self._lin(y, self.pre_projection)
                         for layer in self.layers:
                             x = self._block_graph_fi_batch(layer, x, ent)
                         x = _rmsnorm(x, self.final_norm, self.rms_norm_eps)
-                        state = x @ self.post_projection.t()
+                        state = self._lin(x, self.post_projection)
                         if sparse_at_capture:
-                            tok = self.sparse.ids[(x @ self.sparse.subset.t()).argmax(dim = -1)]
+                            tok = self.sparse.ids[self.sparse.logits(x).argmax(dim = -1)]
                         else:
-                            tok = (x @ self.head.t()).argmax(dim = -1)
+                            tok = self._lin(x, self.head).argmax(dim = -1)
                         ent["ids"][:, k:k + 1].copy_(tok)
 
                 with torch.cuda.device(dev):
@@ -1118,10 +1256,14 @@ class Gemma4AssistantDrafter:
         the captured run()'s addresses stable (the target's BUG 103 graph contract).
         """
         page = 128
+        if self._g_kvl is not None:
+            self._g_kvl.fill_(full_len)
         for ent, l, nkv, hd, window in (
             (self._g_full, full_len, self.num_global_kv_heads, self.global_head_dim, -1),
             (self._g_swa, swa_len, self.num_kv_heads, self.head_dim, self.sliding_window - 1),
         ):
+            if ent is None:
+                continue
             pv = (l + page - 1) // page
             ent["indptr"][1].fill_(pv)
             ent["indices"][:pv].copy_(ent["page_ids"][:pv])
@@ -1150,25 +1292,33 @@ class Gemma4AssistantDrafter:
         hd = layer.head_dim
         nq = layer.num_q_heads
         y = _rmsnorm(x, layer.input_ln, self.rms_norm_eps)
-        q = y @ layer.q_proj.t()
+        q = self._lin(y, layer.q_proj)
         q = q.view(1, 1, nq, hd)
         q = _head_rmsnorm(q, layer.q_norm, self.rms_norm_eps)
         sin, cos = self._get_rope()[layer.rope_index]
         ext_c.rope_(q, sin, cos, -1, nq, hd, self._g_pos, True)
         if layer.is_full:
-            ent, pages = self._g_full, (self._g_kf_pages, self._g_vf_pages)
+            if self._int8_kv and self._g_kvl is not None:
+                st = self.target._mtp_kv
+                out = self._cross_attn_int8(q.view(1, nq, hd), 1, nq, hd,
+                                            self._g_kvl, st["kf8"].shape[1])
+                a = self._lin(out, layer.o_proj)
+            else:
+                ent, pages = self._g_full, (self._g_kf_pages, self._g_vf_pages)
+                # run() needs 3-D q (batch, heads, dim); 2-D is misread as q_len_per_req.
+                out = ent["wrapper"].run(q.view(1, nq, hd), pages)
+                a = self._lin(out.view(1, 1, nq * hd), layer.o_proj)
         else:
             ent, pages = self._g_swa, (self._g_ks_pages, self._g_vs_pages)
-        # run() needs 3-D q (batch, heads, dim); 2-D is misread as q_len_per_req.
-        out = ent["wrapper"].run(q.view(1, nq, hd), pages)
-        a = out.view(1, 1, nq * hd) @ layer.o_proj.t()
+            out = ent["wrapper"].run(q.view(1, nq, hd), pages)
+            a = self._lin(out.view(1, 1, nq * hd), layer.o_proj)
         a = _rmsnorm(a, layer.post_attn_ln, self.rms_norm_eps)
         x = x + a
         y = _rmsnorm(x, layer.pre_ff_ln, self.rms_norm_eps)
-        gate = y @ layer.gate.t()
-        up = y @ layer.up.t()
+        gate = self._lin(y, layer.gate)
+        up = self._lin(y, layer.up)
         y = _gelu_tanh(gate) * up
-        y = y @ layer.down.t()
+        y = self._lin(y, layer.down)
         y = _rmsnorm(y, layer.post_ff_ln, self.rms_norm_eps)
         x = x + y
         return x * layer.layer_scalar
@@ -1187,7 +1337,7 @@ class Gemma4AssistantDrafter:
         """
         if self._draft_graph is not None or self._graph_failed:
             return
-        if self._kf_base is None:
+        if self._kf_base is None and not self._int8_kv:
             return
         try:
             import flashinfer
@@ -1199,10 +1349,10 @@ class Gemma4AssistantDrafter:
             self._ensure_gpu_embed()
             kf, vf = self._kf_base, self._vf_base
             ks, vs = self._ks_base, self._vs_base
-            if kf.shape[0] % page or ks.shape[0] % page:
-                raise RuntimeError(f"shadow depth not page-aligned: {kf.shape[0]}/{ks.shape[0]}")
-            self._g_kf_pages = kf.view(-1, page, kf.shape[1], kf.shape[2])
-            self._g_vf_pages = vf.view(-1, page, vf.shape[1], vf.shape[2])
+            if (kf is not None and kf.shape[0] % page) or ks.shape[0] % page:
+                raise RuntimeError(f"shadow depth not page-aligned")
+            self._g_kf_pages = kf.view(-1, page, kf.shape[1], kf.shape[2]) if kf is not None else None
+            self._g_vf_pages = vf.view(-1, page, vf.shape[1], vf.shape[2]) if vf is not None else None
             self._g_ks_pages = ks.view(-1, page, ks.shape[1], ks.shape[2])
             self._g_vs_pages = vs.view(-1, page, vs.shape[1], vs.shape[2])
 
@@ -1226,12 +1376,14 @@ class Gemma4AssistantDrafter:
                 }
 
             with torch.inference_mode(False):
-                self._g_full = mk_entry(kf.shape[0] // page)
+                self._g_full = mk_entry(kf.shape[0] // page) if kf is not None else None
                 self._g_swa = mk_entry(ks.shape[0] // page)
                 self._g_state = torch.empty((1, 1, H), dtype = torch.half, device = dev)
                 self._g_id_in = torch.empty((1, 1), dtype = torch.long, device = dev)
                 self._g_ids = torch.empty((1, W), dtype = torch.long, device = dev)
                 self._g_pos = torch.zeros((1,), dtype = torch.int32, device = dev)
+                if self._int8_kv and "kf8" in getattr(self.target, "_mtp_kv", {}):
+                    self._g_kvl = torch.zeros(1, dtype = torch.int32, device = dev)
                 # Valid (non-degenerate) capture inputs: token 0's embed row, zero state
                 # (RMSNorm eps guards), lengths >= 1 avoid an all-masked softmax.
                 self._g_id_in.zero_()
@@ -1249,15 +1401,15 @@ class Gemma4AssistantDrafter:
                 for k in range(W):
                     emb = self._gpu_embed[tok.view(-1)].view(1, 1, H)
                     y = torch.cat((emb, state), dim = -1)
-                    x = y @ self.pre_projection.t()
+                    x = self._lin(y, self.pre_projection)
                     for layer in self.layers:
                         x = self._block_graph_fi(layer, x)
                     x = _rmsnorm(x, self.final_norm, self.rms_norm_eps)
-                    state = x @ self.post_projection.t()
+                    state = self._lin(x, self.post_projection)
                     if sparse_at_capture:
-                        tok = self.sparse.ids[(x @ self.sparse.subset.t()).argmax(dim = -1)]
+                        tok = self.sparse.ids[self.sparse.logits(x).argmax(dim = -1)]
                     else:
-                        tok = (x @ self.head.t()).argmax(dim = -1)
+                        tok = self._lin(x, self.head).argmax(dim = -1)
                     self._g_ids[:, k:k + 1].copy_(tok)
 
             with torch.cuda.device(dev):
@@ -1309,7 +1461,7 @@ class Gemma4AssistantDrafter:
             s = s.view(1, 1, -1)
         s = self._target_final_norm(s)
         emb = self._target_embed(tok)
-        x = torch.cat((emb, s), dim = -1) @ self.pre_projection.t()
+        x = self._lin(torch.cat((emb, s), dim = -1), self.pre_projection)
         for layer in self.layers:
             x = self._block(layer, x, pos)
         return _rmsnorm(x, self.final_norm, self.rms_norm_eps)

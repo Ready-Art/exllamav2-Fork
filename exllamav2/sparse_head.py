@@ -47,12 +47,17 @@ class SparseHead:
     """
 
     def __init__(self, full_head: torch.Tensor, columns: int, stats_key: str,
-                 vocab_size: int, device: torch.device):
+                 vocab_size: int, device: torch.device, int8: bool = False):
         self.full = full_head
         self.columns = int(columns)
         self.device = device
         self.vocab_size = int(vocab_size)
         self.stats_key = stats_key
+        # INT8 weight-only subset GEMV (opt-in, drafter EXL2_MTP_INT8_W): the subset
+        # is re-quantized on every rebuild; the full head stays fp16 for the probe.
+        self.int8 = bool(int8)
+        self.subset8 = None
+        self.subset_s = None
         # NORMAL tensor: constructed under the loader's InferenceMode, but observe()
         # does in-place += on the job thread OUTSIDE it (inference tensors forbid that).
         with torch.inference_mode(False):
@@ -125,6 +130,9 @@ class SparseHead:
         with torch.inference_mode(False):
             self.subset = self.full[top.to(self.full.device)].contiguous()
             self.ids = top.to(self.device)
+            if self.int8:
+                from exllamav2.mtp_drafter import Gemma4AssistantDrafter
+                self.subset8, self.subset_s = Gemma4AssistantDrafter._quant_rows(self.subset)
         self.probes = 0
         self.misses = 0
         self.disabled = False
@@ -137,6 +145,12 @@ class SparseHead:
     # ------------------------------------------------------------------ draft
 
     def logits(self, x: torch.Tensor) -> torch.Tensor:
+        shp = x.shape
+        if self.subset8 is not None and x.numel() // shp[-1] <= 8:
+            from exllamav2.ext import exllamav2_ext as ext_c
+            return ext_c.mtp_int8_gemm(
+                x.reshape(-1, shp[-1]).contiguous(),
+                self.subset8, self.subset_s).view(*shp[:-1], self.subset.shape[0])
         return x @ self.subset.t()
 
     def map_ids(self, subset_ids: torch.Tensor) -> torch.Tensor:

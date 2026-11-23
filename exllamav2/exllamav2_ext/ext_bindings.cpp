@@ -196,5 +196,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         py::arg("q"), py::arg("k_i8"), py::arg("v_i8"), py::arg("k_scale"), py::arg("v_scale"),
         py::arg("o"), py::arg("po"), py::arg("pl"), py::arg("kv_len_dev"),
         py::arg("batch_size"), py::arg("num_qo_heads"), py::arg("num_kv_heads"),
-        py::arg("num_splits"), py::arg("sm_scale"), py::arg("head_dim"));
+        py::arg("num_splits"), py::arg("sm_scale"), py::arg("head_dim"),
+        py::arg("row_map") = torch::Tensor());
+    m.def("mtp_int8_gemm", &mtp_int8_gemm, "mtp_int8_gemm",
+        py::arg("x"), py::arg("w8"), py::arg("scale"));
+    m.def("kv_quant_chunk", &kv_quant_chunk, "kv_quant_chunk",
+        py::arg("src_k"), py::arg("src_v"), py::arg("k_i8"), py::arg("v_i8"),
+        py::arg("k_scale"), py::arg("v_scale"), py::arg("dst_row"),
+        py::arg("n"), py::arg("kv_heads"), py::arg("head_dim"));
+    m.def("int8_verify", &int8_verify, "int8_verify",
+        py::arg("q"), py::arg("k_i8"), py::arg("v_i8"), py::arg("k_scale"), py::arg("v_scale"),
+        py::arg("o"), py::arg("po"), py::arg("pl"), py::arg("kv_len_dev"),
+        py::arg("batch_size"), py::arg("q_len"), py::arg("num_qo_heads"), py::arg("num_kv_heads"),
+        py::arg("num_splits"), py::arg("sm_scale"), py::arg("head_dim"),
+        py::arg("row_map") = torch::Tensor());
 }

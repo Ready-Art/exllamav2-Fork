@@ -21,9 +21,35 @@ void int8_decode_cuda
     half* o,                  // (batch, nq, HD)
     float* po,                // (batch, num_splits, nq, HD)
     float* pl,                // (batch, num_splits, nq, 2)
-    const int* kv_len_dev,    // device scalar
+    const int* kv_len_dev,    // device scalar or (batch,) per-row lengths
+    const int* row_map,       // optional (batch,) logical->physical shadow row, NULL = identity
     int depth,                // cache depth (batch stride)
     int batch_size,
+    int num_qo_heads,
+    int num_kv_heads,
+    int num_splits,
+    float sm_scale,
+    int head_dim,
+    cudaStream_t stream
+);
+
+// INT8 verify attention (q_len rows, causal limit kv_len_dev[b]-q_len+r+1 per row).
+// q (batch, q_len, nq, HD); partials po/pl sized (batch, splits, nq*q_len, ...).
+void int8_verify_cuda
+(
+    const half* q,
+    const int8_t* k_i8,
+    const int8_t* v_i8,
+    const half* k_scale,
+    const half* v_scale,
+    half* o,
+    float* po,
+    float* pl,
+    const int* kv_len_dev,
+    const int* row_map,
+    int depth,
+    int batch_size,
+    int q_len,
     int num_qo_heads,
     int num_kv_heads,
     int num_splits,

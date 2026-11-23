@@ -1400,6 +1400,10 @@ class TPProcessGroup:
                     "vs": torch.zeros((B, mc.kv_state_size, d.num_kv_heads, d.head_dim),
                                       dtype = torch.half, device = dev),
                 }
+                if getattr(d, "_int8_kv", False):
+                    self._mtp_kv.update(self._alloc_int8_shadow(
+                        B, sdepth, d.num_global_kv_heads, d.global_head_dim, dev))
+                    self._make_i8_primary(B, d, dev)
             else:
                 self._mtp_kv = {
                     "fl": 0,
@@ -1415,7 +1419,81 @@ class TPProcessGroup:
                     "vs": torch.zeros((mc.kv_state_size, d.num_kv_heads, d.head_dim),
                                       dtype = torch.half, device = dev),
                 }
+                if getattr(d, "_int8_kv", False):
+                    self._mtp_kv.update(self._alloc_int8_shadow(
+                        1, sdepth, d.num_global_kv_heads, d.global_head_dim, dev))
+                    self._make_i8_primary(1, d, dev)
         return self._mtp_kv
+
+    # INT8-primary MTP shadow: the full-layer fp16 buffers shrink to a small gather
+    # STAGING depth; the INT8 copy is the only full-depth storage the drafter reads
+    # (VRAM ~halved vs fp16, and the int8 kernel reads half the bytes). SWA rings
+    # stay fp16 (small). The drafter's full-layer attention ALWAYS uses the int8
+    # kernel in this mode -- there is no fp16 full-depth fallback.
+    _I8_STAGE = 4096
+
+    def _make_i8_primary(self, B, d, dev):
+        st = self._mtp_kv
+        with torch.inference_mode(False):
+            st["kf"] = torch.zeros((B, self._I8_STAGE, d.num_global_kv_heads,
+                                    d.global_head_dim), dtype = torch.half, device = dev)
+            st["vf"] = torch.zeros((B, self._I8_STAGE, d.num_global_kv_heads,
+                                    d.global_head_dim), dtype = torch.half, device = dev)
+        st["i8p"] = True
+
+    def _stage_full_delta(self, row, fl0, cpu_k, cpu_v):
+        """Copy a joined fp16 full-layer delta (CPU) into the INT8 primary shadow via
+        the small staging buffer, chunk by chunk (the first gather / re-pull can be
+        the whole context; steady-state deltas are a few rows)."""
+        st = self._mtp_kv
+        from exllamav2.ext import exllamav2_ext as ext_c
+        n = cpu_k.shape[0]
+        kvh, hd = cpu_k.shape[1], cpu_k.shape[2]
+        sk = st["kf"][row] if row is not None else st["kf"][0]
+        sv = st["vf"][row] if row is not None else st["vf"][0]
+        k8 = st["kf8"][row:row + 1] if row is not None else st["kf8"]
+        v8 = st["vf8"][row:row + 1] if row is not None else st["vf8"]
+        ks = st["kfs"][row:row + 1] if row is not None else st["kfs"]
+        vs = st["vfs"][row:row + 1] if row is not None else st["vfs"]
+        for i in range(0, n, self._I8_STAGE):
+            c = min(self._I8_STAGE, n - i)
+            sk[:c].copy_(cpu_k[i:i + c])
+            sv[:c].copy_(cpu_v[i:i + c])
+            ext_c.kv_quant_chunk(sk[:c], sv[:c], k8, v8, ks, vs,
+                                 fl0 + i, c, kvh, hd)
+
+    def _alloc_int8_shadow(self, B, sdepth, kvh, hd, dev):
+        """INT8 copy of the FULL-layer joined shadow (opt-in EXL2_MTP_INT8_KV): the
+        drafter's int8 flash-decode reads half the bytes at long context. SWA rings
+        stay fp16 (small). Same per-(token,head) symmetric scheme as the target's
+        EXL2_KV_INT8 shadow; quantized on gather/clone/restore, never read past the
+        gather frontier."""
+        with torch.inference_mode(False):
+            return {
+                "kf8": torch.zeros((B, sdepth, kvh, hd), dtype = torch.int8, device = dev),
+                "vf8": torch.zeros((B, sdepth, kvh, hd), dtype = torch.int8, device = dev),
+                "kfs": torch.zeros((B, sdepth, kvh), dtype = torch.half, device = dev),
+                "vfs": torch.zeros((B, sdepth, kvh), dtype = torch.half, device = dev),
+            }
+
+    def _quant_shadow_range(self, row, start, end):
+        """Quantize full-layer shadow rows [start, end) of one row (None = scalar 3-D
+        shadow) into the INT8 copy. Eager (gather/clone/restore run between rounds)."""
+        st = self._mtp_kv
+        if st is None or "kf8" not in st or end <= start:
+            return
+        from exllamav2.ext import exllamav2_ext as ext_c, none_tensor
+        if row is None:
+            kf, vf = st["kf"].unsqueeze(0), st["vf"].unsqueeze(0)
+            kf8, vf8 = st["kf8"], st["vf8"]
+            kfs, vfs = st["kfs"], st["vfs"]
+        else:
+            kf, vf = st["kf"][row:row + 1], st["vf"][row:row + 1]
+            kf8, vf8 = st["kf8"][row:row + 1], st["vf8"][row:row + 1]
+            kfs, vfs = st["kfs"][row:row + 1], st["vfs"][row:row + 1]
+        pos = torch.tensor([start], dtype = torch.int32, device = kf.device)
+        ext_c.kv_quant_shadow(kf, vf, kf8, vf8, kfs, vfs, pos,
+                              1, end - start, kf.shape[2], kf.shape[3], none_tensor)
 
     def _reset_mtp_kv(self):
         """Reset the gather bookkeeping and re-zero the shadow, KEEPING the buffers.
@@ -1569,8 +1647,12 @@ class TPProcessGroup:
             _tm["recv"] = _tc() - _t0
             _t0 = _tc()
         if df > 0:
-            st["kf"][st["fl"]:seq_len].copy_(torch.cat(full_k, dim = 1))
-            st["vf"][st["fl"]:seq_len].copy_(torch.cat(full_v, dim = 1))
+            if st.get("i8p"):
+                self._stage_full_delta(None, st["fl"],
+                                       torch.cat(full_k, dim = 1), torch.cat(full_v, dim = 1))
+            else:
+                st["kf"][st["fl"]:seq_len].copy_(torch.cat(full_k, dim = 1))
+                st["vf"][st["fl"]:seq_len].copy_(torch.cat(full_v, dim = 1))
         # (after a rewind, st["fl"] < seq_len and the delta above re-writes from there)
         st["fl"] = seq_len
 
@@ -1602,6 +1684,9 @@ class TPProcessGroup:
                       f"avg_df={tr['df']/_n:.1f} avg_ds={tr['ds']/_n:.1f} "
                       f"shifts={tr['shifts']} repulls={tr['repulls']}", flush=True)
 
+        if st.get("i8p"):
+            return (None, None, st["ks"][:swa_len], st["vs"][:swa_len],
+                    seq_len, window_beg)
         return (st["kf"][:seq_len], st["vf"][:seq_len],
                 st["ks"][:swa_len], st["vs"][:swa_len],
                 seq_len, window_beg)
@@ -1683,8 +1768,13 @@ class TPProcessGroup:
             seq_len, swa_len, swa_start, df, ds = meta[bi]
             fl0 = specs[bi][1]
             if df > 0:
-                st["kf"][r, fl0:seq_len].copy_(torch.cat(parts[bi][0], dim = 1))
-                st["vf"][r, fl0:seq_len].copy_(torch.cat(parts[bi][1], dim = 1))
+                if st.get("i8p"):
+                    self._stage_full_delta(r, fl0,
+                                           torch.cat(parts[bi][0], dim = 1),
+                                           torch.cat(parts[bi][1], dim = 1))
+                else:
+                    st["kf"][r, fl0:seq_len].copy_(torch.cat(parts[bi][0], dim = 1))
+                    st["vf"][r, fl0:seq_len].copy_(torch.cat(parts[bi][1], dim = 1))
             st["fls"][r] = seq_len
             if ds > 0:
                 st["ks"][r, swa_start:swa_len].copy_(torch.cat(parts[bi][2], dim = 1))
@@ -1854,8 +1944,14 @@ class TPProcessGroup:
             swb = st["wbs"][src]
             n = max(0, min(f - swb, st["ks"].shape[1]))
             with torch.inference_mode():
-                st["kf"][dst, :f].copy_(st["kf"][src, :f])
-                st["vf"][dst, :f].copy_(st["vf"][src, :f])
+                if not st.get("i8p"):
+                    st["kf"][dst, :f].copy_(st["kf"][src, :f])
+                    st["vf"][dst, :f].copy_(st["vf"][src, :f])
+                if "kf8" in st:
+                    st["kf8"][dst, :f].copy_(st["kf8"][src, :f])
+                    st["vf8"][dst, :f].copy_(st["vf8"][src, :f])
+                    st["kfs"][dst, :f].copy_(st["kfs"][src, :f])
+                    st["vfs"][dst, :f].copy_(st["vfs"][src, :f])
                 if n > 0:
                     st["ks"][dst, :n].copy_(st["ks"][src, :n])
                     st["vs"][dst, :n].copy_(st["vs"][src, :n])
@@ -2090,21 +2186,33 @@ class TPProcessGroup:
             fl, sl, wb = st["fls"][row], st["sls"][row], st["wbs"][row]
             n = max(0, min(sl - wb, ring))
             out = {
-                "kf": st["kf"][row, :fl].detach().cpu(),
-                "vf": st["vf"][row, :fl].detach().cpu(),
                 "ks": st["ks"][row, :n].detach().cpu(),
                 "vs": st["vs"][row, :n].detach().cpu(),
             }
+            if st.get("i8p"):
+                out.update(kf8 = st["kf8"][row, :fl].detach().cpu(),
+                           vf8 = st["vf8"][row, :fl].detach().cpu(),
+                           kfs = st["kfs"][row, :fl].detach().cpu(),
+                           vfs = st["vfs"][row, :fl].detach().cpu())
+            else:
+                out.update(kf = st["kf"][row, :fl].detach().cpu(),
+                           vf = st["vf"][row, :fl].detach().cpu())
         else:
             fl, sl, wb = st["fl"], st["sl"], st["wb"]
             n = max(0, min(sl - wb, ring))
             out = {
-                "kf": st["kf"][:fl].detach().cpu(),
-                "vf": st["vf"][:fl].detach().cpu(),
                 "ks": st["ks"][:n].detach().cpu(),
                 "vs": st["vs"][:n].detach().cpu(),
             }
-        out.update(fl = fl, sl = sl, wb = wb, batched = batched)
+            if st.get("i8p"):
+                out.update(kf8 = st["kf8"][0, :fl].detach().cpu(),
+                           vf8 = st["vf8"][0, :fl].detach().cpu(),
+                           kfs = st["kfs"][0, :fl].detach().cpu(),
+                           vfs = st["vfs"][0, :fl].detach().cpu())
+            else:
+                out.update(kf = st["kf"][:fl].detach().cpu(),
+                           vf = st["vf"][:fl].detach().cpu())
+        out.update(fl = fl, sl = sl, wb = wb, batched = batched, i8p = bool(st.get("i8p")))
         return out
 
     def _restore_shadow_row(self, row, shadow, p):
@@ -2120,25 +2228,45 @@ class TPProcessGroup:
         n = max(0, min(f - shadow["wb"], ring))
         if shadow["batched"]:
             self._reset_mtp_kv_row(row)
-            with torch.inference_mode():
-                if f > 0:
-                    st["kf"][row, :f].copy_(shadow["kf"][:f])
-                    st["vf"][row, :f].copy_(shadow["vf"][:f])
-                if n > 0:
+        else:
+            self._reset_mtp_kv()
+        with torch.inference_mode():
+            if n > 0:
+                if shadow["batched"]:
                     st["ks"][row, :n].copy_(shadow["ks"][:n])
                     st["vs"][row, :n].copy_(shadow["vs"][:n])
+                else:
+                    st["ks"][:n].copy_(shadow["ks"][:n])
+                    st["vs"][:n].copy_(shadow["vs"][:n])
+        if f > 0:
+            if "kf8" in shadow:
+                with torch.inference_mode():
+                    if shadow["batched"]:
+                        st["kf8"][row, :f].copy_(shadow["kf8"][:f])
+                        st["vf8"][row, :f].copy_(shadow["vf8"][:f])
+                        st["kfs"][row, :f].copy_(shadow["kfs"][:f])
+                        st["vfs"][row, :f].copy_(shadow["vfs"][:f])
+                    else:
+                        st["kf8"][0, :f].copy_(shadow["kf8"][:f])
+                        st["vf8"][0, :f].copy_(shadow["vf8"][:f])
+                        st["kfs"][0, :f].copy_(shadow["kfs"][:f])
+                        st["vfs"][0, :f].copy_(shadow["vfs"][:f])
+            elif st.get("i8p"):
+                self._stage_full_delta(row if shadow["batched"] else None, 0,
+                                       shadow["kf"][:f], shadow["vf"][:f])
+            else:
+                with torch.inference_mode():
+                    if shadow["batched"]:
+                        st["kf"][row, :f].copy_(shadow["kf"][:f])
+                        st["vf"][row, :f].copy_(shadow["vf"][:f])
+                    else:
+                        st["kf"][:f].copy_(shadow["kf"][:f])
+                        st["vf"][:f].copy_(shadow["vf"][:f])
+        if shadow["batched"]:
             st["fls"][row] = f
             st["sls"][row] = f
             st["wbs"][row] = shadow["wb"]
         else:
-            self._reset_mtp_kv()
-            with torch.inference_mode():
-                if f > 0:
-                    st["kf"][:f].copy_(shadow["kf"][:f])
-                    st["vf"][:f].copy_(shadow["vf"][:f])
-                if n > 0:
-                    st["ks"][:n].copy_(shadow["ks"][:n])
-                    st["vs"][:n].copy_(shadow["vs"][:n])
             st["fl"] = f
             st["sl"] = f
             st["wb"] = shadow["wb"]

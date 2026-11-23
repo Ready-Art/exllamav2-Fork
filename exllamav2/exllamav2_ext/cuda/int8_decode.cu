@@ -19,6 +19,7 @@ int8_decode_kernel
     float* __restrict__ po,
     float* __restrict__ pl,
     const int* __restrict__ kv_len_dev,
+    const int* __restrict__ row_map,
     int depth,
     int num_qo_heads,
     int num_kv_heads,
@@ -32,6 +33,9 @@ int8_decode_kernel
     const int b = blockIdx.z;
     // Per-row kv_lens: scalar (1,) for single-row decode, (batch,) for batched rounds.
     const int kv_len = kv_len_dev[b];
+    // Optional logical->physical row map (batched draft over a subset of shadow rows);
+    // q/o/partials stay in logical batch order, K/V/scales read the physical row.
+    const int br = row_map ? row_map[b] : b;
     const int lane = threadIdx.x;
     const int d0 = lane * DPL;
     const int kvh = h / (num_qo_heads / num_kv_heads);
@@ -55,10 +59,10 @@ int8_decode_kernel
     float m_i = -1e30f, l_i = 0.0f;
 
     const long kv_row = (long)depth * num_kv_heads;
-    const int8_t* kbase = k_i8 + ((long)b * depth) * num_kv_heads * HD + (long)kvh * HD + d0;
-    const int8_t* vbase = v_i8 + ((long)b * depth) * num_kv_heads * HD + (long)kvh * HD + d0;
-    const half* skbase = k_scale + (long)b * depth * num_kv_heads + kvh;
-    const half* svbase = v_scale + (long)b * depth * num_kv_heads + kvh;
+    const int8_t* kbase = k_i8 + ((long)br * depth) * num_kv_heads * HD + (long)kvh * HD + d0;
+    const int8_t* vbase = v_i8 + ((long)br * depth) * num_kv_heads * HD + (long)kvh * HD + d0;
+    const half* skbase = k_scale + (long)br * depth * num_kv_heads + kvh;
+    const half* svbase = v_scale + (long)br * depth * num_kv_heads + kvh;
 
     int8_t kr[DPL], vr[DPL];
     float sk = 0.0f, sv = 0.0f;
@@ -127,6 +131,133 @@ int8_decode_kernel
     }
 }
 
+// INT8 verify attention: q_len query rows (the MTP verify window), each warp owns
+// one (q-head, row) pair and streams its split's key range with online softmax.
+// Row r's causal limit is kv_len_dev[b] - q_len + r + 1 (kv_len_dev = the frontier
+// AFTER all q_len rows were written). Same INT8 dequant + GQA layout as decode;
+// KV bytes are read once per kv-head when the (nq/kvh)*q_len warps sharing a kv
+// head run concurrently (adjacent blockIdx.x) and the split chunk fits L2.
+template <int HD>
+__global__ void __launch_bounds__(32, 32)
+int8_verify_kernel
+(
+    const half* __restrict__ q,
+    const int8_t* __restrict__ k_i8,
+    const int8_t* __restrict__ v_i8,
+    const half* __restrict__ k_scale,
+    const half* __restrict__ v_scale,
+    float* __restrict__ po,
+    float* __restrict__ pl,
+    const int* __restrict__ kv_len_dev,
+    const int* __restrict__ row_map,
+    int depth,
+    int q_len,
+    int num_qo_heads,
+    int num_kv_heads,
+    int num_splits,
+    float scale_log2e
+)
+{
+    constexpr int DPL = HD / 32;
+    const int hr = blockIdx.x;
+    // r-major (hr = r * nq + h) so the merge kernel's flat output index matches the
+    // (B, q_len, nq, HD) tensor layout; adjacent blocks still share kv heads (GQA).
+    const int h = hr % num_qo_heads;
+    const int r = hr / num_qo_heads;
+    const int split = blockIdx.y;
+    const int b = blockIdx.z;
+    const int br = row_map ? row_map[b] : b;
+    const int kv_len = kv_len_dev[b] - q_len + r + 1;
+    const int lane = threadIdx.x;
+    const int d0 = lane * DPL;
+    const int kvh = h / (num_qo_heads / num_kv_heads);
+
+    const int chunk = (kv_len + num_splits - 1) / num_splits;
+    const int kv_begin = split * chunk;
+    int kv_end = kv_begin + chunk;
+    if (kv_end > kv_len) kv_end = kv_len;
+
+    float qf[DPL];
+    {
+        const half* qp = q + (((long)b * q_len + r) * num_qo_heads + h) * HD + d0;
+        #pragma unroll
+        for (int i = 0; i < DPL; i++) qf[i] = __half2float(qp[i]) * scale_log2e;
+    }
+
+    float oacc[DPL];
+    #pragma unroll
+    for (int i = 0; i < DPL; i++) oacc[i] = 0.0f;
+    float m_i = -1e30f, l_i = 0.0f;
+
+    const int8_t* kbase = k_i8 + ((long)br * depth) * num_kv_heads * HD + (long)kvh * HD + d0;
+    const int8_t* vbase = v_i8 + ((long)br * depth) * num_kv_heads * HD + (long)kvh * HD + d0;
+    const half* skbase = k_scale + (long)br * depth * num_kv_heads + kvh;
+    const half* svbase = v_scale + (long)br * depth * num_kv_heads + kvh;
+
+    int8_t kr[DPL], vr[DPL];
+    float sk = 0.0f, sv = 0.0f;
+    if (kv_begin < kv_end)
+    {
+        const int8_t* kp = kbase + (long)kv_begin * num_kv_heads * HD;
+        const int8_t* vp = vbase + (long)kv_begin * num_kv_heads * HD;
+        #pragma unroll
+        for (int i = 0; i < DPL; i += 4)
+        {
+            *(int*)(kr + i) = *(const int*)(kp + i);
+            *(int*)(vr + i) = *(const int*)(vp + i);
+        }
+        sk = __half2float(skbase[(long)kv_begin * num_kv_heads]);
+        sv = __half2float(svbase[(long)kv_begin * num_kv_heads]);
+    }
+    for (int key = kv_begin; key < kv_end; key++)
+    {
+        int8_t kr2[DPL], vr2[DPL];
+        float sk2 = 0.0f, sv2 = 0.0f;
+        if (key + 1 < kv_end)
+        {
+            const int8_t* kp = kbase + (long)(key + 1) * num_kv_heads * HD;
+            const int8_t* vp = vbase + (long)(key + 1) * num_kv_heads * HD;
+            #pragma unroll
+            for (int i = 0; i < DPL; i += 4)
+            {
+                *(int*)(kr2 + i) = *(const int*)(kp + i);
+                *(int*)(vr2 + i) = *(const int*)(vp + i);
+            }
+            sk2 = __half2float(skbase[(long)(key + 1) * num_kv_heads]);
+            sv2 = __half2float(svbase[(long)(key + 1) * num_kv_heads]);
+        }
+
+        float s = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < DPL; i++) s = fmaf(qf[i], (float)kr[i] * sk, s);
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) s += __shfl_xor_sync(0xffffffffu, s, off);
+
+        float mnew = fmaxf(m_i, s);
+        float alpha = exp2f(m_i - mnew);
+        float p = exp2f(s - mnew);
+        l_i = l_i * alpha + p;
+        #pragma unroll
+        for (int i = 0; i < DPL; i++)
+            oacc[i] = oacc[i] * alpha + p * ((float)vr[i] * sv);
+        m_i = mnew;
+
+        #pragma unroll
+        for (int i = 0; i < DPL; i++) { kr[i] = kr2[i]; vr[i] = vr2[i]; }
+        sk = sk2; sv = sv2;
+    }
+
+    long pbase = (((long)b * num_splits + split) * (num_qo_heads * q_len) + hr) * HD;
+    #pragma unroll
+    for (int i = 0; i < DPL; i++) po[pbase + d0 + i] = oacc[i];
+    if (lane == 0)
+    {
+        long mi = (((long)b * num_splits + split) * (num_qo_heads * q_len) + hr) * 2;
+        pl[mi + 0] = m_i;
+        pl[mi + 1] = l_i;
+    }
+}
+
 // Merge split partials: one block per (batch, q-head), HD threads stripe the dims.
 template <int HD>
 __global__ void int8_decode_merge_kernel
@@ -186,6 +317,7 @@ void int8_decode_cuda
     float* po,
     float* pl,
     const int* kv_len_dev,
+    const int* row_map,
     int depth,
     int batch_size,
     int num_qo_heads,
@@ -202,13 +334,13 @@ void int8_decode_cuda
     if (head_dim == 512)
     {
         int8_decode_kernel<512><<<grid, 32, 0, stream>>>
-            (q, k_i8, v_i8, k_scale, v_scale, po, pl, kv_len_dev,
+            (q, k_i8, v_i8, k_scale, v_scale, po, pl, kv_len_dev, row_map,
              depth, num_qo_heads, num_kv_heads, num_splits, scale_log2e);
     }
     else if (head_dim == 256)
     {
         int8_decode_kernel<256><<<grid, 32, 0, stream>>>
-            (q, k_i8, v_i8, k_scale, v_scale, po, pl, kv_len_dev,
+            (q, k_i8, v_i8, k_scale, v_scale, po, pl, kv_len_dev, row_map,
              depth, num_qo_heads, num_kv_heads, num_splits, scale_log2e);
     }
     else return;
@@ -218,4 +350,49 @@ void int8_decode_cuda
         int8_decode_merge_kernel<512><<<mgrid, 512, 0, stream>>>(po, pl, o, num_qo_heads, num_splits);
     else
         int8_decode_merge_kernel<256><<<mgrid, 256, 0, stream>>>(po, pl, o, num_qo_heads, num_splits);
+}
+
+void int8_verify_cuda
+(
+    const half* q,
+    const int8_t* k_i8,
+    const int8_t* v_i8,
+    const half* k_scale,
+    const half* v_scale,
+    half* o,
+    float* po,
+    float* pl,
+    const int* kv_len_dev,
+    const int* row_map,
+    int depth,
+    int batch_size,
+    int q_len,
+    int num_qo_heads,
+    int num_kv_heads,
+    int num_splits,
+    float sm_scale,
+    int head_dim,
+    cudaStream_t stream
+)
+{
+    if (num_splits > 2048) return;
+    float scale_log2e = sm_scale * 1.4426950408889634f;
+    int hr = num_qo_heads * q_len;
+    dim3 grid(hr, num_splits, batch_size);
+    if (head_dim == 512)
+    {
+        int8_verify_kernel<512><<<grid, 32, 0, stream>>>
+            (q, k_i8, v_i8, k_scale, v_scale, po, pl, kv_len_dev, row_map,
+             depth, q_len, num_qo_heads, num_kv_heads, num_splits, scale_log2e);
+        dim3 mgrid(hr, batch_size);
+        int8_decode_merge_kernel<512><<<mgrid, 512, 0, stream>>>(po, pl, o, hr, num_splits);
+    }
+    else if (head_dim == 256)
+    {
+        int8_verify_kernel<256><<<grid, 32, 0, stream>>>
+            (q, k_i8, v_i8, k_scale, v_scale, po, pl, kv_len_dev, row_map,
+             depth, q_len, num_qo_heads, num_kv_heads, num_splits, scale_log2e);
+        dim3 mgrid(hr, batch_size);
+        int8_decode_merge_kernel<256><<<mgrid, 256, 0, stream>>>(po, pl, o, hr, num_splits);
+    }
 }

@@ -51,4 +51,22 @@ void kv_quant_shadow_cuda
     int cache_len
 );
 
+// Quantize a contiguous fp16 chunk (n, kvh, hd) into one row of a full-depth INT8
+// destination at absolute row dst_row (source/destination depths differ).
+void kv_quant_chunk_cuda
+(
+    cudaStream_t stream,
+    const half* src_k,
+    const half* src_v,
+    int8_t* k_i8,
+    int8_t* v_i8,
+    half* k_scale,
+    half* v_scale,
+    int dst_row,
+    int n,
+    int kv_heads,
+    int head_dim,
+    int dst_depth
+);
+
 #endif

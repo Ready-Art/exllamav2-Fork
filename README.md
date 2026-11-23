@@ -400,6 +400,31 @@ CTA, GQA, hd256/512, graph-safe). The shadow halves the decode KV read on the fu
 layers — the dominant bandwidth cost at long context. The fp16 cache stays primary
 (verify/prefill/SWA unchanged); the shadow adds ~50% KV VRAM. Batch-safe (per-row kv_lens).
 Through TabbyAPI: `model.kv_cache_int8: true` (sets `EXL2_KV_INT8`). Default off.
+(INT8-**primary** target storage — dropping the fp16 copy to *reduce* KV VRAM — needs
+INT8 verify/prefill reader kernels and is in progress; the MTP shadow below already
+uses INT8-primary storage.)
+
+### INT8 MTP drafter (opt-in, default fp16)
+
+Two independent gates for the MTP assistant drafter:
+
+- **`EXL2_MTP_INT8_W`** — weight-only INT8 GEMVs (per-output-row symmetric INT8 + fp16
+  scales, custom warp-per-row CUDA kernel; no Triton). Halves the drafter's weight-read
+  bandwidth. Kernel parity rel_L2 ≈ 4e-4 vs the dequantized reference; greedy draft ids
+  unchanged in parity tests. Measured at 25k ctx (4×3090, 200 W, temp 1, W=3): head GEMV
+  1.66× faster, draft phase −31%, acceptance-normalized generation **+12%**.
+- **`EXL2_MTP_INT8_KV`** — **INT8-primary** gathered K/V shadow for the full-attention
+  layers: the full-depth fp16 shadow is *replaced* by INT8 + fp16 scales (**~−40% shadow
+  VRAM**), gather deltas quantize through a small staging buffer, and clone / RAM-offload
+  / restore move INT8. The drafter's cross-attention reads it with the split-KV INT8
+  flash-decode kernel (graph-safe, per-row device kv_lens, logical→physical row map for
+  batched slot subsets). SWA rings stay fp16 (small). At 25k the INT8 attention kernel is
+  currently a touch slower than FlashInfer fp16 (−3% generation; kernel tuning pending) —
+  the long-context payoff is the halved KV read. **Both gates together: +9.5%**
+  acceptance-normalized at 25k.
+
+Through TabbyAPI: `draft_model.mtp_int8_weights: true` / `draft_model.mtp_int8_kv: true`.
+Both default off; fp16 paths are unchanged when disabled.
 
 ### Priority prompt scheduler (opt-in, MP + MTP multi-batch)
 
