@@ -454,6 +454,51 @@ qk_norm; other families (Qwen3/Qwen3MoE with qk_norm, Llama head_dim 128, …) a
 take the generic eager TP attention path (FlashInfer/SDPA, qk_norm-aware). KV-head count
 must be ≥ the TP world size (a rank owning zero KV heads is unsupported, as for Gemma-4).
 
+### INT8 & offload — quick configuration
+
+All INT8/offload features are **opt-in, default off**; the fp16 paths are byte-identical
+when disabled. Each is independent — enable any combination.
+
+| Feature | TabbyAPI option | Env var | Effect | VRAM |
+|---|---|---|---|---|
+| Target KV INT8 **shadow** | `model.kv_cache_int8: true` | `EXL2_KV_INT8=1` | faster base decode (full layers) | **+~50% KV** (fp16 kept primary) |
+| MTP drafter INT8 **weights** | `draft_model.mtp_int8_weights: true` | `EXL2_MTP_INT8_W=1` | +12% gen @25k | ~neutral |
+| MTP KV INT8 **primary** | `draft_model.mtp_int8_kv: true` | `EXL2_MTP_INT8_KV=1` | halved long-ctx draft KV read | **−~40% MTP shadow** |
+| MoE expert offload | `model.moe_offload_experts: N` | `EXL2_MOE_OFFLOAD=N` | fit big MoE on small cards | experts → host RAM |
+
+Example `config.yml` (MP + MTP, all INT8 features on, MoE offload for a MoE model):
+
+```yaml
+model:
+  model_name: Gemma-4-31B-IT-EXL25-6U-HAD-AWQ-HB16
+  backend: exllamav2
+  tensor_parallel: true
+  tensor_parallel_backend: mp
+  gpu_split: [22, 22, 22, 22]
+  cache_size: 160000
+  kv_cache_int8: true          # target decode INT8 shadow (speed; +KV VRAM)
+  # moe_offload_experts: 8     # for MoE models: last 8 experts/layer -> pinned RAM
+draft_model:
+  draft_mode: mtp
+  draft_model_name: gemma-4-31B-it-assistant
+  draft_num_tokens: 3
+  mtp_draft_graph: true
+  mtp_int8_weights: true       # drafter INT8 GEMVs (+12% gen)
+  mtp_int8_kv: true            # drafter INT8-primary KV shadow (-40% shadow VRAM)
+```
+
+Or purely via environment (no TabbyAPI): `EXL2_KV_INT8=1 EXL2_MTP_INT8_W=1
+EXL2_MTP_INT8_KV=1 EXL2_MOE_OFFLOAD=8`.
+
+**Which INT8 KV mode to pick:** the *target* shadow (`kv_cache_int8`) is **speed-only** —
+it keeps fp16 primary because FlashInfer prefill/verify still read fp16, so it *adds*
+~50% KV VRAM; use it when you want faster base decode and have VRAM headroom. The *MTP*
+shadow (`mtp_int8_kv`) is **INT8-primary** — it drops the fp16 copy and *reduces* VRAM
+~40%; use it to save drafter VRAM (small short-ctx speed cost until the INT8 attention
+kernel is tuned). Making the **target** cache INT8-primary (VRAM-reducing) requires a
+competitive INT8 verify/prefill attention kernel and is tracked as future work — see
+`newplan.md` (P10b).
+
 ### Priority prompt scheduler (opt-in, MP + MTP multi-batch)
 
 Shortest-prompt-first admission with a small micro-batch window, so short requests are not
