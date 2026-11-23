@@ -1213,8 +1213,11 @@ def tp_rank_cache(
         lazy = True,
         fixed_device = rank,
     )
-    if not per_layer_geo:
-        # Uniform geometry: pass the narrowed head count directly.
+    if not per_layer_geo and base is not ExLlamaV2Cache_SWA:
+        # Uniform geometry: pass the narrowed head count directly. The SWA cache takes
+        # no num_key_value_heads (it derives per-layer geometry itself) -- mirrors
+        # ExLlamaV2Cache_TP. Without this guard, non-Gemma TP archs (Qwen3MoE, Qwen3,
+        # Llama) crash here because the MP path always builds an SWA base cache.
         sp = model.tp_context.get_split(BROADCAST_KV)
         n = 0
         for d, a, b in sp:

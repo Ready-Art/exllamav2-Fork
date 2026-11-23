@@ -439,8 +439,20 @@ GPU holds one expert's data, not N. Small per-expert constants (permutations, sc
 metadata) stay GPU-resident; the `q_handle` is built against the staging slot once.
 Offload forces the per-expert torch loop (the fused `q_moe_mlp` kernel needs every
 expert resident): slower decode, much lower VRAM — the trade-off for fitting large MoE
-models on small cards. Single-device load path (no TP sharding) in this release.
-Default 0 = off.
+models on small cards. Default 0 = off.
+
+**MP tensor-parallel:** MoE runs on the MP path with **replicated experts** (every rank
+holds the full MoE and runs it identically; the residual is gathered/sharded around the
+block). Offload moves cold experts to pinned RAM on *each* rank. Resident experts use the
+graph-safe fused kernel (TP graphs stay on); offloaded MoE runs eager because its
+data-dependent routing + H2D staging cannot be baked into a replayed graph. Verified on a
+synthetic Qwen3MoE across 4 GPUs (N=0/4/8 greedy ids identical). Expert column/row TP
+*sharding* (less VRAM than replication) is future work.
+
+**Multi-model MP:** the fused TP attention kernel only covers head_dim 256/512 without
+qk_norm; other families (Qwen3/Qwen3MoE with qk_norm, Llama head_dim 128, …) automatically
+take the generic eager TP attention path (FlashInfer/SDPA, qk_norm-aware). KV-head count
+must be ≥ the TP world size (a rank owning zero KV heads is unsupported, as for Gemma-4).
 
 ### Priority prompt scheduler (opt-in, MP + MTP multi-batch)
 

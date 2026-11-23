@@ -667,6 +667,12 @@ class ExLlamaV2:
         # falls back to the eager path, which is what this used to do unconditionally.
         self.tp_graph = TPGraphManager(self)
 
+        # MoE with resident experts uses the graph-safe fused kernel (TP graphs stay ON).
+        # Offloaded MoE runs the data-dependent torch routing loop + H2D staging, which
+        # cannot be baked into a replayed graph -> disable capture for that case only.
+        if any(isinstance(m, ExLlamaV2MoEMLP) and m.offload_experts > 0 for m in self.modules):
+            self.tp_graph.disable("MoE expert offload: data-dependent routing/staging is not graph-capturable")
+
         # Size the device context for THIS rank only.
         #
         # scratch_space_tp() returns one entry per device and also populates the
@@ -706,6 +712,9 @@ class ExLlamaV2:
                     module.tp_load_rank(rank)
 
                 elif isinstance(module, ExLlamaV2MLP):
+                    module.tp_load_rank(rank)
+
+                elif isinstance(module, ExLlamaV2MoEMLP):
                     module.tp_load_rank(rank)
 
                 elif isinstance(module, (ExLlamaV2RMSNorm, ExLlamaV2LayerNorm)):

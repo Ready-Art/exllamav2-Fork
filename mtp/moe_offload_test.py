@@ -18,17 +18,20 @@ def make():
     from safetensors.torch import save_file
     import pandas as pd
     torch.manual_seed(42)
+    # Qwen3MoE: supports_tp=True AND is_moe=True in the fork (Mixtral has no TP path).
     # V must cover the borrowed Gemma tokenizer's id range (262k), else calibration
     # embedding lookups device-assert.
-    H, I, L, E, V, NH, NKV = 256, 512, 2, 8, 262144, 8, 2
+    # NKV must be >= the TP world size (4) or some rank owns zero KV heads -> empty split.
+    H, I, L, E, V, NH, NKV, HD = 256, 512, 2, 8, 262144, 8, 4, 32
     cfg = {
-        "architectures": ["MixtralForCausalLM"], "model_type": "mixtral",
-        "hidden_size": H, "intermediate_size": I, "num_hidden_layers": L,
-        "num_attention_heads": NH, "num_key_value_heads": NKV,
-        "num_local_experts": E, "num_experts_per_tok": 2, "vocab_size": V,
-        "max_position_embeddings": 4096, "rms_norm_eps": 1e-5, "rope_theta": 1e6,
-        "torch_dtype": "float16", "tie_word_embeddings": False,
-        "sliding_window": None, "attention_dropout": 0.0, "initializer_range": 0.02,
+        "architectures": ["Qwen3MoeForCausalLM"], "model_type": "qwen3_moe",
+        "hidden_size": H, "moe_intermediate_size": I, "intermediate_size": I,
+        "num_hidden_layers": L, "num_attention_heads": NH, "num_key_value_heads": NKV,
+        "head_dim": HD, "num_experts": E, "num_experts_per_tok": 2,
+        "decoder_sparse_step": 1, "norm_topk_prob": True, "mlp_only_layers": [],
+        "vocab_size": V, "max_position_embeddings": 4096, "rms_norm_eps": 1e-6,
+        "rope_theta": 1e6, "torch_dtype": "float16", "tie_word_embeddings": False,
+        "attention_bias": False, "attention_dropout": 0.0, "initializer_range": 0.02,
     }
     os.makedirs(SYNTH, exist_ok=True)
     json.dump(cfg, open(f"{SYNTH}/config.json", "w"), indent=1)
@@ -41,16 +44,18 @@ def make():
         p = f"model.layers.{i}."
         w[p + "input_layernorm.weight"] = torch.ones(H).half()
         w[p + "post_attention_layernorm.weight"] = torch.ones(H).half()
-        w[p + "self_attn.q_proj.weight"] = rn(NH * 32, H)
-        w[p + "self_attn.k_proj.weight"] = rn(NKV * 32, H)
-        w[p + "self_attn.v_proj.weight"] = rn(NKV * 32, H)
-        w[p + "self_attn.o_proj.weight"] = rn(H, NH * 32)
-        w[p + "block_sparse_moe.gate.weight"] = rn(E, H)
+        w[p + "self_attn.q_proj.weight"] = rn(NH * HD, H)
+        w[p + "self_attn.k_proj.weight"] = rn(NKV * HD, H)
+        w[p + "self_attn.v_proj.weight"] = rn(NKV * HD, H)
+        w[p + "self_attn.o_proj.weight"] = rn(H, NH * HD)
+        w[p + "self_attn.q_norm.weight"] = torch.ones(HD).half()
+        w[p + "self_attn.k_norm.weight"] = torch.ones(HD).half()
+        w[p + "mlp.gate.weight"] = rn(E, H)
         for e in range(E):
-            ep = p + f"block_sparse_moe.experts.{e}."
-            w[ep + "w1.weight"] = rn(I, H)
-            w[ep + "w2.weight"] = rn(H, I)
-            w[ep + "w3.weight"] = rn(I, H)
+            ep = p + f"mlp.experts.{e}."
+            w[ep + "gate_proj.weight"] = rn(I, H)
+            w[ep + "up_proj.weight"] = rn(I, H)
+            w[ep + "down_proj.weight"] = rn(H, I)
     save_file(w, f"{SYNTH}/model.safetensors")
     # tokenizer: borrow a HF fast tokenizer json from the Gemma EXL2.5 model
     src = "/home/westfox35/exl2work/models/Gemma-4-31B-IT-EXL25-6U-HAD-AWQ-HB16"
@@ -89,8 +94,34 @@ def run():
           f"gen={gen}", flush=True)
 
 
+def run_mp():
+    # MP path (replicated MoE per rank). Mixtral has no per-layer geometry -> SEQPAR=0.
+    os.environ.setdefault("EXL2_TP_SEQPAR", "0")
+    from exllamav2 import ExLlamaV2Config, ExLlamaV2Tokenizer
+    from exllamav2.tp_mp import TPProcessGroup
+    N = os.environ.get("EXL2_MOE_OFFLOAD", "0")
+    c = ExLlamaV2Config(); c.model_dir = SYNTH + "_exl2"; c.prepare()
+    c.max_seq_len = 1024; c.chunk_size = 256; c.max_input_len = 256
+    tok = ExLlamaV2Tokenizer(c)
+    pg = TPProcessGroup(SYNTH + "_exl2", [2.0] * 4, 1024, 1024, "ExLlamaV2Cache")
+    pg.start()
+    ids = tok.encode("The quick brown fox jumps over the lazy dog.", encode_special_tokens = True)
+    lg = pg.forward(ids, 0, ids.shape[-1], 1, True)
+    gen = []
+    nxt = int(lg[0, -1].argmax())
+    past = ids.shape[-1]
+    gen.append(nxt)
+    for _ in range(24):
+        lg = pg.forward(torch.tensor([[nxt]]), past, 1, 1, True)
+        nxt = int(lg[0, -1].argmax()); past += 1; gen.append(nxt)
+    print(f"MP OFFLOAD={N} logits_sum={float(lg.float().sum()):.4f} gen={gen}", flush=True)
+    pg.close()
+
+
 if __name__ == "__main__":
     if sys.argv[1] == "make":
         make()
+    elif sys.argv[1] == "mp":
+        run_mp()
     else:
         run()

@@ -1706,9 +1706,15 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 
         if self.is_tp:
             # Gemma-4 (per-layer geometry) must avoid the fused kernel: it assumes one global
-            # split and a v_proj q_handle, and has no sliding-window support.
+            # split and a v_proj q_handle, and has no sliding-window support. The fused kernel
+            # also only supports head_dim 256/512 WITHOUT qk_norm; other architectures
+            # (Qwen3/Qwen3MoE qk_norm + head_dim 128/32, Llama head_dim 128, ...) take the
+            # generic eager forward_tp_old path, which handles qk_norm and any head_dim via
+            # FlashInfer/SDPA. This is what makes MP work across model families.
             _per_layer_geo = bool(getattr(cfg.arch.lm, "tp_per_layer_geometry", False))
-            if cache is not None and use_flash_attn and not _per_layer_geo:
+            _fused_ok = (self.q_norm is None and self.v_norm is None
+                         and self.head_dim in (256, 512))
+            if cache is not None and use_flash_attn and not _per_layer_geo and _fused_ok:
                 return self.forward_tp(
                     hidden_states,
                     cache,

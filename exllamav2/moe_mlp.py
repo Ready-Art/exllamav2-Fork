@@ -101,6 +101,9 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
                            self.w2 + \
                            self.w3
 
+        self.is_tp = False
+        self.q_handle = None
+
 
     def numel(self) -> int:
 
@@ -248,6 +251,81 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
             self.w3[e].set_device_idx(idx)
 
 
+    def scratch_space_tp(self):
+        # Replicated MoE (see tp_load_rank): every rank runs the full MoE, so reserve
+        # the single-device scratch on each rank. Conservative but correct; expert TP
+        # sharding (which would cut this) is a follow-up.
+        devs = self.model.tp_context.num_devices
+        s = self.scratch_space()
+        return [s] * devs
+
+    def tp_load_rank(self, rank: int):
+        # Replicated-expert MP MoE: each rank loads the FULL gate/norm/experts and runs
+        # them identically (forward_tp_old gathers/shards the residual around the block).
+        # EXL2_MOE_OFFLOAD moves the last N experts to pinned RAM on EVERY rank, with one
+        # shared GPU staging slot per projection. Expert column/row TP sharding is a
+        # follow-up (P7); replication keeps the routing math exact and offload functional.
+        self.device_idx = rank
+        self.post_attention_layernorm.set_device_idx(rank)
+        self.gate.set_device_idx(rank)
+        off = self.offload_experts
+        first_off = self.num_experts - off
+        shared = [{}, {}, {}] if off else None
+        for e in range(self.num_experts):
+            is_off = bool(off and e >= first_off)
+            for wi, wl in enumerate((self.w1, self.w2, self.w3)):
+                wl[e].offload = is_off
+                wl[e].set_device_idx(rank)
+                if is_off:
+                    wl[e]._offload_shared = shared[wi]
+        self.post_attention_layernorm.load()
+        self.gate.load()
+        for e in range(self.num_experts):
+            self.w1[e].load()
+            self.w2[e].load()
+            self.w3[e].load()
+        if off:
+            print(f"[moe-offload] rank {rank} layer {self.layer_idx}: {off}/{self.num_experts} "
+                  f"experts in pinned RAM (replicated MP MoE)", flush = True)
+        self.is_tp = True
+        self.device_idx = rank
+
+    def forward_tp_old(
+        self,
+        hidden_states: torch.Tensor,
+        cache = None,
+        attn_params = None,
+        past_len = None,
+        intermediates: bool = False,
+        loras: list[ExLlamaV2Lora] | None = None,
+        **kwargs
+    ) -> torch.Tensor | dict[str: torch.Tensor]:
+        ctx = self.model.tp_context
+        batch_size, q_len, _ = hidden_states.shape
+        repl_chunk = ctx.decode_repl and q_len <= 32
+        if ctx.seqpar and not repl_chunk:
+            full = ctx.gather_residual(hidden_states)
+        else:
+            full = hidden_states
+
+        # Resident experts: the fused q_moe_mlp kernel handles routing internally with
+        # fixed buffers -> CUDA-graph safe (TP graphs stay ON). Offloaded experts use the
+        # data-dependent torch loop + H2D staging, which cannot be baked into a replayed
+        # graph; that case runs eager (the graph manager disables capture when offload is
+        # active). Replicated full-width MoE runs identically on every rank.
+        rows = batch_size * q_len
+        if (self.q_handle is not None and not intermediates and rows <= 4
+                and self.num_experts in [4, 8, 16, 128]
+                and not (loras is not None and len(loras) > 0)):
+            ext_c.q_moe_mlp_forward_(self.q_handle, full.view(-1, full.shape[-1]))
+            out = full
+        else:
+            out = self.forward_torch(full, cache, attn_params, past_len, intermediates,
+                                     loras = loras, **kwargs)
+        if ctx.seqpar and not repl_chunk:
+            out = ctx.shard_residual(out)
+        return out
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -258,6 +336,10 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
         loras: list[ExLlamaV2Lora] | None = None,
         **kwargs
     ) -> torch.Tensor | dict[str: torch.Tensor]:
+
+        if self.is_tp:
+            return self.forward_tp_old(hidden_states, cache, attn_params, past_len,
+                                       intermediates, loras = loras, **kwargs)
 
         batch_size, sequence_length, hidden_dim = hidden_states.shape
 
