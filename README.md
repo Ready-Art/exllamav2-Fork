@@ -457,12 +457,13 @@ The `head_norm` kernel now supports head_dim < 64 (Qwen3's head_dim 32): it pads
 reduction to a full warp so the shuffle sum is correct (previously half-warp launches
 corrupted qk_norm). Verified vs torch RMSNorm for hd 32/64/128/256/512.
 
-**Expert TP sharding (WIP):** `EXL2_MOE_TP_SHARD=1` splits each expert's FFN across ranks
-(column-parallel w1/w3, row-parallel w2) like a dense MLP — ~world× less expert VRAM/RAM
-per rank and ~world× less offload PCIe traffic; auto-enabled when offloading. Implemented
-and runs on 2/3/4 GPUs, but **not yet released**: a Qwen3MoE MP attention parity gap
-(prefill logits cos ~0.83 vs single-device, present in replicated MP too) blocks coherence
-verification. Tracked for the next session (see `newplan.md`).
+**Expert TP sharding (EXPERIMENTAL, opt-in):** `EXL2_MOE_TP_SHARD=1` (default 0 =
+replicate) splits each expert's FFN across ranks (column-parallel w1/w3, row-parallel w2)
+like a dense MLP — ~world× less expert VRAM/RAM per rank and ~world× less offload PCIe
+traffic; works on 2/3/4 GPUs (uneven splits). **Caveat:** a Qwen3-family MP attention
+parity gap (prefill logits cos ~0.83 vs single-device, present in replicated MP too) is
+still open, so sharded Qwen3 output is not yet verified coherent — keep it opt-in until
+that attention bug is fixed (see `newplan.md`). Gemma-4 (the tested family) is unaffected.
 
 ### INT8 & offload — quick configuration
 
@@ -475,6 +476,7 @@ when disabled. Each is independent — enable any combination.
 | MTP drafter INT8 **weights** | `draft_model.mtp_int8_weights: true` | `EXL2_MTP_INT8_W=1` | +12% gen @25k | ~neutral |
 | MTP KV INT8 **primary** | `draft_model.mtp_int8_kv: true` | `EXL2_MTP_INT8_KV=1` | halved long-ctx draft KV read | **−~40% MTP shadow** |
 | MoE expert offload | `model.moe_offload_experts: N` | `EXL2_MOE_OFFLOAD=N` | fit big MoE on small cards | experts → host RAM |
+| MoE expert TP sharding (experimental) | — | `EXL2_MOE_TP_SHARD=1` | split experts across ranks | ~world× less expert VRAM/RAM |
 
 Example `config.yml` (MP + MTP, all INT8 features on, MoE offload for a MoE model):
 
