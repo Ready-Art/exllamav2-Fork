@@ -13,6 +13,7 @@
 
 #include "cuda/q_matrix.cuh"
 #include "cuda/q_gemm.cuh"
+#include "cuda/exl25_transform.cuh"
 
 #include "cpp/util.h"
 #include "cpp/threadpool.h"
@@ -234,7 +235,8 @@ void gemm_half_q_half
     torch::Tensor a,
     uintptr_t b,
     torch::Tensor c,
-    bool force_cuda
+    bool force_cuda,
+    bool pre_tf
 )
 {
     QMatrix* qm = reinterpret_cast<QMatrix*> (b);
@@ -261,7 +263,9 @@ void gemm_half_q_half
         a.size(1), // k
         true,
         NULL,
-        force_cuda
+        force_cuda,
+        NULL, 0, false, NULL, 0,
+        pre_tf
     );
 }
 
@@ -272,7 +276,8 @@ void gemm_half_q_half_tp
     const std::vector<torch::Tensor> &c,
     bool force_cuda,
     uintptr_t tp_context,
-    int t_device
+    int t_device,
+    bool pre_tf
 )
 {
     ExtTPContext* ctx = reinterpret_cast<ExtTPContext*> (tp_context);
@@ -302,7 +307,9 @@ void gemm_half_q_half_tp
             a[i].size(1), // k
             true,
             NULL,
-            force_cuda
+            force_cuda,
+            NULL, 0, false, NULL, 0,
+            pre_tf
         );
         if (ctx->graph_capture)
         {
@@ -316,6 +323,30 @@ void gemm_half_q_half_tp
 }
 
 // Convert tensors
+
+void exl25_transform
+(
+    torch::Tensor a,
+    torch::Tensor out,
+    torch::Tensor awq_scale,
+    int64_t had_k
+)
+{
+    TORCH_CHECK_DTYPE(a, kHalf);
+    TORCH_CHECK_DTYPE(out, kHalf);
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    exl25_transform_a
+    (
+        stream,
+        (const half*) a.data_ptr(),
+        (half*) out.data_ptr(),
+        a.size(0),
+        a.size(1),
+        awq_scale.numel() ? (const half*) awq_scale.data_ptr() : NULL,
+        (int) had_k
+    );
+}
 
 void matrix_q4_to_fp16
 (

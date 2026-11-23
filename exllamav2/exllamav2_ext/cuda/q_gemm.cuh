@@ -27,7 +27,8 @@ void gemm_half_q_half_cuda
     const int r_weights_stride = 0,
     bool mul_r_weights = false,
     Graph* graph = NULL,
-    int label = 0
+    int label = 0,
+    bool pre_tf = false
 );
 
 void clear_tensor_cuda

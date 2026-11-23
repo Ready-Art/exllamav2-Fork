@@ -32,7 +32,8 @@ void gemm_half_q_half_cuda_part
     int r_weights_stride,
     bool mul_r_weights,
     Graph* graph,
-    int label
+    int label,
+    bool pre_tf = false
 )
 {
     if (!b->is_gptq)
@@ -44,7 +45,7 @@ void gemm_half_q_half_cuda_part
         if (exl25_kn)
         {
             exl25_gemm_cuda_part(stream, a, b, c, size_m, size_n, size_k, m_count, clear,
-                                 r_weights, r_weights_stride, mul_r_weights, graph, label, exl25_kn);
+                                 r_weights, r_weights_stride, mul_r_weights, graph, label, exl25_kn, pre_tf);
             return;
         }
         // had/awq tensors can NEVER fall back to legacy (no activation transform there).
@@ -250,7 +251,8 @@ void gemm_half_q_half_cuda
     const int r_weights_stride,
     bool mul_r_weights,
     Graph* graph,
-    int label
+    int label,
+    bool pre_tf
 )
 {
     if (b->cuda_bias && clear)
@@ -270,7 +272,7 @@ void gemm_half_q_half_cuda
     // EXL2.5 hadamard/awq: the reconstruct+cuBLAS path (large-m prefill) must see
     // (a * S^-1 * H) to match the pre-rotated stored weights. Transform out-of-place
     // into grow-only scratch; the small-m lane does this in-kernel instead.
-    if (b->exl25_bits && (b->had_k || b->cuda_awq_scale) &&
+    if (b->exl25_bits && (b->had_k || b->cuda_awq_scale) && !pre_tf &&
         size_m > MAX_Q_GEMM_ROWS && !force_cuda && size_k <= row_step)
     {
         half* ta = exl25_get_scratch(b->device, (size_t) size_m * size_k);
@@ -352,7 +354,8 @@ void gemm_half_q_half_cuda
             r_weights_stride,
             mul_r_weights,
             graph,
-            label
+            label,
+            pre_tf
         );
     }
 

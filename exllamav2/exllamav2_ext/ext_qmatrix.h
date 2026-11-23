@@ -59,7 +59,8 @@ void gemm_half_q_half
     torch::Tensor a,
     uintptr_t b,
     torch::Tensor c,
-    bool force_cuda
+    bool force_cuda,
+    bool pre_tf = false
 );
 
 void gemm_half_q_half_tp
@@ -69,7 +70,16 @@ void gemm_half_q_half_tp
     const std::vector<torch::Tensor> &c,
     bool force_cuda,
     uintptr_t tp_context,
-    int t_device = -1
+    int t_device = -1,
+    bool pre_tf = false
+);
+
+void exl25_transform
+(
+    torch::Tensor a,
+    torch::Tensor out,
+    torch::Tensor awq_scale,
+    int64_t had_k
 );
 
 void matrix_q4_to_fp16

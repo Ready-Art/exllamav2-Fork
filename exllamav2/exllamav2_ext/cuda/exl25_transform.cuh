@@ -25,7 +25,8 @@ void exl25_gemm_cuda_part
     bool mul_r_weights,
     class Graph* graph,
     int label,
-    int kn
+    int kn,
+    bool pre_tf = false
 );
 
 half* exl25_get_scratch(int device, size_t numel);

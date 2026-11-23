@@ -62,7 +62,8 @@ void exl25_gemm_cuda_part
     bool mul_r_weights,
     Graph* graph,
     int label,
-    int kn
+    int kn,
+    bool pre_tf
 )
 {
     fp_exl25_gemm_kernel kernel = pick_exl25_kernel(b->exl25_bits, m_count, kn, r_weights != NULL, mul_r_weights);
@@ -87,8 +88,8 @@ void exl25_gemm_cuda_part
         size_n,
         size_k,
         b->exl25_groupsize,
-        b->cuda_awq_scale,
-        b->had_k,
+        pre_tf ? NULL : b->cuda_awq_scale,
+        pre_tf ? 0 : b->had_k,
         clear,
         r_weights,
         r_weights_stride

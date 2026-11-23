@@ -180,6 +180,7 @@ class ExLlamaV2Linear(ExLlamaV2Module):
                 for k in w.keys():
                     w[k] = safe_move_tensor(w[k], self.device())
 
+            self._stash_exl25(w)
             self.q_handle = ext.make_q_matrix(w,
                                               self.temp_dq,
                                               prescale = self.prescale,
@@ -426,6 +427,14 @@ class ExLlamaV2Linear(ExLlamaV2Module):
             return hidden_states_out
 
 
+    def _stash_exl25(self, d: dict):
+        """Remember the EXL2.5 transform config for shared-input decisions (forward_tp)."""
+        from exllamav2.ext import exl25_tags
+        bits, gs, had = exl25_tags(d)
+        self._exl25_had = had if bits else 0
+        awq = d.get("q_awq_scale", None)
+        self._exl25_awq = awq if (bits and awq is not None and awq.numel() > 1) else None
+
     def forward_tp(
         self,
         hidden_states: torch.Tensor,
@@ -504,7 +513,8 @@ class ExLlamaV2Linear(ExLlamaV2Module):
             outputs,
             force_cuda,
             ctx.ext_tp_context,
-            -1
+            -1,
+            kwargs.get("pre_transformed", False)
         )
 
         if output_split:
@@ -678,6 +688,7 @@ class ExLlamaV2Linear(ExLlamaV2Module):
             # Store it in the shard dict (which becomes self.q_tensors); a temporary here
             # would be freed on return and the kernel would read recycled memory (gibberish).
             _exl25_args = _exl25_bind_args(self.q_tensors)
+            self._stash_exl25(self.q_tensors)
             if _exl25_args[0].numel() > 1:
                 w["q_awq_scale"] = safe_move_tensor(_exl25_args[0], idx).contiguous()
 
@@ -827,6 +838,7 @@ class ExLlamaV2Linear(ExLlamaV2Module):
         # EXL2.5 tags before the host copy is freed; the AWQ scale (if any) rides to the
         # rank with the shard. Column split: K intact, no row slicing.
         _exl25_args = _exl25_bind_args(w)
+        self._stash_exl25(w)
         if _exl25_args[0].numel() > 1:
             _exl25_args = (safe_move_tensor(_exl25_args[0], rank), *_exl25_args[1:])
             # Keep the exact tensor the kernel points at alive in self.q_tensors (below);
@@ -1051,6 +1063,7 @@ class ExLlamaV2Linear(ExLlamaV2Module):
         # EXL2.5 tags before the host copy is freed; row split slices the AWQ scale and
         # enforces group / Hadamard-block alignment.
         _exl25_args = _exl25_bind_args(w, a, b)
+        self._stash_exl25(w)
         if _exl25_args[0].numel() > 1:
             _exl25_args = (safe_move_tensor(_exl25_args[0], rank), *_exl25_args[1:])
             # Keep the exact tensor the kernel points at alive in self.q_tensors (below);
@@ -1263,6 +1276,7 @@ class ExLlamaV2Linear(ExLlamaV2Module):
             self.model.config.max_dq_size // self.out_features,
             *_exl25_bind_args(self.q_tensors)
         )
+        self._stash_exl25(self.q_tensors)
 
         self.out_features_tp = []
         self.in_features_tp = []
@@ -1353,6 +1367,7 @@ class ExLlamaV2Linear(ExLlamaV2Module):
             # EXL2.5: keep the exact AWQ slice passed to the kernel alive in the shard dict
             # (raw device pointer in the QMatrix; a temporary would be freed on return).
             _exl25_args = _exl25_bind_args(self.q_tensors, a, b)
+            self._stash_exl25(self.q_tensors)
             if _exl25_args[0].numel() > 1:
                 w["q_awq_scale"] = safe_move_tensor(_exl25_args[0], idx).contiguous()
 

@@ -485,8 +485,33 @@ class ExLlamaV2MLP(ExLlamaV2Module):
             post_norm = self.pre_layernorm.forward_tp(hidden_states, output_split = True) \
                 if self.pre_layernorm else hidden_states
 
-        gate = self.gate_proj.forward_tp(post_norm, output_split = True)
-        up = self.up_proj.forward_tp(post_norm, output_split = True)
+        # EXL2.5 shared input transform: gate/up consume the SAME post-norm activation;
+        # apply awq+Hadamard ONCE instead of per-GEMM (mirrors attn.py q/k/v sharing).
+        _pn_in = post_norm
+        _pre_tf = False
+        if isinstance(post_norm, torch.Tensor) and post_norm.dtype == torch.half:
+            _gh = getattr(self.gate_proj, "_exl25_had", 0)
+            _ga = getattr(self.gate_proj, "_exl25_awq", None)
+            _uh = getattr(self.up_proj, "_exl25_had", 0)
+            _ua = getattr(self.up_proj, "_exl25_awq", None)
+            if (_gh or _ga is not None) and _gh == _uh \
+                    and (_ga is not None) == (_ua is not None):
+                _rows = post_norm.view(-1, post_norm.shape[-1])
+                _dev = _rows.device
+                _awq_ref = _ga if _ga is not None else torch.empty(0, device = _dev)
+                if _awq_ref.device == _dev and _rows.shape[0] <= 256:
+                    _sc_cache = ctx.__dict__.setdefault("_x25in_scratch", {})
+                    _sc = _sc_cache.get(_dev)
+                    if _sc is None or _sc.shape[1] < _rows.shape[1]:
+                        _sc = torch.empty(256, _rows.shape[1], dtype = torch.half, device = _dev)
+                        _sc_cache[_dev] = _sc
+                    _tf_out = _sc[:_rows.shape[0]]
+                    ext_c.exl25_transform(_rows.contiguous(), _tf_out, _awq_ref, _gh)
+                    _pn_in = _tf_out
+                    _pre_tf = True
+
+        gate = self.gate_proj.forward_tp(_pn_in, output_split = True, pre_transformed = _pre_tf)
+        up = self.up_proj.forward_tp(_pn_in, output_split = True, pre_transformed = _pre_tf)
 
         outputs = []
         for idx, hs in enumerate(post_norm):

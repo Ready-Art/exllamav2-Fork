@@ -1993,8 +1993,36 @@ class ExLlamaV2Attention(ExLlamaV2Module):
             residual = hidden_states
 
             post_norm = self.pre_layernorm.forward(hidden_states) if self.has_norm else hidden_states
-        q = self.q_proj.forward_tp(post_norm, loras = loras, output_split = True, dim = self.head_dim)
-        k = self.k_proj.forward_tp(post_norm, loras = loras, output_split = True, dim = self.head_dim)
+        # EXL2.5 shared input transform: q/k/v consume the SAME post-norm activation;
+        # apply awq+Hadamard ONCE instead of per-GEMM (m1 decode lever). Only when all
+        # projections carry the same transform config and the input is a single fp16
+        # tensor on the AWQ scale's device; otherwise each GEMM transforms its own input.
+        _pn_in = post_norm
+        _pre_tf = False
+        if isinstance(post_norm, torch.Tensor) and post_norm.dtype == torch.half:
+            _qh = getattr(self.q_proj, "_exl25_had", 0)
+            _qa = getattr(self.q_proj, "_exl25_awq", None)
+            _kh = getattr(self.k_proj, "_exl25_had", 0)
+            _ka = getattr(self.k_proj, "_exl25_awq", None)
+            _vh = getattr(self.v_proj, "_exl25_had", 0) if self.v_proj is not None else _qh
+            _va = getattr(self.v_proj, "_exl25_awq", None) if self.v_proj is not None else _qa
+            if (_qh or _qa is not None) and _qh == _kh == _vh \
+                    and (_qa is not None) == (_ka is not None) == (_va is not None):
+                _rows = post_norm.view(-1, post_norm.shape[-1])
+                _dev = _rows.device
+                _awq_ref = _qa if _qa is not None else torch.empty(0, device = _dev)
+                if _awq_ref.device == _dev and _rows.shape[0] <= 256:
+                    _sc_cache = _ctx.__dict__.setdefault("_x25in_scratch", {})
+                    _sc = _sc_cache.get(_dev)
+                    if _sc is None or _sc.shape[1] < _rows.shape[1]:
+                        _sc = torch.empty(256, _rows.shape[1], dtype = torch.half, device = _dev)
+                        _sc_cache[_dev] = _sc
+                    _tf_out = _sc[:_rows.shape[0]]
+                    ext_c.exl25_transform(_rows.contiguous(), _tf_out, _awq_ref, _qh)
+                    _pn_in = _tf_out
+                    _pre_tf = True
+        q = self.q_proj.forward_tp(_pn_in, loras = loras, output_split = True, dim = self.head_dim, pre_transformed = _pre_tf)
+        k = self.k_proj.forward_tp(_pn_in, loras = loras, output_split = True, dim = self.head_dim, pre_transformed = _pre_tf)
         # BUG 90a (TP): on a k-eq-v layer V is K, but the two must be INDEPENDENT
         # storages from this point on: the per-head-norm block applies v_norm to v and
         # k_norm to k, both in place, and rope_ rotates k in place. If `v` were the same
@@ -2004,7 +2032,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
         # byte-identical to cached K (cos 1.0, V rms = the k_norm constant instead of 1.0,
         # on all 10 full layers x 4 devices). Clone each device's raw k output into a new
         # list so v and k diverge cleanly.
-        v = [x.clone() for x in k] if self.use_k_as_v else self.v_proj.forward_tp(post_norm, loras = loras, output_split = True, dim = self.head_dim)
+        v = [x.clone() for x in k] if self.use_k_as_v else self.v_proj.forward_tp(_pn_in, loras = loras, output_split = True, dim = self.head_dim, pre_transformed = _pre_tf)
 
         if os.environ.get("EXL2_TP_DUMP"):
             _d = os.environ["EXL2_TP_DUMP"]

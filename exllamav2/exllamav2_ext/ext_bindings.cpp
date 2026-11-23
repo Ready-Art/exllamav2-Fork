@@ -85,8 +85,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("p2p_ag_norm_res", &p2p_ag_norm_res, "p2p_ag_norm_res");
     m.def("p2p_allreduce", &p2p_allreduce, "p2p_allreduce");
     m.def("reconstruct", &reconstruct, "reconstruct");
-    m.def("gemm_half_q_half", &gemm_half_q_half, "gemm_half_q_half");
-    m.def("gemm_half_q_half_tp", &gemm_half_q_half_tp, "gemm_half_q_half_tp");
+    m.def("gemm_half_q_half", &gemm_half_q_half, "gemm_half_q_half",
+        py::arg("a"), py::arg("b"), py::arg("c"), py::arg("force_cuda"),
+        py::arg("pre_transformed") = false);
+    m.def("gemm_half_q_half_tp", &gemm_half_q_half_tp, "gemm_half_q_half_tp",
+        py::arg("a"), py::arg("b"), py::arg("c"), py::arg("force_cuda"),
+        py::arg("tp_context"), py::arg("t_device") = -1,
+        py::arg("pre_transformed") = false);
+    m.def("exl25_transform", &exl25_transform, "exl25_transform",
+        py::arg("a"), py::arg("out"), py::arg("awq_scale"), py::arg("had_k"));
     m.def("matrix_fp16_to_q4", &matrix_fp16_to_q4, "matrix_fp16_to_q4");
     m.def("matrix_q4_to_fp16", &matrix_q4_to_fp16, "matrix_q4_to_fp16");
     m.def("make_group_map", &make_group_map, "make_group_map");
