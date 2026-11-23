@@ -64,7 +64,25 @@ class ExLlamaV2NGramEmbedding(ExLlamaV2Module):
         assert ple_embed_dim == self.num_heads * head_dim
         self.eos_token_id = eos_token_id
         self.bits = bits
-        self.stream_from_disk = stream_from_disk
+        # Storage mode: "disk" (pread per lookup, default), "ram" (full table in host
+        # RAM), "hybrid" (disk + bounded LRU row cache in host RAM). Env overrides the
+        # constructor default so tabby/API users can choose without code changes.
+        mode = os.environ.get("EXL2_NGRAM_MODE", "disk" if stream_from_disk else "ram").lower()
+        if mode not in ("disk", "ram", "hybrid"):
+            mode = "disk"
+        self.ngram_mode = mode
+        self.stream_from_disk = mode != "ram"
+        self._hybrid_cap = 0
+        self._hybrid_cache = None
+        self._hybrid_bytes = 0
+        if mode == "hybrid":
+            try:
+                mb = int(os.environ.get("EXL2_NGRAM_HYBRID_MB", "1024"))
+            except ValueError:
+                mb = 1024
+            self._hybrid_cap = max(1, mb) * 1024 * 1024
+            from collections import OrderedDict
+            self._hybrid_cache = OrderedDict()
 
         self.head_offsets = None        # int64 CPU
         self.head_vocab_sizes = None    # int64 CPU
@@ -137,6 +155,9 @@ class ExLlamaV2NGramEmbedding(ExLlamaV2Module):
         self.head_bias = None
         self._stage = None
         self._stage_rows = 0
+        if self._hybrid_cache is not None:
+            self._hybrid_cache.clear()
+        self._hybrid_bytes = 0
 
     def set_device_idx(self, idx: int | None):
         self.device_idx = idx
@@ -176,13 +197,11 @@ class ExLlamaV2NGramEmbedding(ExLlamaV2Module):
 
     # ---- row gather + decode ----
 
-    def _gather_packed(self, uids: torch.Tensor) -> torch.Tensor:
-        if self.table_ram is not None:
-            return self.table_ram.index_select(0, uids)
+    def _pread_rows(self, uids: torch.Tensor) -> torch.Tensor:
+        """Fetch rows from the safetensors file, coalescing contiguous runs."""
         fd, data_base, row_bytes, num_rows = self._disk
         assert int(uids.max().item()) < num_rows
         out = torch.empty(uids.shape[0], row_bytes, dtype = torch.uint8)
-        # coalesce contiguous runs into single preads
         order = torch.argsort(uids)
         su = uids[order]
         i = 0
@@ -195,6 +214,42 @@ class ExLlamaV2NGramEmbedding(ExLlamaV2Module):
             buf = torch.frombuffer(bytearray(raw), dtype = torch.uint8).view(j - i, row_bytes)
             out.index_copy_(0, order[i:j], buf)
             i = j
+        return out
+
+    def _gather_packed(self, uids: torch.Tensor) -> torch.Tensor:
+        if self.table_ram is not None:
+            return self.table_ram.index_select(0, uids)
+        fd, data_base, row_bytes, num_rows = self._disk
+        if self._hybrid_cache is None:
+            return self._pread_rows(uids).view(torch.int32)
+        # Hybrid: bounded LRU row cache in host RAM over the disk backend. Hot rows
+        # (repeated n-grams across a conversation) serve from RAM; cold rows pread.
+        cache = self._hybrid_cache
+        out = torch.empty(uids.shape[0], row_bytes, dtype = torch.uint8)
+        miss_idx = []
+        for i in range(uids.shape[0]):
+            u = int(uids[i].item())
+            ent = cache.get(u)
+            if ent is not None:
+                cache.move_to_end(u)
+                out[i] = torch.frombuffer(ent, dtype = torch.uint8)
+            else:
+                miss_idx.append(i)
+        if miss_idx:
+            mu = uids[miss_idx]
+            fetched = self._pread_rows(mu)
+            for k, i in enumerate(miss_idx):
+                u = int(mu[k].item())
+                ent = bytearray(fetched[k].numpy().tobytes())
+                out[i] = fetched[k]
+                if u in cache:
+                    cache.move_to_end(u)
+                else:
+                    cache[u] = ent
+                    self._hybrid_bytes += len(ent)
+            while self._hybrid_bytes > self._hybrid_cap and cache:
+                _, old = cache.popitem(last = False)
+                self._hybrid_bytes -= len(old)
         return out.view(torch.int32)
 
     def _stage_h2d(self, packed: torch.Tensor, scales: torch.Tensor, heads: torch.Tensor):
