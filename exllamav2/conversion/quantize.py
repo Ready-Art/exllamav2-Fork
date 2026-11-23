@@ -53,10 +53,10 @@ def list_live_tensors():
 
 def _configure_exl25(lq: AdaptiveGPTQ, job: dict):
     """
-    Apply job["exl25"] options to a fresh quantizer. Must run BEFORE calibration
-    (add_batch transforms activations) and before prepare_hessian (AWQ scale, identity
-    permutation). Options: uniform_bits (2..8, fast lane), group_size (default 128),
-    hadamard (bool, K-side incoherence; requires uniform_bits), awq (bool).
+    Apply job["exl25"] options to a fresh quantizer. Must run BEFORE prepare_hessian
+    (Hadamard congruence, AWQ scale, identity permutation). Options: uniform_bits
+    (2..8, fast lane), group_size (default 128), hadamard (bool, K-side incoherence;
+    requires uniform_bits), awq (bool).
     """
     ex = job.get("exl25") or {}
     if not ex: return

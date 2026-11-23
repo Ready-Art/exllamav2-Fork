@@ -273,9 +273,10 @@ class AdaptiveGPTQ:
 
             self.num_batches += 1
             inputs = inputs.view((-1, inputs.shape[-1])).float().to(self.hessian.device)
-            if self.exl25_had:
-                from exllamav2.hadamard.hadamard import had_rotate_activations
-                inputs = had_rotate_activations(inputs, self.exl25_had)
+            # Accumulate in the RAW activation space. The Hadamard congruence happens
+            # ONCE in prepare_hessian (had_rotate_hessian). Rotating here as well would
+            # apply H_int twice: H_int^2 = block*I cancels the rotation, leaving GPTQ
+            # error compensation and the AWQ scale derivation in the wrong space.
             self.hessian.addmm_(inputs.T, inputs)
 
 
@@ -475,6 +476,11 @@ class AdaptiveGPTQ:
             self.hessian = None
             self.perm = other.perm
             self.perm_cpu = other.perm_cpu
+            # EXL2.5: tensors sharing a Hessian share the same input activations (q/k/v,
+            # gate/up), so the AWQ protection scale derived from it applies to them too.
+            # Without this they staged/packed had-only while their Hessian was AWQ-
+            # congruenced -- inconsistent rounding, and no channel protection on k/v/gate.
+            self.awq_inv_scale = other.awq_inv_scale
 
 
     def reuse_h(self, other, stager: WeightStager | None = None, key: int = 0):

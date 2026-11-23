@@ -62,9 +62,10 @@ is 2048.
 - **-b / --bits *float***: Target average number of bits per weight.
   
 
-- **-hb / --bits *int***: Number of bits for the lm_head (output) layer of the model. Default is 6, although that
-value actually results in a mixed-precision quantization of about 6.3 bits. Options are 2, 3, 4, 5, 6 and 8. (Only 6
-and 8 appear to be useful.)
+- **-hb / --head_bits *int***: Number of bits for the lm_head (output) layer of the model. Default is 6, although that
+value actually results in a mixed-precision quantization of about 6.3 bits. Options are 2, 3, 4, 5, 6, 8 and **16**.
+**16 leaves the head unquantized (fp16)** — recommended for large-vocabulary models like Gemma-4 (262k), and
+**required for EXL2.5 Hadamard** (`-x25h`; with a quantized head the converter skips Hadamard on the lm_head).
 
   
 - **-ss / --shard_size *float***: Output shard size, in megabytes. Default is 8192. Set this to 0 to disable sharding.
@@ -210,6 +211,48 @@ python convert.py \
 
 A ready-made wrapper for this exact job is in [`scripts/remote_convert_2gpu_hb16.sh`](../scripts/remote_convert_2gpu_hb16.sh).
 
+### Running several conversions in parallel
+
+**One venv is enough — a venv is just a Python environment; GPU assignment is per-process.**
+To convert the same model to several bitrates at once (or several different models), launch one
+`convert.py` process per job, each pinned to its own GPU(s) with `CUDA_VISIBLE_DEVICES`, each
+with its **own work dir (`-o`) and output dir (`-cf`)**:
+
+```sh
+# 4 concurrent conversions of the same model, one GPU each, same venv.
+# Job state, calibration trajectory and output are fully per-process — nothing is shared.
+for i in 0 1 2 3; do
+  CUDA_VISIBLE_DEVICES=$i OMP_NUM_THREADS=8 \
+  venv/bin/python convert.py \
+    -i /mnt/models/gemma-4-31B-it \
+    -o /mnt/work/exl25-bpw$i -cf /mnt/models/gemma-4-exl25-bpw$i \
+    -b 6.0 -hb 16 -x25u 6 -x25h -x25a -d 0 -nr \
+    > /mnt/work/convert-bpw$i.log 2>&1 &
+done
+```
+
+Notes:
+
+- Inside each process the pinned GPU is device 0, so use **`-d 0`** (a single-device job).
+  `-crs on` has no effect with one device; leave it off.
+- **Skip the measurement pass for jobs 2–4.** Measurement depends only on the source model, not
+  the bitrate: run it once with `-om measurement.json`, then pass `-m measurement.json` to every
+  quantization job. (With EXL2.5 uniform bits the per-tensor allocation is fixed anyway, so the
+  measurement is only used for the strategy search.) The measurement pass is the slow part —
+  sharing it saves hours per additional job.
+- **RAM:** each process holds its own calibration trajectory (~5 GB for 100 rows × 2048 tokens
+  at hidden 5376, fp32), pinned staging arena and torch overhead — roughly 10–15 GB per 31B
+  job. Four concurrent jobs fit comfortably in 125 GB; watch `free -g` on smaller boxes.
+- **VRAM:** a single-GPU job loads one module at a time (lazy load/unload), so the fp16 source
+  model does **not** need to fit in VRAM whole — peak usage is the largest module plus its
+  Hessian and quantization buffers (~10–12 GB for Gemma-4-31B's widest MLP). 24 GB cards are
+  fine; 16 GB cards may be tight on the widest layers.
+- **CPU:** set `OMP_NUM_THREADS` to roughly `cores / jobs` (e.g. 8 for 4 jobs on 32 cores) so
+  the processes don't oversubscribe the host threads.
+- **Disk:** each job writes a work dir (~25 GB for a 31B model at 6 bpw, mostly the calibration
+  trajectory + per-tensor files) plus the compiled output. Use `-ss` to control shard size.
+- Give each job a **fresh work dir** (or `-nr`). Never point two processes at the same work dir.
+
 ### EXL2.5 format arguments (ReadyArt fork)
 
 EXL2.5 adds per-tensor opt-in upgrades on top of EXL2. **The one rule: EXL2.5's new features
@@ -240,6 +283,25 @@ Engram (hashed n-gram embedding) tables use a separate scalar-row converter:
 `python -m exllamav2.conversion.convert_ngram -i <model_dir> -o <out> -k <table_key>
 --bits 8 --ngram-size N --heads-per-ngram H --ple-embed-dim D --eos <id>`
 (4 or 8 bits per row; no trellis; RAM or disk-streaming lookup at inference).
+
+**Important notes for EXL2.5 jobs:**
+
+- **Use a fresh work dir per job, and never resume across converter code changes.** The work
+  dir stores the calibration trajectory (hidden states) advanced layer by layer; it must match
+  the code that produced it. If a job was interrupted by a converter bug or you updated the
+  fork, start over with `-nr` or a new `-o` — resuming can silently quantize against a stale or
+  corrupted trajectory.
+- **Check the final perplexity.** The last `calibration perplexity (quant)` line measures the
+  composed quantized model on the calibration data. Healthy: single/low-double digits.
+  Thousands or more: the conversion failed — do not ship the checkpoint; convert again with a
+  fresh work dir. (Per-tensor `rfn_error` staying small does *not* guarantee a healthy composed
+  model — it compares each module against its own reference on the same input.)
+- **Hadamard/AWQ need the fast path at inference.** The converted model only runs correctly on
+  this fork's CUDA extension (built from the `ReadyArt` branch). The activation transforms are
+  applied inside the EXL2.5 GEMM kernels; upstream exllamav2 cannot serve these tensors.
+- The Hadamard activation rotation accumulates in fp32 inside the kernels (real-model
+  activations overflow fp16 butterfly partial sums); no converter flag is involved — just make
+  sure the inference-side extension is current.
 
 Notes:
 - Without `-crs on`, the measurement pass is single-device (the primary); `-d` still distributes the

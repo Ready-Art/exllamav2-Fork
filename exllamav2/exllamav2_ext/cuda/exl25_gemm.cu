@@ -111,12 +111,16 @@ __global__ void exl25_transform_kernel
     int had_k
 )
 {
-    __shared__ half sh[128];
+    // fp32 intermediates: real Gemma-4 activations carry ~3000-magnitude outlier
+    // channels; butterfly PARTIAL sums (up to 128 aligned terms, AWQ can amplify
+    // small channels 4x) overflow fp16's 65504 even when the final sums fit.
+    // fp16 stages produced inf -> inf-inf = NaN -> gibberish decode.
+    __shared__ float sh[128];
     int t = threadIdx.x;
     int idx = blockIdx.y * size_k + blockIdx.x * 128 + t;
 
-    half v = a[idx];
-    if (awq_scale) v = __hmul(v, awq_scale[blockIdx.x * 128 + t]);
+    float v = __half2float(a[idx]);
+    if (awq_scale) v *= __half2float(awq_scale[blockIdx.x * 128 + t]);
     sh[t] = v;
     __syncthreads();
 
@@ -125,14 +129,14 @@ __global__ void exl25_transform_kernel
         #pragma unroll
         for (int h = 1; h < 128; h <<= 1)
         {
-            half x = sh[t];
-            half y = sh[t ^ h];
+            float x = sh[t];
+            float y = sh[t ^ h];
             __syncthreads();
-            sh[t] = (t & h) ? __hsub(y, x) : __hadd(x, y);
+            sh[t] = (t & h) ? (y - x) : (x + y);
             __syncthreads();
         }
     }
-    out[idx] = sh[t];
+    out[idx] = __float2half_rn(sh[t]);
 }
 
 // Grow-only per-device scratch (process lifetime; eager prefill path only -- never
@@ -182,3 +186,4 @@ void exl25_transform_a
     dim3 blockDim(128), gridDim(size_k / 128, size_m);
     exl25_transform_kernel<<<gridDim, blockDim, 0, stream>>>(a, out, size_k, awq_scale, had_k);
 }
+

@@ -106,7 +106,12 @@ internlm2_keymap = [("$output.", "lm_head."),
                     ("$model.tok_embeddings.", "model.embed_tokens."),
                     (".attention.", ".self_attn."),
                     (".wo.", ".o_proj.")]
-google_keymap = [("mm_input_projection_weight", "mm_input_projection.weight")]
+google_keymap = [("mm_input_projection_weight", "mm_input_projection.weight"),
+                 # Untied-head Gemma finetunes may store the head shard with a bare key
+                 # (e.g. Nimbz/Gemma-4-Dark-Orthia-Untied-31B's model-lmhead.safetensors).
+                 # $-anchored: only keys STARTING with lm_head.weight remap; already-prefixed
+                 # keys (model.lm_head.weight, model.language_model.lm_head.weight) untouched.
+                 ("$lm_head.weight", "model.language_model.lm_head.weight")]
 
 no_default = object()
 

@@ -12,8 +12,9 @@
 // Optional per-tensor features (runtime flags, branch only in the preload):
 //   had_k = 128 : K-side Hadamard incoherence. Weights were pre-rotated by the orthonormal
 //                 block-diagonal H128 at conversion; activations get the UNNORMALIZED
-//                 butterfly here (exact fp16 +/-1 add/sub, 7 shared-mem stages). The
-//                 1/sqrt(128) lives in the stored weights, so no normalization multiply.
+//                 butterfly here (fp32 +/-1 add/sub, 7 shared-mem stages -- fp16 partial
+//                 sums overflow on real outlier activations). The 1/128 lives in the
+//                 stored weights, so no normalization multiply.
 //   awq_scale   : per-input-channel inverse protection scale, applied before the butterfly.
 //
 // MoE: same r_weights early-exit / mul_r_weights contract as the legacy kernel, so the
@@ -63,37 +64,29 @@ __forceinline__ __device__ void exl25_dequant_8bit_8
     dq[3] = __halves2half2(__high2half(t2), __high2half(t3));
 }
 
-// Register-fed dot products. Numerics mirror the legacy dot22_*_h exactly:
-// 8-weight chunks accumulate in fp32 (unscaled weights span -128..127), 16/32-weight
-// chunks in half2 with the group scale applied to the chunk partial.
+// Register-fed dot products. ALL chunk widths accumulate in fp32: the partial sums
+// multiply UNSCALED codes (6-bit spans -32..31) by activations, and the group scale is
+// applied only afterwards. Hadamard/AWQ activations spread each outlier channel across
+// a whole 128-block at ~1000+ magnitude, so a 16-term fp16 partial reaches ~1e5 > 65504
+// -> inf -> NaN on real Gemma-4 activations (randn-scale synthetics never overflowed,
+// which is why the original parity gates missed this). fp32 partials are magnitude-robust.
 
 template <int wj>
 __forceinline__ __device__ half exl25_dot(half2 (&dq)[wj / 2], const half2 (&a2)[wj / 2], const half g_result, const half qs_h)
 {
-    if constexpr (wj == 8)
+    float result = {};
+    #pragma unroll
+    for (int i = 0; i < wj / 2; i++)
     {
-        float result = {};
-        #pragma unroll
-        for (int i = 0; i < 4; i++)
-        {
-            float w0 = __low2float(dq[i]);
-            float w1 = __high2float(dq[i]);
-            float x0 = __low2float(a2[i]);
-            float x1 = __high2float(a2[i]);
-            result = fma(w0, x0, result);
-            result = fma(w1, x1, result);
-        }
-        result *= __half2float(qs_h);
-        return __hadd(__float2half_rn(result), g_result);
+        float w0 = __low2float(dq[i]);
+        float w1 = __high2float(dq[i]);
+        float x0 = __low2float(a2[i]);
+        float x1 = __high2float(a2[i]);
+        result = fma(w0, x0, result);
+        result = fma(w1, x1, result);
     }
-    else
-    {
-        half2 result = {};
-        #pragma unroll
-        for (int i = 0; i < wj / 2; i++) result = __hfma2(dq[i], a2[i], result);
-        half result_h = __hadd(__low2half(result), __high2half(result));
-        return __hfma(result_h, qs_h, g_result);
-    }
+    result *= __half2float(qs_h);
+    return __hadd(__float2half_rn(result), g_result);
 }
 
 typedef void (*fp_exl25_gemm_kernel)
@@ -175,69 +168,112 @@ __global__ void exl25_gemm_kernel
 
     // Preload activations: vectorized int4 (no permutation in the fast lane), optional
     // AWQ inverse-scale multiply per channel.
+    //
+    // had/awq tensors preload + butterfly in fp32: real Gemma-4 activations carry
+    // ~3000-magnitude outlier channels, and butterfly PARTIAL sums (up to 128 aligned
+    // terms; AWQ amplifies small channels up to 4x) overflow fp16's 65504 even when the
+    // final sums fit -- fp16 stages gave inf -> inf-inf = NaN -> gibberish decode.
+    // Plain uniform tensors keep the original direct-half preload bit-for-bit.
 
+    // Separate fp32 staging + fp16 dot buffers. A float/half union aliases the same
+    // bytes; nvcc -O3 miscompiles the cross-member narrowing (the dot loop read
+    // uninitialized shared memory -> all-NaN / all-zero outputs). Two arrays, no UB.
+    __shared__ float block_af[m_count][block_kn];
     __shared__ half block_a[m_count][block_kn];
 
-    if (t < block_kn / 8)
+    if (had_k || awq_scale)
     {
-        int kk = offset_k + t * 8;
-        if (kk < end_k)
+        if (t < block_kn / 8)
         {
-            #pragma unroll
-            for (int m = 0; m < m_count; ++m)
+            int kk = offset_k + t * 8;
+            if (kk < end_k)
             {
-                if (m >= m_count_min) continue;
-                int4 v = *((const int4*) (a + (offset_m + m) * size_k + kk));
-                if (awq_scale)
-                {
-                    int4 s = *((const int4*) (awq_scale + kk));
-                    half* vh = (half*) &v;
-                    const half* sh = (const half*) &s;
-                    #pragma unroll
-                    for (int i = 0; i < 8; i++) vh[i] = __hmul(vh[i], sh[i]);
-                }
-                *((int4*) &block_a[m][t * 8]) = v;
-            }
-        }
-    }
-    __syncthreads();
-
-    // K-side Hadamard butterfly over 128-blocks (unnormalized; weights carry 1/sqrt(128)).
-    // All threads participate -- the n-boundary return must come AFTER this, since a live
-    // thread's butterfly partner may sit in a column slot past size_n.
-
-    if (had_k)
-    {
-        const int hb = t >> 7;
-        const int he = t & 127;
-        #pragma unroll
-        for (int h = 1; h < 128; h <<= 1)
-        {
-            const int pt = (hb << 7) | (he ^ h);
-            // 4-row groups keep the butterfly temporaries at 8 registers even for m16.
-            #pragma unroll
-            for (int mg = 0; mg < m_count; mg += 4)
-            {
-                half v[4], p[4];
                 #pragma unroll
-                for (int r = 0; r < 4; r++)
+                for (int m = 0; m < m_count; ++m)
                 {
-                    if (mg + r < m_count_min)
+                    if (m >= m_count_min) continue;
+                    int4 v = *((const int4*) (a + (offset_m + m) * size_k + kk));
+                    const half* vh = (const half*) &v;
+                    if (awq_scale)
                     {
-                        v[r] = block_a[mg + r][t];
-                        p[r] = block_a[mg + r][pt];
+                        int4 s = *((const int4*) (awq_scale + kk));
+                        const half* sh = (const half*) &s;
+                        #pragma unroll
+                        for (int i = 0; i < 8; i++)
+                            block_af[m][t * 8 + i] = __half2float(vh[i]) * __half2float(sh[i]);
+                    }
+                    else
+                    {
+                        #pragma unroll
+                        for (int i = 0; i < 8; i++)
+                            block_af[m][t * 8 + i] = __half2float(vh[i]);
                     }
                 }
-                __syncthreads();
-                #pragma unroll
-                for (int r = 0; r < 4; r++)
-                {
-                    if (mg + r < m_count_min)
-                        block_a[mg + r][t] = (he & h) ? __hsub(p[r], v[r]) : __hadd(v[r], p[r]);
-                }
-                __syncthreads();
             }
         }
+        __syncthreads();
+
+        // K-side Hadamard butterfly over 128-blocks (unnormalized; weights carry 1/128).
+        // All threads participate -- the n-boundary return must come AFTER this, since a
+        // live thread's butterfly partner may sit in a column slot past size_n.
+
+        if (had_k)
+        {
+            const int hb = t >> 7;
+            const int he = t & 127;
+            #pragma unroll
+            for (int h = 1; h < 128; h <<= 1)
+            {
+                const int pt = (hb << 7) | (he ^ h);
+                // 4-row groups keep the butterfly temporaries at 8 registers even for m16.
+                #pragma unroll
+                for (int mg = 0; mg < m_count; mg += 4)
+                {
+                    float v[4], p[4];
+                    #pragma unroll
+                    for (int r = 0; r < 4; r++)
+                    {
+                        if (mg + r < m_count_min)
+                        {
+                            v[r] = block_af[mg + r][t];
+                            p[r] = block_af[mg + r][pt];
+                        }
+                    }
+                    __syncthreads();
+                    #pragma unroll
+                    for (int r = 0; r < 4; r++)
+                    {
+                        if (mg + r < m_count_min)
+                            block_af[mg + r][t] = (he & h) ? (p[r] - v[r]) : (v[r] + p[r]);
+                    }
+                    __syncthreads();
+                }
+            }
+        }
+
+        // Narrow to fp16 for the dot loop (separate arrays -- no aliasing).
+        #pragma unroll
+        for (int m = 0; m < m_count; m++)
+            if (m < m_count_min) block_a[m][t] = __float2half_rn(block_af[m][t]);
+        __syncthreads();
+    }
+    else
+    {
+        if (t < block_kn / 8)
+        {
+            int kk = offset_k + t * 8;
+            if (kk < end_k)
+            {
+                #pragma unroll
+                for (int m = 0; m < m_count; ++m)
+                {
+                    if (m >= m_count_min) continue;
+                    int4 v = *((const int4*) (a + (offset_m + m) * size_k + kk));
+                    *((int4*) &block_a[m][t * 8]) = v;
+                }
+            }
+        }
+        __syncthreads();
     }
 
     if (n >= size_n) return;
