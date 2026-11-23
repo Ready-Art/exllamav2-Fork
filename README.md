@@ -453,6 +453,16 @@ synthetic Qwen3MoE across 4 GPUs (N=0/4/8 greedy ids identical). Expert column/r
 qk_norm; other families (Qwen3/Qwen3MoE with qk_norm, Llama head_dim 128, …) automatically
 take the generic eager TP attention path (FlashInfer/SDPA, qk_norm-aware). KV-head count
 must be ≥ the TP world size (a rank owning zero KV heads is unsupported, as for Gemma-4).
+The `head_norm` kernel now supports head_dim < 64 (Qwen3's head_dim 32): it pads the
+reduction to a full warp so the shuffle sum is correct (previously half-warp launches
+corrupted qk_norm). Verified vs torch RMSNorm for hd 32/64/128/256/512.
+
+**Expert TP sharding (WIP):** `EXL2_MOE_TP_SHARD=1` splits each expert's FFN across ranks
+(column-parallel w1/w3, row-parallel w2) like a dense MLP — ~world× less expert VRAM/RAM
+per rank and ~world× less offload PCIe traffic; auto-enabled when offloading. Implemented
+and runs on 2/3/4 GPUs, but **not yet released**: a Qwen3MoE MP attention parity gap
+(prefill logits cos ~0.83 vs single-device, present in replicated MP too) blocks coherence
+verification. Tracked for the next session (see `newplan.md`).
 
 ### INT8 & offload — quick configuration
 
