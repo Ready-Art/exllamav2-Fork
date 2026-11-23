@@ -113,6 +113,8 @@ MTP drafter (939 MB): [google/gemma-4-31B-it-assistant](https://huggingface.co/g
 | **FlashInfer attention** | head_dim 512 on every path on sm86 — paged decode (incl. CUDA-graph mode), single-token decode, prefill. |
 | **Multi-batch (experimental)** | Slot-based concurrency on MP + MTP, validated at batch 4. See [Experimental features](#experimental-features). |
 | **Prompt-cache RAM offload (experimental)** | Tier idle conversations to host RAM under a whole-server cap. See [Experimental features](#experimental-features). |
+| **INT8 KV cache (opt-in)** | INT8 K/V shadow + custom flash-decode halves long-context decode KV reads. Default fp16. |
+| **Priority scheduler (opt-in)** | Shortest-first admission + reprocess-abuse penalty for shared-API serving. |
 | **DFlash drafting (experimental)** | Block-diffusion drafter: a whole block in one parallel pass. See [Experimental features](#experimental-features). |
 | **Multi-GPU quantization** | `convert.py -d 0,1,2,3 -crs on` spreads conversion across GPUs; run several conversions in parallel on separate GPUs. See [doc/convert.md](doc/convert.md). |
 
@@ -389,6 +391,33 @@ Through TabbyAPI: `model.prompt_cache_offload: true` + `model.prompt_cache_ram_l
 Kill switch `EXL2_PROMPT_OFFLOAD=0`; decision logging `EXL2_OFFLOAD_DEBUG=1`. `cache_size` stays
 the per-row VRAM depth — RAM extends the *number* of cached lineages, not a single
 conversation's attendable depth.
+
+### INT8 KV cache shadow (opt-in, default fp16)
+
+Ampere has no FP8, so K/V are quantized to symmetric per-(token, head) **INT8 with fp16
+scales** and dequantized in-register by a custom split-KV flash-decode kernel (one warp per
+CTA, GQA, hd256/512, graph-safe). The shadow halves the decode KV read on the full-attention
+layers — the dominant bandwidth cost at long context. The fp16 cache stays primary
+(verify/prefill/SWA unchanged); the shadow adds ~50% KV VRAM. Batch-safe (per-row kv_lens).
+Through TabbyAPI: `model.kv_cache_int8: true` (sets `EXL2_KV_INT8`). Default off.
+
+### Priority prompt scheduler (opt-in, MP + MTP multi-batch)
+
+Shortest-prompt-first admission with a small micro-batch window, so short requests are not
+stuck behind multi-second long prefills. Includes a **reprocess-abuse penalty**: long prompts
+that repeatedly FULLY re-prefill from scratch (tracked by prompt fingerprint — prefix hash +
+length bucket, no API-key tracking) are deprioritized and held briefly; re-rendered last
+replies take the partial-reuse paths and never count. Aging bounds starvation. Through
+TabbyAPI: `model.priority_queue: true` (+ `batch_window_ms`, `reprocess_*` options). Default
+off. Mid-prefill preemption (`priority_preempt`) is experimental and **default off** — see the
+config description for the known batch-driver state-sync issue.
+
+### Engram (n-gram) table storage modes
+
+For models with hashed n-gram embedding tables (e.g. Qwen3.8-Flash-Next): `EXL2_NGRAM_MODE` =
+`disk` (pread per lookup from SSD/NVMe, default), `ram` (full table in host RAM), or `hybrid`
+(disk + bounded LRU row cache, `EXL2_NGRAM_HYBRID_MB`, default 1024). Never VRAM-resident.
+Through TabbyAPI: `model.ngram_mode` / `model.ngram_hybrid_mb`.
 
 ### DFlash block-diffusion drafting (MP, batch 1)
 
