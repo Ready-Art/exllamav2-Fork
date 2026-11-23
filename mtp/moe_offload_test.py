@@ -78,6 +78,7 @@ def run():
     from exllamav2.cache import ExLlamaV2Cache
     N = os.environ.get("EXL2_MOE_OFFLOAD", "0")
     os.environ["EXL2_MOE_DBG"] = "sd"
+    os.environ["EXL2_ATTN_DBG"] = "sd"
     c = ExLlamaV2Config(); c.model_dir = SYNTH + "_exl2"; c.prepare()
     c.max_seq_len = 1024
     tok = ExLlamaV2Tokenizer(c)
@@ -111,7 +112,9 @@ def run_mp():
     c.max_seq_len = 1024; c.chunk_size = 256; c.max_input_len = 256
     tok = ExLlamaV2Tokenizer(c)
     ngpu = int(os.environ.get("MOE_TEST_GPUS", "4"))
-    os.environ["EXL2_MOE_DBG"] = f"g{ngpu}_{'sh' if os.environ.get('EXL2_MOE_TP_SHARD','auto')!='0' else 'repl'}"
+    _mtag = f"g{ngpu}_{'sh' if os.environ.get('EXL2_MOE_TP_SHARD','auto')!='0' else 'repl'}"
+    os.environ["EXL2_MOE_DBG"] = _mtag
+    os.environ["EXL2_ATTN_DBG"] = _mtag
     pg = TPProcessGroup(SYNTH + "_exl2", [2.0] * ngpu, 1024, 1024, "ExLlamaV2Cache")
     pg.start()
     ids = tok.encode("The quick brown fox jumps over the lazy dog.", encode_special_tokens = True)
@@ -153,6 +156,16 @@ def cmp():
             print(f"MOE-IN {os.path.basename(f):20s} rel_l2={rel:.5f} cos={cos:.6f}", flush=True)
 
 
+def cmp_attn():
+    import glob
+    s = torch.load("/tmp/attn_out_sd.pt")
+    for f in sorted(glob.glob("/tmp/attn_out_g*.pt")):
+        x = torch.load(f)
+        rel = float((x - s).norm() / s.norm().clamp_min(1e-9))
+        cos = float(torch.nn.functional.cosine_similarity(x.flatten(), s.flatten(), dim=0))
+        print(f"ATTN-OUT {os.path.basename(f):22s} rel_l2={rel:.5f} cos={cos:.6f}", flush=True)
+
+
 if __name__ == "__main__":
     if sys.argv[1] == "make":
         make()
@@ -160,5 +173,7 @@ if __name__ == "__main__":
         run_mp()
     elif sys.argv[1] == "cmp":
         cmp()
+    elif sys.argv[1] == "cmp_attn":
+        cmp_attn()
     else:
         run()

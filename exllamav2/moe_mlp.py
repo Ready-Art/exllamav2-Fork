@@ -8,6 +8,7 @@ from exllamav2.layernorm import ExLlamaV2LayerNorm
 from exllamav2.linear import ExLlamaV2Linear
 from exllamav2.lora import ExLlamaV2Lora
 from exllamav2.ext import exllamav2_ext as ext_c, none_tensor
+from exllamav2.tensor_p import BROADCAST_ID, BROADCAST_RS, BROADCAST_VC
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -60,6 +61,14 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
         # q_moe_mlp kernel needs every expert resident). Single-device load path only.
         self.offload_experts = max(0, min(int(os.environ.get("EXL2_MOE_OFFLOAD", "0") or 0),
                                           self.num_experts))
+
+        # MP expert layout: "shard" splits each expert's FFN across ranks (column-parallel
+        # w1/w3, row-parallel w2) like a dense MLP — ~world× less expert VRAM/RAM per rank
+        # and ~world× less offload PCIe traffic. "replicate" keeps the full MoE on every
+        # rank (graph-safe fused kernel). EXL2_MOE_TP_SHARD=1 opts in; default 0 = replicate.
+        # EXPERIMENTAL: sharding runs on 2/3/4 GPUs but Qwen3-family MP attention has an
+        # open parity bug (see README), so sharded output is not yet verified coherent.
+        self._tp_shard = os.environ.get("EXL2_MOE_TP_SHARD", "0") != "0"
 
         if ap.norm == "layernorm":
             self.post_attention_layernorm = ExLlamaV2LayerNorm(model, key + km["norm_2"])
@@ -252,24 +261,66 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
 
 
     def scratch_space_tp(self):
-        # Replicated MoE (see tp_load_rank): every rank runs the full MoE, so reserve
-        # the single-device scratch on each rank. Conservative but correct; expert TP
-        # sharding (which would cut this) is a follow-up.
         devs = self.model.tp_context.num_devices
-        s = self.scratch_space()
-        return [s] * devs
+        if not self._tp_shard:
+            # Replicated MoE: every rank runs the full MoE; reserve single-device scratch.
+            return [self.scratch_space()] * devs
+        # Sharded MoE mirrors the dense MLP: column-parallel w1/w3 (ID split),
+        # column-parallel w2 on the RS split. Expert temp_dq slices reuse the device
+        # scratch (each tp_load_rank calls begin_scratch_alloc), so one max suffices.
+        cfg = self.model.config
+        ctx = self.model.tp_context
+        scratch = [0] * devs
+        def amax(res):
+            for i, s in enumerate(res): scratch[i] = max(scratch[i], s)
+        amax(self.w1[0].scratch_space_tp(BROADCAST_ID, 1))
+        amax(self.w3[0].scratch_space_tp(BROADCAST_ID, 1))
+        amax(self.w2[0].scratch_space_tp(BROADCAST_RS, 1))
+        maxrows = cfg.max_batch_size * cfg.max_input_len
+        def add(res):
+            for i, s in enumerate(res): scratch[i] += s
+        add(ctx.get_temp_tensors_bc_s(maxrows, 2, BROADCAST_ID))
+        add(ctx.get_temp_tensors_s(maxrows, 2, BROADCAST_RS))
+        return scratch
 
     def tp_load_rank(self, rank: int):
-        # Replicated-expert MP MoE: each rank loads the FULL gate/norm/experts and runs
-        # them identically (forward_tp_old gathers/shards the residual around the block).
-        # EXL2_MOE_OFFLOAD moves the last N experts to pinned RAM on EVERY rank, with one
-        # shared GPU staging slot per projection. Expert column/row TP sharding is a
-        # follow-up (P7); replication keeps the routing math exact and offload functional.
         self.device_idx = rank
-        self.post_attention_layernorm.set_device_idx(rank)
-        self.gate.set_device_idx(rank)
         off = self.offload_experts
         first_off = self.num_experts - off
+
+        if self._tp_shard:
+            # Sharded-expert MP MoE: each expert's FFN is split across ranks exactly like
+            # a dense MLP (w1/w3 column-parallel ID, w2 column-parallel RS + unmap remap).
+            # The router gate + input norm stay replicated so routing is identical on every
+            # rank; forward_tp_sharded allgathers the summed expert output once per block.
+            # Offload moves each rank's SHARD of the last N experts to pinned RAM (~world×
+            # less RAM/PCIe than replicated offload).
+            self.post_attention_layernorm.tp_load_rank(rank, BROADCAST_RS)
+            self.gate.set_device_idx(rank)
+            self.gate.load()
+            shared = [{}, {}, {}] if off else None
+            for e in range(self.num_experts):
+                is_off = bool(off and e >= first_off)
+                for wi, wl in enumerate((self.w1, self.w2, self.w3)):
+                    wl[e].offload = is_off
+                    if is_off:
+                        wl[e]._offload_shared = shared[wi]
+                perm = self.w2[e].tp_load_rank(rank, BROADCAST_RS, unmap = True)
+                self.w1[e].tp_load_rank(rank, BROADCAST_ID, output_map = perm)
+                self.w3[e].tp_load_rank(rank, BROADCAST_ID, output_map = perm)
+            if off:
+                print(f"[moe-offload] rank {rank} layer {self.layer_idx}: {off}/{self.num_experts} "
+                      f"expert SHARDS in pinned RAM (sharded MP MoE)", flush = True)
+            self.is_tp = True
+            self.device_idx = rank
+            return
+
+        # Replicated-expert MP MoE: each rank loads the FULL gate/norm/experts and runs
+        # them identically (forward_tp_old gathers/shards the residual around the block).
+        # Resident experts use the graph-safe fused kernel; offload moves the last N
+        # experts to pinned RAM on EVERY rank with one shared GPU staging slot/projection.
+        self.post_attention_layernorm.set_device_idx(rank)
+        self.gate.set_device_idx(rank)
         shared = [{}, {}, {}] if off else None
         for e in range(self.num_experts):
             is_off = bool(off and e >= first_off)
@@ -290,6 +341,51 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
         self.is_tp = True
         self.device_idx = rank
 
+    def _forward_tp_sharded(self, full, ctx, loras):
+        # Routing is replicated (gate + norm full on every rank) so selected_experts and
+        # routing_weights agree across ranks. Each rank computes its FFN shard of every
+        # selected expert (w1/w3 ID-shard -> act -> w2 RS-shard), accumulates the weighted
+        # expert outputs into a local RS-shard of the hidden, then ONE allgather rebuilds
+        # the full MoE output. Mirrors the dense-MLP column->RS->gather flow per expert.
+        B, q, H = full.shape
+        x = full.view(-1, H)
+        post_norm = self.post_attention_layernorm.forward(x)
+        router_logits = self.gate.forward(post_norm, loras = loras)
+        routing_weights = F.softmax(router_logits, dim = -1, dtype = torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.num_experts_per_token, dim = -1)
+        routing_weights /= routing_weights.sum(dim = -1, keepdim = True)
+        routing_weights = routing_weights.to(post_norm.dtype)
+
+        dev, a, b = ctx.get_split(BROADCAST_RS)[0]
+        hidden_local = b - a
+        rows = x.shape[0]
+        final_shard = torch.zeros((rows, hidden_local), dtype = post_norm.dtype, device = x.device)
+        expert_mask = F.one_hot(selected_experts, num_classes = self.num_experts).permute(2, 1, 0)
+        act_silu = self.archparams.mlp_act_func == "silu"
+        first_off = self.num_experts - self.offload_experts
+
+        for e in range(self.num_experts):
+            idx, top_x = torch.where(expert_mask[e])
+            if top_x.shape[0] == 0:
+                continue
+            if self.offload_experts and e >= first_off:
+                self.w1[e]._stage_offload()
+                self.w3[e]._stage_offload()
+                self.w2[e]._stage_offload()
+            cur = post_norm[top_x]
+            # forward_tp expects a per-device LIST (the TP GEMM binding takes Sequence[Tensor]);
+            # under rank-local MP the list has one entry (this rank's shard).
+            g = self.w1[e].forward_tp([cur], output_split = True, skip_broadcast = True, loras = loras)[0]
+            u = self.w3[e].forward_tp([cur], output_split = True, skip_broadcast = True, loras = loras)[0]
+            act = F.silu(g) if act_silu else F.gelu(g, approximate = "tanh")
+            act = act * u
+            d = self.w2[e].forward_tp([act], output_split = True, skip_broadcast = True, loras = loras)[0]
+            d = d * routing_weights[top_x, idx, None]
+            final_shard.index_add_(0, top_x, d.to(final_shard.dtype))
+
+        final_full = ctx.allgather(1, [final_shard], BROADCAST_RS, BROADCAST_RS)[0]
+        return final_full.view(B, q, H)
+
     def forward_tp_old(
         self,
         hidden_states: torch.Tensor,
@@ -307,6 +403,12 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
             full = ctx.gather_residual(hidden_states)
         else:
             full = hidden_states
+
+        if self._tp_shard:
+            out_full = self._forward_tp_sharded(full, ctx, loras)
+            if ctx.seqpar and not repl_chunk:
+                return ctx.shard_residual(out_full) + hidden_states
+            return out_full + hidden_states
 
         # Resident experts: the fused q_moe_mlp kernel handles routing internally with
         # fixed buffers -> CUDA-graph safe (TP graphs stay ON). Offloaded experts use the
