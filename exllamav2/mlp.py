@@ -9,7 +9,7 @@ from exllamav2.layernorm import ExLlamaV2LayerNorm
 from exllamav2.linear import ExLlamaV2Linear
 from exllamav2.ext import exllamav2_ext as ext_c, none_tensor
 from exllamav2.lora import ExLlamaV2Lora
-from exllamav2.tensor_p import BROADCAST_ID, BROADCAST_RS
+from exllamav2.tensor_p import BROADCAST_ID, BROADCAST_RS, fuse_agnr_enabled
 # from line_profiler import profile
 
 from typing import TYPE_CHECKING
@@ -523,7 +523,7 @@ class ExLlamaV2MLP(ExLlamaV2Module):
             down = self.down_proj.forward_tp(outputs, output_split = True)
             # Fused AG+post-norm+residual (EXL2_TP_FUSE_AGNR=1), mirrors attn.py.
             _fused = None
-            if os.environ.get("EXL2_TP_FUSE_AGNR", "0") == "1" \
+            if fuse_agnr_enabled((past_len or 0) + q_len) \
                     and self.post_layernorm is not None and self.has_residual:
                 _fused = ctx.ag_norm_res(down[0], 3, self.post_layernorm.weight,
                                          residual, self.post_layernorm.variance_epsilon)

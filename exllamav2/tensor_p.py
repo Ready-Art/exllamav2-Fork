@@ -15,6 +15,27 @@ if TYPE_CHECKING:
 BROADCAST_KV = 0
 BROADCAST_ID = 1
 BROADCAST_VC = 2
+
+
+def fuse_agnr_enabled(kv_len: int) -> bool:
+    """
+    Context-adaptive AG+norm+residual fusion. Measured (user regime, temp1/top_p0.92,
+    4x3090 200W): +7.8% total MTP tok/s at 100k ctx, but -17% at ~1.3k — the fixed
+    collective-latency saving only pays once the round is attention-bound. Default
+    "auto": fuse at kv >= 8192. EXL2_TP_FUSE_AGNR=1/0 forces on/off; the threshold
+    is tunable via EXL2_TP_FUSE_AGNR_KV.
+    """
+    import os
+    v = os.environ.get("EXL2_TP_FUSE_AGNR", "auto")
+    if v == "1":
+        return True
+    if v == "0":
+        return False
+    try:
+        thr = int(os.environ.get("EXL2_TP_FUSE_AGNR_KV", "8192"))
+    except ValueError:
+        thr = 8192
+    return kv_len >= thr
 BROADCAST_RS = 3
 BROADCAST_Q = 4
 

@@ -12,7 +12,7 @@ from exllamav2.cache import ExLlamaV2CacheBase, ExLlamaV2Cache_SWA
 from exllamav2.ext import exllamav2_ext as ext_c, none_tensor
 from exllamav2.lora import ExLlamaV2Lora
 from exllamav2.architecture import RopeStyle
-from exllamav2.tensor_p import BROADCAST_KV, BROADCAST_Q, BROADCAST_RS, BROADCAST_ID, BROADCAST_VC
+from exllamav2.tensor_p import BROADCAST_KV, BROADCAST_Q, BROADCAST_RS, BROADCAST_ID, BROADCAST_VC, fuse_agnr_enabled
 from exllamav2 import attn_backend
 from exllamav2.attn_backend import FlashInferPaged
 import math
@@ -2632,7 +2632,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                 # replaces the RS allgather + norm + add (3 launches -> 1). Falls back
                 # to the unfused path when P2P is off or the shape/dtype is unsupported.
                 _fused = None
-                if os.environ.get("EXL2_TP_FUSE_AGNR", "0") == "1" \
+                if fuse_agnr_enabled(past_len + q_len) \
                         and self.post_layernorm is not None and self.has_residual:
                     _fused = _ctx.ag_norm_res(out_shard, 1, self.post_layernorm.weight,
                                               residual, self.post_layernorm.variance_epsilon)
