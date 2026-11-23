@@ -1644,8 +1644,15 @@ class TPProcessGroup:
                 st["ks"][r, :ring - swa_shift].copy_(st["ks"][r, swa_shift:].clone())
                 st["vs"][r, :ring - swa_shift].copy_(st["vs"][r, swa_shift:].clone())
             df = seq_len - st["fls"][r]
+            fl0 = st["fls"][r]
+            if df < 0:
+                # Row reused for a SHORTER prompt than its last gather (slot reset /
+                # mid-prefill preemption): re-pull the full layer from 0, mirroring the
+                # SWA backward guard above. Without this, view(df<0, ...) crashes.
+                fl0 = 0
+                df = seq_len
             ds = swa_len - swa_start
-            specs.append((r, st["fls"][r], seq_len, swa_start, swa_len))
+            specs.append((r, fl0, seq_len, swa_start, swa_len))
             meta.append((seq_len, swa_len, swa_start, df, ds))
 
         for device, w in sorted(self.workers.items()):
