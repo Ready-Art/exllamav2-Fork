@@ -239,6 +239,7 @@ if build_jit:
         "cuda/rope.cu",
         "cuda/cache.cu",
         "cuda/kv_write.cu",
+        "cuda/int8_decode.cu",
         "cuda/util.cu",
         "cuda/softcap.cu",
         "cuda/tp.cu",

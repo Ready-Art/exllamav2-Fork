@@ -13,8 +13,108 @@
 
 #include "cuda/cache.cuh"
 #include "cuda/kv_write.cuh"
+#include "cuda/int8_decode.cuh"
 
 #include "cpp/util.h"
+
+// INT8 KV shadow quantization (Ampere: INT8 + fp16 per-(token,head) scales, no FP8).
+void kv_quant_shadow
+(
+    torch::Tensor cache_k,
+    torch::Tensor cache_v,
+    torch::Tensor k_i8,
+    torch::Tensor v_i8,
+    torch::Tensor k_scale,
+    torch::Tensor v_scale,
+    torch::Tensor pos,
+    int batch_size,
+    int q_len,
+    int kv_heads,
+    int head_dim,
+    torch::Tensor row_map
+)
+{
+    TORCH_CHECK_DTYPE(cache_k, kHalf);
+    TORCH_CHECK_DTYPE(cache_v, kHalf);
+    TORCH_CHECK_DTYPE(k_i8, kChar);
+    TORCH_CHECK_DTYPE(v_i8, kChar);
+    TORCH_CHECK_DTYPE(k_scale, kHalf);
+    TORCH_CHECK_DTYPE(v_scale, kHalf);
+    TORCH_CHECK_DTYPE(pos, kInt);
+
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(cache_k));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    int cache_len = (int) cache_k.size(1);
+    const int32_t* row_map_ptr = NULL;
+    if (row_map.defined() && row_map.numel() > 0)
+    {
+        TORCH_CHECK_DTYPE(row_map, kInt);
+        row_map_ptr = (const int32_t*) row_map.data_ptr();
+    }
+    kv_quant_shadow_cuda
+    (
+        stream,
+        (const half*) cache_k.data_ptr(),
+        (const half*) cache_v.data_ptr(),
+        (int8_t*) k_i8.data_ptr(),
+        (int8_t*) v_i8.data_ptr(),
+        (half*) k_scale.data_ptr(),
+        (half*) v_scale.data_ptr(),
+        (const int32_t*) pos.data_ptr(),
+        row_map_ptr,
+        batch_size, q_len, kv_heads, head_dim, cache_len
+    );
+}
+
+// INT8 KV flash-decode (q_len=1, GQA, contiguous KV, split-KV, graph-safe).
+void int8_decode
+(
+    torch::Tensor q,
+    torch::Tensor k_i8,
+    torch::Tensor v_i8,
+    torch::Tensor k_scale,
+    torch::Tensor v_scale,
+    torch::Tensor o,
+    torch::Tensor po,
+    torch::Tensor pl,
+    torch::Tensor kv_len_dev,
+    int batch_size,
+    int num_qo_heads,
+    int num_kv_heads,
+    int num_splits,
+    double sm_scale,
+    int head_dim
+)
+{
+    TORCH_CHECK_DTYPE(q, kHalf);
+    TORCH_CHECK_DTYPE(k_i8, kChar);
+    TORCH_CHECK_DTYPE(v_i8, kChar);
+    TORCH_CHECK_DTYPE(k_scale, kHalf);
+    TORCH_CHECK_DTYPE(v_scale, kHalf);
+    TORCH_CHECK_DTYPE(o, kHalf);
+    TORCH_CHECK_DTYPE(po, kFloat);
+    TORCH_CHECK_DTYPE(pl, kFloat);
+    TORCH_CHECK_DTYPE(kv_len_dev, kInt);
+    TORCH_CHECK(kv_len_dev.numel() == 1, "int8_decode: kv_len_dev must be a scalar");
+
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    int depth = (int) k_i8.size(1);
+    int8_decode_cuda
+    (
+        (const half*) q.data_ptr(),
+        (const int8_t*) k_i8.data_ptr(),
+        (const int8_t*) v_i8.data_ptr(),
+        (const half*) k_scale.data_ptr(),
+        (const half*) v_scale.data_ptr(),
+        (half*) o.data_ptr(),
+        (float*) po.data_ptr(),
+        (float*) pl.data_ptr(),
+        (const int*) kv_len_dev.data_ptr(),
+        depth, batch_size, num_qo_heads, num_kv_heads, num_splits,
+        (float) sm_scale, head_dim, stream
+    );
+}
 
 // CUDA-graph-safe KV cache write. The position comes from a device tensor, so the same
 // captured graph replays correctly at every decode step.

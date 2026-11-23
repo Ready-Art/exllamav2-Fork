@@ -57,5 +57,40 @@ int count_match
     int max_a
 );
 
+void kv_quant_shadow
+(
+    torch::Tensor cache_k,
+    torch::Tensor cache_v,
+    torch::Tensor k_i8,
+    torch::Tensor v_i8,
+    torch::Tensor k_scale,
+    torch::Tensor v_scale,
+    torch::Tensor pos,
+    int batch_size,
+    int q_len,
+    int kv_heads,
+    int head_dim,
+    torch::Tensor row_map
+);
+
+void int8_decode
+(
+    torch::Tensor q,
+    torch::Tensor k_i8,
+    torch::Tensor v_i8,
+    torch::Tensor k_scale,
+    torch::Tensor v_scale,
+    torch::Tensor o,
+    torch::Tensor po,
+    torch::Tensor pl,
+    torch::Tensor kv_len_dev,
+    int batch_size,
+    int num_qo_heads,
+    int num_kv_heads,
+    int num_splits,
+    double sm_scale,
+    int head_dim
+);
+
 //void array_fp16_to_fp8_ref(torch::Tensor in_tensor, torch::Tensor out_tensor, int size);
 //void array_fp8_to_fp16_ref(torch::Tensor in_tensor, torch::Tensor out_tensor, int size);

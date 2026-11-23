@@ -31,4 +31,24 @@ void kv_write_cuda
     int cache_len            // tokens per sequence in the cache buffer
 );
 
+// Quantize freshly written fp16 cache rows into an INT8 shadow + per-(token,head)
+// fp16 scales (Ampere INT8 KV; same device-side position logic as kv_write_cuda).
+void kv_quant_shadow_cuda
+(
+    cudaStream_t stream,
+    const half* cache_k,
+    const half* cache_v,
+    int8_t* k_i8,
+    int8_t* v_i8,
+    half* k_scale,
+    half* v_scale,
+    const int32_t* pos,
+    const int32_t* row_map,
+    int batch_size,
+    int q_len,
+    int kv_heads,
+    int head_dim,
+    int cache_len
+);
+
 #endif

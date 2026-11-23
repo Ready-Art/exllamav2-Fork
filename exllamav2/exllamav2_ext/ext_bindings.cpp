@@ -180,4 +180,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         py::arg("src_k"), py::arg("src_v"), py::arg("cache_k"), py::arg("cache_v"),
         py::arg("pos"), py::arg("batch_size"), py::arg("q_len"), py::arg("kv_heads"),
         py::arg("head_dim"), py::arg("row_map") = torch::Tensor());
+    m.def("kv_quant_shadow", &kv_quant_shadow, "kv_quant_shadow",
+        py::arg("cache_k"), py::arg("cache_v"), py::arg("k_i8"), py::arg("v_i8"),
+        py::arg("k_scale"), py::arg("v_scale"), py::arg("pos"),
+        py::arg("batch_size"), py::arg("q_len"), py::arg("kv_heads"),
+        py::arg("head_dim"), py::arg("row_map") = torch::Tensor());
+    m.def("int8_decode", &int8_decode, "int8_decode",
+        py::arg("q"), py::arg("k_i8"), py::arg("v_i8"), py::arg("k_scale"), py::arg("v_scale"),
+        py::arg("o"), py::arg("po"), py::arg("pl"), py::arg("kv_len_dev"),
+        py::arg("batch_size"), py::arg("num_qo_heads"), py::arg("num_kv_heads"),
+        py::arg("num_splits"), py::arg("sm_scale"), py::arg("head_dim"));
 }

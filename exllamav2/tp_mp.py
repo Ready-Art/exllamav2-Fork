@@ -279,6 +279,7 @@ def mp_worker(conn, device, world_size, rank, init_method, uuid_hex, model_dir, 
                             vc[dst, :p].copy_(vc[src, :p])
                 cache.seq_lens[dst] = p
                 cache.window_begs[dst] = wb
+                _requant_shadow_row(cache, dst, p)
                 conn.send(("ok", None))
             elif cmd == "kv-pack-batch":
                 # Multi-batch MTP gather: per-row deltas of both drafter source layers,
@@ -324,6 +325,7 @@ def mp_worker(conn, device, world_size, rank, init_method, uuid_hex, model_dir, 
                 row, entry_id, p, wb, attach_snapshot = args
                 store, meta = ctx["cold_bundles"][entry_id]
                 _restore_row_offload(ctx["cache"], row, store, meta, p, wb)
+                _requant_shadow_row(ctx["cache"], row, p)
                 if attach_snapshot:
                     _attach_ring_snapshot(ctx, row, entry_id)
                 conn.send(("ok", None))
@@ -446,6 +448,28 @@ def _worker_kv_slice(ctx, layer_idx, start, end):
     k = cache.key_states[layer_idx][0, start:end].detach().cpu()
     v = cache.value_states[layer_idx][0, start:end].detach().cpu()
     return (k, v)
+
+
+def _requant_shadow_row(cache, row, n):
+    """
+    Re-quantize the INT8 KV shadow for a row whose fp16 KV was just cloned/restored.
+    The shadow is derived state: a raw fp16 copy (clone-row, restore-row) leaves it
+    stale, and the int8 decode would read garbage for the copied prefix.
+    """
+    sh = getattr(cache, "kv_i8", None)
+    if not sh or n <= 0:
+        return
+    from exllamav2.ext import exllamav2_ext as ext_c
+    with torch.inference_mode():
+        for l, (ki, vi, ks, vs) in sh.items():
+            kc, vc = cache.key_states[l], cache.value_states[l]
+            if kc is None:
+                continue
+            dev = kc.device
+            pos = torch.zeros(1, dtype = torch.int32, device = dev)
+            rmap = torch.tensor([row], dtype = torch.int32, device = dev)
+            ext_c.kv_quant_shadow(kc, vc, ki, vi, ks, vs, pos, 1, n,
+                                  kc.shape[2], kc.shape[3], rmap)
 
 
 def _clone_swa_ring(cache):

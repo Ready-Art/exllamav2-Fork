@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import torch
 from exllamav2.ext import exllamav2_ext as ext_c, none_tensor
 from exllamav2.tensor_p import BROADCAST_KV
@@ -439,6 +440,33 @@ class ExLlamaV2Cache_SWA(ExLlamaV2Cache):
             # Now allocate the full-length buffers for the non-sliding layers only.
             self._allocate_full_attention()
 
+        # INT8 KV shadow (opt-in, default fp16): per-(token,head) symmetric INT8 + fp16
+        # scales for the FULL layers, read by the int8 flash-decode kernel. Ampere has
+        # no FP8; INT8 halves the decode KV read. SWA rings stay fp16 (tiny).
+        self.int8_shadow = os.environ.get("EXL2_KV_INT8", "0") != "0"
+        self.kv_i8: dict = {}
+        if self.int8_shadow and not lazy:
+            self._allocate_int8_shadow()
+
+    def _allocate_int8_shadow(self):
+        """INT8 shadow tensors for full-attention layers (opt-in via EXL2_KV_INT8)."""
+        self.kv_i8 = {}
+        if not getattr(self, "int8_shadow", False):
+            return
+        for i in range(self.num_hidden_layers):
+            if self.is_swa_layer[i] or self.key_states[i] is None:
+                continue
+            k = self.key_states[i]
+            kvh = self.layer_num_kv_heads[i]
+            hd = self.layer_head_dims[i]
+            depth = k.shape[1]
+            self.kv_i8[i] = (
+                torch.zeros((self.batch_size, depth, kvh, hd), dtype = torch.int8, device = k.device),
+                torch.zeros((self.batch_size, depth, kvh, hd), dtype = torch.int8, device = k.device),
+                torch.zeros((self.batch_size, depth, kvh), dtype = torch.half, device = k.device),
+                torch.zeros((self.batch_size, depth, kvh), dtype = torch.half, device = k.device),
+            )
+
     def _allocate_rings(self):
 
         for i in range(self.num_hidden_layers):
@@ -494,6 +522,9 @@ class ExLlamaV2Cache_SWA(ExLlamaV2Cache):
                 self.value_states[k] = torch.zeros(
                     self.layer_shapes_wv[k], dtype = self.dtype, device = v
                 ).contiguous()
+
+        if getattr(self, "int8_shadow", False):
+            self._allocate_int8_shadow()
 
     def _allocate_full_attention(self):
         """Allocate full-length KV buffers for the non-sliding layers only."""
