@@ -25,6 +25,12 @@ __global__ void head_norm_kernel
     int warp_id = threadIdx.x / WARP_SIZE;
     int lane_id = threadIdx.x % WARP_SIZE;
     int num_warps = DIVIDE(head_dim, 64);
+    // head_dim < 64 (e.g. Qwen3 head_dim 32) would launch fewer than 32 threads, but the
+    // warp shuffle reduction uses a full 0xffffffff mask: inactive lanes would feed garbage
+    // into the sum. The launcher pads blockDim to a full warp; lanes past head_dim/2 stay
+    // active in the shuffle but contribute zero and skip the load/store.
+    int half_dim = head_dim / 2;
+    bool active = threadIdx.x < half_dim;
 
     int t = threadIdx.x;
     const half* x_ptr = x + num_heads * head_dim * blockIdx.y + head_dim * blockIdx.x;
@@ -45,7 +51,7 @@ __global__ void head_norm_kernel
 
     if (rms)
     {
-        half2 h01 = ((half2*)x_ptr)[t];
+        half2 h01 = active ? x_ptr2[t] : __float2half2_rn(0.0f);
         float f0 = __half2float(__low2half(h01));
         float f1 = __half2float(__high2half(h01));
         f0 = fmaxf(-65504.0f, fminf(f0, 65504.0f));
@@ -75,7 +81,7 @@ __global__ void head_norm_kernel
         float n0, n1;
         if (w_ptr2)
         {
-            half2 w01 = w_ptr2[t];
+            half2 w01 = active ? w_ptr2[t] : __float2half2_rn(0.0f);
             n0 = itemf[0] * __half2float(__low2half(w01)) * rsvar;
             n1 = itemf[1] * __half2float(__high2half(w01)) * rsvar;
         }
@@ -85,15 +91,15 @@ __global__ void head_norm_kernel
             n1 = itemf[1] * rsvar;
         }
         half2 nh = __halves2half2(__float2half_rn(n0), __float2half_rn(n1));
-        if (b) nh = __hadd2(nh, b_ptr2[t]);  // Optional bias
-        y_ptr2[t] = nh;
+        if (b && active) nh = __hadd2(nh, b_ptr2[t]);  // Optional bias
+        if (active) y_ptr2[t] = nh;
     }
 
     // LayerNorm
 
     else
     {
-        half2 h01 = ((half2*)x_ptr)[t];
+        half2 h01 = active ? x_ptr2[t] : __float2half2_rn(0.0f);
         float f0 = __half2float(__low2half(h01));
         float f1 = __half2float(__high2half(h01));
         f0 = fmaxf(-65504.0f, fminf(f0, 65504.0f));
@@ -121,10 +127,13 @@ __global__ void head_norm_kernel
         // Compute square of distance to mean
 
         sum = 0.0f;
-        itemf[0] -= mean;
-        itemf[1] -= mean;
-        sum = fma(itemf[0], itemf[0], sum);
-        sum = fma(itemf[1], itemf[1], sum);
+        if (active)
+        {
+            itemf[0] -= mean;
+            itemf[1] -= mean;
+            sum = fma(itemf[0], itemf[0], sum);
+            sum = fma(itemf[1], itemf[1], sum);
+        }
 
         // Shuffle to sum across lanes
 
@@ -146,7 +155,7 @@ __global__ void head_norm_kernel
         float n0, n1;
         if (w_ptr2)
         {
-            half2 w01 = w_ptr2[t];
+            half2 w01 = active ? w_ptr2[t] : __float2half2_rn(0.0f);
             n0 = itemf[0] * __half2float(__low2half(w01)) * rsvar;
             n1 = itemf[1] * __half2float(__high2half(w01)) * rsvar;
         }
@@ -156,8 +165,8 @@ __global__ void head_norm_kernel
             n1 = itemf[1] * rsvar;
         }
         half2 nh = __halves2half2(__float2half_rn(n0), __float2half_rn(n1));
-        if (b) nh = __hadd2(nh, b_ptr2[t]);  // Optional bias
-        y_ptr2[t] = nh;
+        if (b && active) nh = __hadd2(nh, b_ptr2[t]);  // Optional bias
+        if (active) y_ptr2[t] = nh;
     }
 }
 
@@ -178,7 +187,9 @@ void head_norm_cuda
 )
 {
     dim3 blockDim, gridDim;
-    blockDim.x = head_dim / 2;
+    // At least one full warp so the 0xffffffff shuffle reduction has all lanes active
+    // (head_dim 32 -> 16 data lanes + 16 zero-padding lanes). See head_norm_kernel.
+    blockDim.x = head_dim / 2 < 32 ? 32 : head_dim / 2;
     gridDim.x = num_heads;
     gridDim.y = rows;
 
