@@ -1999,7 +1999,8 @@ class ExLlamaV2Attention(ExLlamaV2Module):
         # tensor on the AWQ scale's device; otherwise each GEMM transforms its own input.
         _pn_in = post_norm
         _pre_tf = False
-        if isinstance(post_norm, torch.Tensor) and post_norm.dtype == torch.half:
+        if isinstance(post_norm, torch.Tensor) and post_norm.dtype == torch.half \
+                and os.environ.get("EXL2_X25_SHARE", "1") != "0":
             _qh = getattr(self.q_proj, "_exl25_had", 0)
             _qa = getattr(self.q_proj, "_exl25_awq", None)
             _kh = getattr(self.k_proj, "_exl25_had", 0)
@@ -2301,18 +2302,24 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                                 and getattr(cache, "kv_i8", None)
                                 and self.layer_idx in cache.kv_i8):
                             # INT8 KV shadow decode: half the KV bytes of the fp16 FI path.
-                            # kv_len = past_len + 1 from the per-replay-staged past_len_tp.
+                            # Batch-safe: per-row kv_lens (kernel reads kv_len_dev[row]).
                             # The add MUST write a PERSISTENT buffer: a temporary result is
                             # freed after the call and the graph-private allocator reuses its
                             # address during capture, so the baked kernel pointer would alias
                             # another buffer on replay (frozen kv_len -> degenerate output).
                             _pl = _ctx.get_past_len_tp(_ctx.geometry_key_active)
-                            _src = _pl[idx] if _pl is not None else _write_pos
+                            if _pl is not None and _pl.numel() >= batch_size:
+                                _src = _pl[:batch_size]
+                            elif torch.is_tensor(_write_pos):
+                                _src = _write_pos.expand(batch_size)
+                            else:
+                                _src = torch.full((batch_size,), int(_write_pos),
+                                                  dtype = torch.int32, device = dev)
                             _kvl_bufs = _ctx.__dict__.setdefault("_int8_kvl", {})
-                            _kvl = _kvl_bufs.get((dev, idx))
+                            _kvl = _kvl_bufs.get((dev, idx, batch_size))
                             if _kvl is None:
-                                _kvl = torch.zeros(1, dtype = torch.int32, device = dev)
-                                _kvl_bufs[(dev, idx)] = _kvl
+                                _kvl = torch.zeros(batch_size, dtype = torch.int32, device = dev)
+                                _kvl_bufs[(dev, idx, batch_size)] = _kvl
                             torch.add(_src, 1, out = _kvl)
                             attn_output = self._attn_int8_decode(
                                 q[idx], k_cache[idx], v_cache[idx], dev, batch_size,
@@ -2660,7 +2667,8 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                 # replaces the RS allgather + norm + add (3 launches -> 1). Falls back
                 # to the unfused path when P2P is off or the shape/dtype is unsupported.
                 _fused = None
-                if fuse_agnr_enabled(past_len + q_len) \
+                _kv_for_fuse = (max(past_len) if isinstance(past_len, (list, tuple)) else (past_len or 0)) + q_len
+                if fuse_agnr_enabled(_kv_for_fuse) \
                         and self.post_layernorm is not None and self.has_residual:
                     _fused = _ctx.ag_norm_res(out_shard, 1, self.post_layernorm.weight,
                                               residual, self.post_layernorm.variance_epsilon)

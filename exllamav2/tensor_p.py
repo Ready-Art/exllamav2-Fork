@@ -311,6 +311,12 @@ class TPContext:
         B = len(kv_lens)
         pages_valid = [(l + page - 1) // page for l in kv_lens]
         total = sum(pages_valid)
+        # Indices address the FULL page view (row_map[b]*npages + page), so their valid
+        # range is (max physical row + 1)*npages -- NOT the B*npages entry count. The
+        # fi-guard bounds check uses this (subset batches using the last slot otherwise
+        # false-positive as corruption).
+        _rm = row_map if row_map is not None else list(range(B))
+        entry["pages_bound"] = (max(_rm) + 1) * npages
         idx_host = torch.empty(total, dtype = torch.int32)
         ip = [0]
         o = 0
@@ -729,9 +735,10 @@ class TPContext:
                     bad.append((kind, key, "last_page_len", lpl.data_ptr(), lp, "1..128"))
                 if ok_ip and ip[-1] > 0:
                     iv = idx[:ip[-1]].cpu()
-                    if int(iv.min()) < 0 or int(iv.max()) >= idx.numel():
+                    bound = entry.get("pages_bound", idx.numel())
+                    if int(iv.min()) < 0 or int(iv.max()) >= bound:
                         bad.append((kind, key, "indices", idx.data_ptr(),
-                                    [int(iv.min()), int(iv.max())], f"0..{idx.numel() - 1}"))
+                                    [int(iv.min()), int(iv.max())], f"0..{bound - 1}"))
         ws_bad = []
         for wkey, canary in attn_backend.FlashInferPaged._workspace_canary.items():
             tail = canary[:1024].cpu()

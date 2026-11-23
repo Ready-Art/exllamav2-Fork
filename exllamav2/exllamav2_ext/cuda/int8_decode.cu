@@ -27,10 +27,11 @@ int8_decode_kernel
 )
 {
     constexpr int DPL = HD / 32;
-    const int kv_len = *kv_len_dev;
     const int h = blockIdx.x;
     const int split = blockIdx.y;
     const int b = blockIdx.z;
+    // Per-row kv_lens: scalar (1,) for single-row decode, (batch,) for batched rounds.
+    const int kv_len = kv_len_dev[b];
     const int lane = threadIdx.x;
     const int d0 = lane * DPL;
     const int kvh = h / (num_qo_heads / num_kv_heads);

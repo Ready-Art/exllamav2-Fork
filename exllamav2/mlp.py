@@ -489,7 +489,8 @@ class ExLlamaV2MLP(ExLlamaV2Module):
         # apply awq+Hadamard ONCE instead of per-GEMM (mirrors attn.py q/k/v sharing).
         _pn_in = post_norm
         _pre_tf = False
-        if isinstance(post_norm, torch.Tensor) and post_norm.dtype == torch.half:
+        if isinstance(post_norm, torch.Tensor) and post_norm.dtype == torch.half \
+                and os.environ.get("EXL2_X25_SHARE", "1") != "0":
             _gh = getattr(self.gate_proj, "_exl25_had", 0)
             _ga = getattr(self.gate_proj, "_exl25_awq", None)
             _uh = getattr(self.up_proj, "_exl25_had", 0)
@@ -548,7 +549,8 @@ class ExLlamaV2MLP(ExLlamaV2Module):
             down = self.down_proj.forward_tp(outputs, output_split = True)
             # Fused AG+post-norm+residual (EXL2_TP_FUSE_AGNR=1), mirrors attn.py.
             _fused = None
-            if fuse_agnr_enabled((past_len or 0) + q_len) \
+            _kv_for_fuse = (max(past_len) if isinstance(past_len, (list, tuple)) else (past_len or 0)) + q_len
+            if fuse_agnr_enabled(_kv_for_fuse) \
                     and self.post_layernorm is not None and self.has_residual:
                 _fused = ctx.ag_norm_res(down[0], 3, self.post_layernorm.weight,
                                          residual, self.post_layernorm.variance_epsilon)
