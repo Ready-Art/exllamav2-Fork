@@ -673,6 +673,14 @@ class ExLlamaV2Linear(ExLlamaV2Module):
             if "bias" in self.q_tensors:
                 w["bias"] = safe_move_tensor(self.q_tensors["bias"][a:b], idx).contiguous()
 
+            # EXL2.5: the AWQ scale is a raw device pointer inside the QMatrix -- the exact
+            # tensor passed to make_q_matrix_split must stay alive for the handle's lifetime.
+            # Store it in the shard dict (which becomes self.q_tensors); a temporary here
+            # would be freed on return and the kernel would read recycled memory (gibberish).
+            _exl25_args = _exl25_bind_args(self.q_tensors)
+            if _exl25_args[0].numel() > 1:
+                w["q_awq_scale"] = safe_move_tensor(_exl25_args[0], idx).contiguous()
+
             new_q_tensors.append(w)
 
             device_context = self.model.get_device_context(idx)
@@ -695,7 +703,7 @@ class ExLlamaV2Linear(ExLlamaV2Module):
                     w.get("bias", none_tensor),
                     new_temp_dq[-1],
                     max_dq_rows,
-                    *_exl25_bind_args(self.q_tensors)
+                    w.get("q_awq_scale", none_tensor), *_exl25_args[1:]
                 )
             )
 
@@ -821,6 +829,9 @@ class ExLlamaV2Linear(ExLlamaV2Module):
         _exl25_args = _exl25_bind_args(w)
         if _exl25_args[0].numel() > 1:
             _exl25_args = (safe_move_tensor(_exl25_args[0], rank), *_exl25_args[1:])
+            # Keep the exact tensor the kernel points at alive in self.q_tensors (below);
+            # otherwise it is freed on return and the GEMM reads recycled memory.
+            shard["q_awq_scale"] = _exl25_args[0]
 
         # Free the host copy before moving the shard.
         del w
@@ -1042,6 +1053,9 @@ class ExLlamaV2Linear(ExLlamaV2Module):
         _exl25_args = _exl25_bind_args(w, a, b)
         if _exl25_args[0].numel() > 1:
             _exl25_args = (safe_move_tensor(_exl25_args[0], rank), *_exl25_args[1:])
+            # Keep the exact tensor the kernel points at alive in self.q_tensors (below);
+            # otherwise it is freed on return and the GEMM reads recycled memory.
+            shard["q_awq_scale"] = _exl25_args[0]
 
         del w
 
@@ -1206,7 +1220,10 @@ class ExLlamaV2Linear(ExLlamaV2Module):
         assert self.q_handle is not None, "Can only replicate a quantized tensor."
 
         for k in ("q_scale", "q_scale_max", "q_group_map", "q_groups", "q_weight",
-                  "q_perm", "q_invperm", "bias"):
+                  "q_perm", "q_invperm", "bias",
+                  # EXL2.5: the AWQ scale must follow the weights to this device (the
+                  # QMatrix stores a raw pointer); tags ride along for the bind args.
+                  "q_awq_scale", "q_uniform_bits", "q_group_size", "q_hadamard"):
             if k in self.q_tensors:
                 self.q_tensors[k] = safe_move_tensor(self.q_tensors[k], device_idx)
 
@@ -1333,6 +1350,12 @@ class ExLlamaV2Linear(ExLlamaV2Module):
             if "bias" in self.q_tensors:
                 w["bias"] = safe_move_tensor(self.q_tensors["bias"], idx).contiguous()
 
+            # EXL2.5: keep the exact AWQ slice passed to the kernel alive in the shard dict
+            # (raw device pointer in the QMatrix; a temporary would be freed on return).
+            _exl25_args = _exl25_bind_args(self.q_tensors, a, b)
+            if _exl25_args[0].numel() > 1:
+                w["q_awq_scale"] = safe_move_tensor(_exl25_args[0], idx).contiguous()
+
             new_q_tensors.append(w)
 
             device_context = self.model.get_device_context(idx)
@@ -1355,7 +1378,7 @@ class ExLlamaV2Linear(ExLlamaV2Module):
                     w.get("bias", none_tensor),
                     new_temp_dq[-1],
                     max_dq_rows,
-                    *_exl25_bind_args(self.q_tensors, a, b)
+                    w.get("q_awq_scale", none_tensor), *_exl25_args[1:]
                 )
             )
 

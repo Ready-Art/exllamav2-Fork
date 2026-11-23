@@ -323,12 +323,18 @@ A/B, speed A/B vs legacy, CUDA-graph capture/replay), `mtp/exl25_moe_test.py` (f
   run **slower than legacy** (fp32 dot partials + register pressure; the 16-row one-pass design
   is in place, occupancy/numerics tuning is the next lever). Hadamard/AWQ add an in-kernel
   butterfly cost on top (quality feature).
+- **TP loader fix (user-confirmed 2026-11-23):** the tensor-parallel loaders stored the AWQ
+  scale only in a local variable while the QMatrix kept a raw device pointer to it — the
+  scale was freed on return and the GEMMs read recycled memory (gibberish, zero MTP
+  acceptance on the MP backend). All five TP construction paths now retain the exact scale
+  tensor for the handle's lifetime. A freshly converted checkpoint runs **coherent on
+  MP + MTP** after this fix.
 - **First checkpoint invalid:** the first EXL2.5 conversion was interrupted by a converter bug
   and resumed; its calibration trajectory was corrupted (composed perplexity ~1e18 while every
   per-module check stayed small), so its weights were rounded against garbage activations.
-  Re-convert with a **fresh work dir** using the fixed converter. Real-model perplexity /
-  MTP-acceptance numbers and the server A/B vs EXL2-6.0 are pending that re-conversion.
-  EXL2.5 is opt-in per tensor; existing EXL2 models and the legacy kernel are untouched.
+  Always convert with a **fresh work dir** using the fixed converter. Throughput A/B numbers
+  vs EXL2-6.0 are still being measured. EXL2.5 is opt-in per tensor; existing EXL2 models and
+  the legacy kernel are untouched.
 
 ---
 
