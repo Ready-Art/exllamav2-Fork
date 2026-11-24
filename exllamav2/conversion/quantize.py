@@ -15,6 +15,8 @@ from exllamav2.model import \
 from safetensors import safe_open
 from safetensors.torch import save_file
 from exllamav2.layer_scalar import ExLlamaV2LayerScalar
+from exllamav2.qwen4_exp import ExLlamaV2HyperConnection, ExLlamaV2PLELayer
+from exllamav2.gemma4_moe import ExLlamaV2Gemma4MoEBlock
 from exllamav2.conversion.qparams import QParams, qparams_headoptions, qparams_attn, qparams_mlp, get_qparams_reduced
 from exllamav2.conversion.adaptivegptq import AdaptiveGPTQ
 import torch
@@ -558,6 +560,13 @@ def quant(job, save_fn, model):
             quantizers["up_proj"] = mk_q(module.up_proj.linear)
             quantizers["down_proj"] = mk_q(module.down_proj.linear)
 
+        elif isinstance(module, ExLlamaV2Gemma4MoEBlock):
+            mode = "block_sparse_moe"
+            for i in range(model.config.num_experts):
+                quantizers[f"w1.{i}"] = mk_q(module.w1[i].linear)
+                quantizers[f"w3.{i}"] = mk_q(module.w3[i].linear)
+                quantizers[f"w2.{i}"] = mk_q(module.w2[i].linear)
+
         elif isinstance(module, ExLlamaV2MoEMLP):
             mode = "block_sparse_moe"
             for i in range(model.config.num_experts):
@@ -585,6 +594,12 @@ def quant(job, save_fn, model):
 
         elif isinstance(module, ExLlamaV2PosEmbedding):
             mode = "pos_emb"
+
+        elif isinstance(module, ExLlamaV2HyperConnection):
+            mode = "hc"
+
+        elif isinstance(module, ExLlamaV2PLELayer):
+            mode = "ple"
 
         elif isinstance(module, ExLlamaV2ParallelDecoder):
             mode = "parallel_decoder"
@@ -618,7 +633,10 @@ def quant(job, save_fn, model):
         for i in range(len(hidden_states)):
 
             x = hidden_states[i].to(module_dev)
-            outputs = module.forward(x, cache, attn_params, intermediates = True)
+            if mode == "ple":
+                outputs = { "hidden_states": x }
+            else:
+                outputs = module.forward(x, cache, attn_params, intermediates = True)
 
             # Hessians
 
@@ -664,6 +682,15 @@ def quant(job, save_fn, model):
                 ue = uncalibrated_experts[j]
                 if ue > len(hidden_states) * 0.20:
                     print(f" !! Warning: w2.{j} has less than 10% calibration for {ue}/{len(hidden_states)} rows")
+
+        # fp16 pass-through modules (hyper-connections, PLE): nothing to quantize;
+        # compile.py copies the raw weights. Propagate the reference forward states.
+        if mode in ("hc", "ple"):
+            hidden_states = target_states
+            module.unload()
+            gc.collect()
+            torch.cuda.empty_cache()
+            continue
 
         # Conversion
 

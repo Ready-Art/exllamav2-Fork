@@ -12,6 +12,13 @@ from exllamav2.model import \
     ExLlamaV2LayerNorm
 )
 from exllamav2.layer_scalar import ExLlamaV2LayerScalar
+from exllamav2.qwen4_exp import (
+    ExLlamaV2HyperConnection,
+    ExLlamaV2QSAAttention,
+    ExLlamaV2Qwen4MoE,
+    ExLlamaV2PLELayer,
+)
+from exllamav2.gemma4_moe import ExLlamaV2Gemma4MoEBlock
 
 from exllamav2.version import __version__
 
@@ -124,10 +131,22 @@ def compile_model(job, save_fn, model):
                 d = get_f_module(job, module.v_norm)
                 if d: out_dict.update(d); current_size += _dsize(d)
 
+                # QSA indexer (Qwen4-Exp): fp16 pass-through, checkpoint layout.
+                if isinstance(module, ExLlamaV2QSAAttention):
+                    module.load()
+                    ik = module.key + ".self_attn.indexer"
+                    raw = {
+                        ik + ".index_qk_proj.weight": module.index_qk_w.half(),
+                        ik + ".q_layernorm.weight": module.index_q_norm_w.half(),
+                        ik + ".k_layernorm.weight": module.index_k_norm_w.half(),
+                    }
+                    out_dict.update(raw); current_size += _dsize(raw)
+
             if isinstance(module, ExLlamaV2GatedDeltaNet):
 
                 # Qwen3.5 gated delta net (newplan.md P6). q/k/v/z/out quantized;
                 # b/a fp16; conv1d/A_log/dt_bias/norm copied in checkpoint layout.
+                module.load()
                 d = get_f_module(job, module.pre_layernorm)
                 if d: out_dict.update(d); current_size += _dsize(d)
                 for proj in (module.in_proj_q, module.in_proj_k, module.in_proj_v,
@@ -158,12 +177,70 @@ def compile_model(job, save_fn, model):
 
             if isinstance(module, ExLlamaV2MoEMLP):
 
-                d = get_f_module(job, module.post_attention_layernorm); out_dict.update(d); current_size += _dsize(d)
+                d = get_f_module(job, module.post_attention_layernorm)
+                if d: out_dict.update(d); current_size += _dsize(d)
                 d = get_f_module(job, module.gate); out_dict.update(d); current_size += _dsize(d)
                 for i in range(model.config.num_experts):
                     d = get_q_module(job, module.w1[i]); out_dict.update(d); current_size += _dsize(d)
                     d = get_q_module(job, module.w3[i]); out_dict.update(d); current_size += _dsize(d)
                     d = get_q_module(job, module.w2[i]); out_dict.update(d); current_size += _dsize(d)
+
+                # Qwen4-Exp shared expert + sigmoid gate: fp16 pass-through.
+                if isinstance(module, ExLlamaV2Qwen4MoE):
+                    for m in (module.shared_w1, module.shared_w2, module.shared_w3, module.shared_gate):
+                        d = get_f_module(job, m)
+                        if d: out_dict.update(d); current_size += _dsize(d)
+
+            if isinstance(module, ExLlamaV2Gemma4MoEBlock):
+
+                # Dense branch + router + norms: fp16 pass-through.
+                for m in (module.dense.pre_layernorm, module.dense.post_layernorm,
+                          module.dense.gate_proj, module.dense.up_proj, module.dense.down_proj,
+                          module.pre_ffn_2, module.post_ffn_2, module.post_ffn,
+                          module.router_proj):
+                    d = get_f_module(job, m)
+                    if d: out_dict.update(d); current_size += _dsize(d)
+                module.load()
+                raw = {
+                    module.key + ".router.scale": module.router_scale.half(),
+                    module.key + ".router.per_expert_scale": module.per_expert_scale.half(),
+                }
+                out_dict.update(raw); current_size += _dsize(raw)
+                for i in range(model.config.num_experts):
+                    d = get_q_module(job, module.w1[i]); out_dict.update(d); current_size += _dsize(d)
+                    d = get_q_module(job, module.w3[i]); out_dict.update(d); current_size += _dsize(d)
+                    d = get_q_module(job, module.w2[i]); out_dict.update(d); current_size += _dsize(d)
+
+            if isinstance(module, ExLlamaV2HyperConnection):
+
+                # Hyper-connection weights: fp16 pass-through in checkpoint layout.
+                if module.mode != "expand":
+                    module.load()
+                    raw = {
+                        module.key + ".hc_norm.weight": module.hc_norm_w.half(),
+                        module.key + ".input_mix_weight_down.weight": module.down_w.half(),
+                        module.key + ".input_mix_weight_up.weight": module.up_w.half(),
+                    }
+                    if module.mode == "mix":
+                        raw[module.key + ".block_inject_weight.weight"] = module.inject_w.half()
+                    out_dict.update(raw); current_size += _dsize(raw)
+
+            if isinstance(module, ExLlamaV2PLELayer):
+
+                # PLE projections/norms/conv: fp16 pass-through. The n-gram table
+                # itself is converted separately (convert_ngram.py) and never
+                # passes through the quantizer.
+                module.load_raw()
+                pk = module.key
+                raw = {
+                    pk + ".key_proj.weight": module.key_proj_w.half(),
+                    pk + ".value_proj.weight": module.value_proj_w.half(),
+                    pk + ".norm_key.weight": module.norm_key_w.half(),
+                    pk + ".norm_query.weight": module.norm_query_w.half(),
+                    pk + ".norm_conv.weight": module.norm_conv_w.half(),
+                    pk + ".conv1d.weight": module.conv1d_w.view(module.hc_hidden, 1, module.conv_kernel).half(),
+                }
+                out_dict.update(raw); current_size += _dsize(raw)
 
             if isinstance(module, ExLlamaV2ParallelDecoder):
 

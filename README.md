@@ -28,9 +28,14 @@ Licensed under the same MIT license as upstream; all original credit to
 
 - **Model compatibility:** built and tested end-to-end on
   **[Gemma-4-31B-IT](https://huggingface.co/ReadyArt/Gemma-4-31B-IT-EXL2-6.0BPW-HB16)** only.
-  **[Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)** (hybrid gated-delta-net backbone) is
-  implemented but **experimental and not yet rig-validated**. Other EXL2 models *should* work;
-  other architectures are untested here — verify correctness yourself.
+  **[Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)** (hybrid gated-delta-net backbone),
+  **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** (hybrid GDN + QSA
+  indexed attention + 512-expert MoE + hyper-connections + PLE n-grams + built-in MTP) and
+  **[Gemma-4-26B-A4B-it](https://huggingface.co/google/gemma-4-26B-A4B-it)** (Gemma-4 with a
+  parallel 128-expert MoE block) are implemented and **synthetic-parity verified** (HF reference
+  logits / block math / MP fork-vs-fork), but **not yet validated on real quantized checkpoints
+  on the rig** — treat them as experimental. Other EXL2 models *should* work; other architectures
+  are untested here — verify correctness yourself.
 - **Hardware:** built and tested on **SM86 (Ampere — RTX 3090)** only. The kernel build targets
   `TORCH_CUDA_ARCH_LIST="8.6"`. Other architectures may work but are untested.
 - **Primary path:** the majority of development and optimization goes into
@@ -111,6 +116,9 @@ MTP drafter (939 MB): [google/gemma-4-31B-it-assistant](https://huggingface.co/g
 | **EXL2.5 quantization format** | Per-tensor opt-in upgrades: uniform-bit fast-path GEMM (Ampere-optimized, 16-row cap), Hadamard incoherence + AWQ channel protection for lower quant error at the same bpw. Plain EXL2 models run unchanged. See [EXL2.5](#exl25-quantization-format). |
 | **Gemma-4-31B-IT support** | Text-only. Two attention geometries (head_dim 256 sliding / 512 full), `k_eq_v` layers, proportional RoPE, per-layer norms. |
 | **Qwen3.8-27B support (experimental)** | Text-only hybrid backbone: gated delta net (linear attention) + output-gated full attention, built-in MTP drafter, TP/MP. Not yet rig-validated. See [Experimental features](#experimental-features). |
+| **Qwen3.8-Flash-Next support (experimental)** | Text-only `qwen4_exp`: 4-stream hyper-connections, gated delta net + QSA indexed sparse attention (top-512 blocks), 512-expert MoE + sigmoid shared expert, PLE hashed n-gram embeddings (engram disk/RAM/hybrid storage), built-in MTP. MP: GDN shards by value heads, attention/PLE/HC replicated, MoE replicate/shard/offload. Synthetic-parity verified; real-checkpoint validation pending. |
+| **Gemma-4-26B-A4B support (experimental)** | Gemma-4 attention (SWA hd256 / full hd512 `k_eq_v`) plus a parallel per-layer MoE block: 128 experts top-8 with scale/per-expert-scale router, dense MLP branch, fused-3D expert quantization. MP: low-KV-head layers replicate, MoE replicate/shard/offload. Synthetic block-math parity cos 1.0; real-checkpoint validation pending. |
+| **Built-in MTP on MP** | The built-in drafters (Qwen3.5/3.8 and Flash-Next) run on the MP path through `BuiltinMTPMPAdapter`: own draft KV on the master rank, target GDN/PLE verify state staged and restored by the distributed rewind. Greedy chain; sampled acceptance resamples from verified target logits. Single-sequence (`max_batch_size 1`). |
 | **Sliding-window + TP KV cache** | Ring buffers for sliding layers make long context fit (≈22.5 GB instead of ≈236 GB at 256k for Gemma-4-31B). |
 | **TP CUDA graphs** | Whole-step decode/verify graphs remove per-op launch latency on the tensor-parallel path. |
 | **FlashInfer attention** | head_dim 512 on every path on sm86 — paged decode (incl. CUDA-graph mode), single-token decode, prefill. |

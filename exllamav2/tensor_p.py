@@ -178,8 +178,14 @@ class TPContext:
 
         assert cfg.arch.lm.supports_tp, \
             f"Tensor-parallel is not supported for {cfg.arch.arch_string}"
-        assert cfg.intermediate_size % 128 == 0, \
-            "Model intermediate size must be divisible by 128"
+        # The %128 granularity is required by the dense-MLP column split. The new
+        # MoE backbones run their MLP/expert blocks replicated (or shard experts
+        # per-head-group), so the dense intermediate size need not be %128 there
+        # (Gemma-4-26B dense 2112, expert 704; Qwen4-Exp expert 640).
+        if not getattr(cfg.arch.lm, "gemma4_moe_block", False) and \
+                not getattr(cfg.arch.lm, "hc_residual", False):
+            assert cfg.intermediate_size % 128 == 0, \
+                "Model intermediate size must be divisible by 128"
 
         self.kv_split = None
         self.kv_split_devs = None

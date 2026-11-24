@@ -750,6 +750,22 @@ class ExLlamaV2ArchParams:
                 layer_keys_gemma2_norms + \
                 layer_keys_llama_attn + \
                 layer_keys_llama_mlp
+            # Gemma-4-26B-A4B: every layer carries a parallel MoE block alongside
+            # the dense MLP (enable_moe_block). Fused 3D expert tensors + router
+            # with scale/per_expert_scale + the branch's own pre/post norms.
+            _g4_moe = (read_config.get("text_config", read_config) or {}).get("enable_moe_block", False)
+            if _g4_moe:
+                self.lm.is_moe = True
+                self.lm.gemma4_moe_block = True
+                self.lm.layer_keys += \
+                    [["experts.gate_up_proj", "experts.0.gate_proj", "experts.0.up_proj"],
+                     ["experts.down_proj", "experts.0.down_proj"],
+                     ["router.proj"],
+                     ["router.scale"],
+                     ["router.per_expert_scale"],
+                     ["pre_feedforward_layernorm_2"],
+                     ["post_feedforward_layernorm_1"],
+                     ["post_feedforward_layernorm_2"]]
             self.lm.expect_keys += \
                 expect_keys_gemma4
             self.lm.keys.update({
@@ -827,13 +843,16 @@ class ExLlamaV2ArchParams:
         # only the first head_dim * partial_rotary_factor dims (64 of 256), NEOX, theta 1e7.
         # Attention output gate: sigmoid. Delta-net gated norm: silu (output_gate_type swish).
         #
-        # TP/MP for the hybrid backbone is a follow-up; single-GPU / autosplit first.
+        # MP rank-local TP: GDN shards by value heads, the gated attention/MLP use the
+        # standard TP paths (layers with fewer KV heads than ranks replicate). Built-in
+        # MTP runs on MP through BuiltinMTPMPAdapter. Single-process TP is not wired.
 
         if arch_string in ("Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM"):
             arch_recognized = True
             self.lm.hybrid_linear_attn = True
             self.lm.attn_output_gate = True
             self.lm.builtin_mtp = True
+            self.lm.supports_tp = True
 
             self.lm.layer_keys += \
                 layer_keys_llama_norms + \
@@ -882,6 +901,123 @@ class ExLlamaV2ArchParams:
             self.compile_fix_keymap = google_keymap
 
             self.mtp_prefix = "mtp."
+
+        # Qwen3.8-Flash-Next (Qwen/Qwen3.8-Flash-Next). P7.
+        #
+        # qwen4_exp: 48-layer hybrid GDN/full-attention backbone like Qwen3.5, but with
+        # hyper-connections (4-stream residual, lowrank mix / sigmoid inject), a QSA
+        # indexer on the 12 full-attention layers (top-512 blocks of 4 tokens), MoE on
+        # EVERY layer (512 routed experts top-10 + 1 sigmoid-gated shared expert, fused
+        # 3D expert tensors), and PLE hashed n-gram embeddings at layer index 1. There
+        # is NO final model norm: the global hyper_connection_mixer collapses the stream
+        # for the untied top-level lm_head. Built-in 1-layer MTP (mtp.*) with its own
+        # MoE + indexer + hyper-connections. Vision tower skipped (text-only).
+        #
+        # Norms are zero-centered (1+w); the GDN gated-norm activation is SIGMOID
+        # (output_gate_type), unlike Qwen3.5's silu. Attention output gate: sigmoid.
+        # Partial NEOX rope 64/256, theta 1e7. mrope is text-degenerate (all three
+        # position grids identical) -> ordinary partial rope.
+
+        if arch_string in ("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM"):
+            arch_recognized = True
+            self.lm.hybrid_linear_attn = True
+            self.lm.attn_output_gate = True
+            self.lm.builtin_mtp = True
+            self.lm.hc_residual = True
+            self.lm.is_moe = True
+            self.lm.qsa_indexer = True
+            self.lm.ple_ngram = True
+
+            # Full-attention layer key set (check_keys uses layer_keys for full
+            # layers and linear_layer_keys for linear-attention layers).
+            # Source checkpoints store fused 3D expert tensors; the compiled EXL2
+            # model stores per-expert virtual keys. Accept either (expert 0 as the
+            # representative).
+            _q4_moe_keys = \
+                [["mlp.experts.gate_up_proj", "mlp.experts.0.gate_proj", "mlp.experts.0.up_proj"],
+                 ["mlp.experts.down_proj", "mlp.experts.0.down_proj"],
+                 ["mlp.gate"],
+                 ["mlp.shared_expert.gate_proj"],
+                 ["mlp.shared_expert.up_proj"],
+                 ["mlp.shared_expert.down_proj"],
+                 ["mlp.shared_expert_gate"]]
+            _q4_hc_keys = \
+                [["attn_hyper_connection.hc_norm"],
+                 ["attn_hyper_connection.input_mix_weight_down"],
+                 ["attn_hyper_connection.input_mix_weight_up"],
+                 ["attn_hyper_connection.block_inject_weight"],
+                 ["mlp_hyper_connection.hc_norm"],
+                 ["mlp_hyper_connection.input_mix_weight_down"],
+                 ["mlp_hyper_connection.input_mix_weight_up"],
+                 ["mlp_hyper_connection.block_inject_weight"]]
+            self.lm.layer_keys += \
+                layer_keys_llama_attn + \
+                [["self_attn.q_norm"], ["self_attn.k_norm"],
+                 ["self_attn.indexer.index_qk_proj"],
+                 ["self_attn.indexer.q_layernorm"],
+                 ["self_attn.indexer.k_layernorm"]] + \
+                _q4_moe_keys + _q4_hc_keys
+            self.lm.linear_layer_keys += \
+                [["linear_attn.in_proj_qkv"],
+                 ["linear_attn.in_proj_z"],
+                 ["linear_attn.in_proj_b"],
+                 ["linear_attn.in_proj_a"],
+                 ["linear_attn.out_proj"],
+                 ["linear_attn.conv1d"],
+                 ["linear_attn.A_log"],
+                 ["linear_attn.dt_bias"],
+                 ["linear_attn.norm"]] + \
+                _q4_moe_keys + _q4_hc_keys
+            # PLE lives on one layer only (ple_layer_ids); the global mixer is
+            # validated here, the PLE tensors are asserted by the module loader.
+            self.lm.expect_keys += \
+                [["embed_tokens"], ["lm_head"],
+                 ["hyper_connection_mixer.hc_norm"],
+                 ["hyper_connection_mixer.input_mix_weight_down"],
+                 ["hyper_connection_mixer.input_mix_weight_up"]]
+
+            if arch_string == "Qwen4ExpForConditionalGeneration":
+                self.lm_prefix = "model.language_model."
+            else:
+                self.lm_prefix = "model."
+            self.lm.layers_root = "layers"
+            self.lm.embed_key = "embed_tokens"
+            # No final norm: the global hyper-connection mixer is the output norm.
+            self.lm.norm_key = None
+
+            self.lm.norm = "rmsnorm"
+            self.lm.headnorm = "rmsnorm"
+            self.lm.norm_constant_bias = 1
+            self.lm.headnorm_constant_bias = 1
+            self.lm.default_use_qk_norm = True
+            self.lm.default_rms_norm_eps = 1e-06
+            self.lm.default_rope_theta = 1e7
+            self.lm.mlp_act_func = "silu"
+            self.lm.mlp_gate = True
+            self.lm.rope_style = RopeStyle.NEOX
+
+            self.lm.keys.update({
+                "norm_1": None,
+                "norm_2": None,
+                "mlp_gate": ".mlp.experts.*.gate_proj",
+                "mlp_up": ".mlp.experts.*.up_proj",
+                "mlp_down": ".mlp.experts.*.down_proj",
+                "mlp_expert_gate": ".mlp.gate",
+            })
+
+            # MP rank-local TP: the hyper-stream must stay full-width on every rank
+            # (the mix reads all 4 streams), so seqpar is disabled for this arch.
+            # Attention (2 KV heads) runs replicated on every rank; GDN shards by
+            # value heads and the MoE shards/offloads through the usual paths.
+            self.lm.supports_tp = True
+            self.lm.tp_no_seqpar = True
+            self.lm.tp_kv_replicate = True
+
+            self.keymap = google_keymap
+            self.compile_fix_keymap = google_keymap
+
+            self.mtp_prefix = "mtp."
+            self.vt_prefix = "model.visual."
 
         # StarCoder2
 

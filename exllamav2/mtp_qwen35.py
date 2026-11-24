@@ -71,6 +71,37 @@ class Qwen35MTPDrafter:
         self.weights = {}
         self._load_weights()
 
+        # The MTP driver pipes the target's PRE-final-norm hidden state
+        # (extract_state_indices taps the norm module's input). HF's MTP fusion
+        # consumes the POST-norm hidden, so apply the target's final norm here.
+        self.target_norm_w = None
+        nk = getattr(self.cfg.arch.lm, "norm_key", "norm")
+        if nk:
+            tn_key = self.cfg.arch.lm_prefix + nk + ".weight"
+            fn = self.cfg.tensor_file_map.get(tn_key)
+            if fn is not None:
+                st = STFile.open(fn, keymap=self.cfg.arch.keymap)
+                self.target_norm_w = st.get_tensor(tn_key, device=self.device).half()
+
+        # On MP the master's embedding/lm_head are VOCAB-SHARDED; the drafter
+        # runs on the master alone (workers idle), so it needs full tables.
+        self._full_embed = None
+        self._full_head = None
+        emb_mod = self.model.modules[0]
+        if getattr(emb_mod, "_tp_vocab_shard", None) is not None:
+            key = self.cfg.arch.lm_prefix + getattr(self.cfg.arch.lm, "embed_key", "embed_tokens") + ".weight"
+            fn = self.cfg.tensor_file_map.get(key)
+            if fn is not None:
+                st = STFile.open(fn, keymap=self.cfg.arch.keymap)
+                self._full_embed = st.get_tensor(key, device=self.device).half()
+        head = self.model.modules[self.model.head_layer_idx]
+        if getattr(head, "_tp_vocab_parallel", False):
+            key = self.cfg.arch.lm_prefix + "lm_head.weight"
+            fn = self.cfg.tensor_file_map.get(key)
+            if fn is not None:
+                st = STFile.open(fn, keymap=self.cfg.arch.keymap)
+                self._full_head = st.get_tensor(key, device=self.device).half()
+
         # Own K/V cache for the single MTP attention layer.
         self.k_cache = torch.zeros((1, self.max_seq_len, self.nkv, self.hd), dtype=torch.half, device=self.device)
         self.v_cache = torch.zeros((1, self.max_seq_len, self.nkv, self.hd), dtype=torch.half, device=self.device)
@@ -125,6 +156,8 @@ class Qwen35MTPDrafter:
     # ------------------------------------------------------------- embeddings
 
     def _embed(self, ids: torch.Tensor) -> torch.Tensor:
+        if getattr(self, "_full_embed", None) is not None:
+            return F.embedding(ids.to(self._full_embed.device), self._full_embed).to(self.device)
         emb_mod = self.model.modules[0]
         w = emb_mod.get_weight() if hasattr(emb_mod, "get_weight") else emb_mod.weight
         if isinstance(w, tuple):
@@ -132,6 +165,8 @@ class Qwen35MTPDrafter:
         return F.embedding(ids.to(w.device), w).to(self.device)
 
     def _head_logits(self, h: torch.Tensor) -> torch.Tensor:
+        if getattr(self, "_full_head", None) is not None:
+            return F.linear(h.to(self._full_head.device), self._full_head).to(self.device)
         head = self.model.modules[self.model.head_layer_idx]
         if head.q_handle is not None:
             # Quantized head: run through the module on its device.
@@ -206,6 +241,12 @@ class Qwen35MTPDrafter:
     def _norm_out(self, h: torch.Tensor) -> torch.Tensor:
         return _rms_norm(h, self._w("mtp.norm.weight"), self.eps)
 
+    def _target_hidden(self, h: torch.Tensor) -> torch.Tensor:
+        # The driver pipes fp32 states; the drafter is fp16.
+        if self.target_norm_w is not None:
+            return _rms_norm(h, self.target_norm_w, self.eps).half()
+        return h.half()
+
     def _step(self, tok: torch.Tensor, h: torch.Tensor, position: int) -> tuple[torch.Tensor, torch.Tensor]:
         """
         One drafter step. tok (B, 1) ids, h (B, 1, H) post-norm hidden, absolute
@@ -240,7 +281,7 @@ class Qwen35MTPDrafter:
         for s in range(0, L, chunk):
             e = min(s + chunk, L)
             tok = ids[:, s:e].to(self.device)
-            h = target_states[:, s:e].to(self.device)
+            h = self._target_hidden(target_states[:, s:e].to(self.device))
             emb = self._embed(tok)
             en = _rms_norm(emb, self._w("mtp.pre_fc_norm_embedding.weight"), self.eps)
             hn = _rms_norm(h, self._w("mtp.pre_fc_norm_hidden.weight"), self.eps)
@@ -261,7 +302,7 @@ class Qwen35MTPDrafter:
         """
         kv_save = self.kv_len
         tok = base_tok.to(self.device)
-        h = base_state.to(self.device)
+        h = self._target_hidden(base_state.to(self.device))
         drafts = []
         # The first draft token occupies `pos`; its MTP input is the base token at
         # pos-1. Each step processes its input at p and predicts the token at p+1.
@@ -285,7 +326,7 @@ class Qwen35MTPDrafter:
         if n == 0:
             return
         tok = ids.to(self.device)
-        h = target_states.to(self.device)
+        h = self._target_hidden(target_states.to(self.device))
         emb = self._embed(tok)
         en = _rms_norm(emb, self._w("mtp.pre_fc_norm_embedding.weight"), self.eps)
         hn = _rms_norm(h, self._w("mtp.pre_fc_norm_hidden.weight"), self.eps)

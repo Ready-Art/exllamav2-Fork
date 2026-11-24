@@ -36,7 +36,11 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
         model: ExLlamaV2,
         key: str,
         layer_idx: int,
-        archparams = None
+        archparams = None,
+        has_norm: bool = True,
+        has_residual: bool = True,
+        fused_gate_up_key: str | None = None,
+        fused_down_key: str | None = None
     ):
         super().__init__(model, key, archparams)
 
@@ -45,6 +49,11 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
         km = self.archparams.keys
 
         self.layer_idx = layer_idx
+
+        # Qwen4-Exp (Flash-Next): the hyper-connection mix supplies the normed input
+        # and the inject module owns the residual add; the MoE block itself has neither.
+        self.has_norm = has_norm
+        self.has_residual = has_residual
 
         self.q_handle = None
         self.temp_lora_size = 0
@@ -70,10 +79,12 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
         # open parity bug (see README), so sharded output is not yet verified coherent.
         self._tp_shard = os.environ.get("EXL2_MOE_TP_SHARD", "0") != "0"
 
-        if ap.norm == "layernorm":
-            self.post_attention_layernorm = ExLlamaV2LayerNorm(model, key + km["norm_2"])
-        elif ap.norm == "rmsnorm":
-            self.post_attention_layernorm = ExLlamaV2RMSNorm(model, key + km["norm_2"])
+        self.post_attention_layernorm = None
+        if has_norm:
+            if ap.norm == "layernorm":
+                self.post_attention_layernorm = ExLlamaV2LayerNorm(model, key + km["norm_2"])
+            elif ap.norm == "rmsnorm":
+                self.post_attention_layernorm = ExLlamaV2RMSNorm(model, key + km["norm_2"])
 
         w1_key = key + km["mlp_gate"]
         w2_key = key + km["mlp_down"]
@@ -95,20 +106,29 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
             # ad = bd
             bu += intermediate_size
             # bd += hidden_size
-            w1 = ExLlamaV2Linear(model, w1_key.replace("*", str(e)), hidden_size, intermediate_size, ap.mlp_bias, f_key = w1_f_key, f_beg = au, f_end = bu)
-            w2 = ExLlamaV2Linear(model, w2_key.replace("*", str(e)), intermediate_size, hidden_size, ap.mlp_bias, f_key = w2_f_key, f_beg = au, f_end = bu)
-            w3 = ExLlamaV2Linear(model, w3_key.replace("*", str(e)), hidden_size, intermediate_size, ap.mlp_bias, f_key = w3_f_key, f_beg = au, f_end = bu)
+            if fused_gate_up_key is not None:
+                # Fused 3D checkpoint layout (Qwen4-Exp / Gemma-4 MoE):
+                # gate_up_proj (E, 2I, H) -- gate rows [e*2I, e*2I+I), up rows
+                # [e*2I+I, (e+1)*2I); down_proj (E, H, I) -- rows [e*H, (e+1)*H).
+                w1 = ExLlamaV2Linear(model, w1_key.replace("*", str(e)), hidden_size, intermediate_size, ap.mlp_bias, f_key = fused_gate_up_key, f_beg = e * 2 * intermediate_size, f_end = e * 2 * intermediate_size + intermediate_size)
+                w3 = ExLlamaV2Linear(model, w3_key.replace("*", str(e)), hidden_size, intermediate_size, ap.mlp_bias, f_key = fused_gate_up_key, f_beg = e * 2 * intermediate_size + intermediate_size, f_end = (e + 1) * 2 * intermediate_size)
+                w2 = ExLlamaV2Linear(model, w2_key.replace("*", str(e)), intermediate_size, hidden_size, ap.mlp_bias, f_key = fused_down_key, f_beg = e * hidden_size, f_end = (e + 1) * hidden_size)
+            else:
+                w1 = ExLlamaV2Linear(model, w1_key.replace("*", str(e)), hidden_size, intermediate_size, ap.mlp_bias, f_key = w1_f_key, f_beg = au, f_end = bu)
+                w2 = ExLlamaV2Linear(model, w2_key.replace("*", str(e)), intermediate_size, hidden_size, ap.mlp_bias, f_key = w2_f_key, f_beg = au, f_end = bu)
+                w3 = ExLlamaV2Linear(model, w3_key.replace("*", str(e)), hidden_size, intermediate_size, ap.mlp_bias, f_key = w3_f_key, f_beg = au, f_end = bu)
             self.w1.append(w1)
             self.w2.append(w2)
             self.w3.append(w3)
 
         self.gate = ExLlamaV2Linear(model, key + gate_key, hidden_size, self.num_experts, False, pad32 = False)
 
-        self.submodules = [self.post_attention_layernorm,
-                           self.gate] + \
+        self.submodules = [self.gate] + \
                            self.w1 + \
                            self.w2 + \
                            self.w3
+        if self.post_attention_layernorm is not None:
+            self.submodules.insert(0, self.post_attention_layernorm)
 
         self.is_tp = False
         self.q_handle = None
@@ -122,7 +142,7 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
     @torch.inference_mode
     def load(self):
 
-        self.post_attention_layernorm.load()
+        if self.post_attention_layernorm is not None: self.post_attention_layernorm.load()
         self.gate.load()
         off = self.offload_experts
         first_off = self.num_experts - off
@@ -143,7 +163,7 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
             print(f"[moe-offload] layer {self.layer_idx}: {off}/{self.num_experts} experts "
                   f"in pinned RAM (shared GPU staging slot)", flush = True)
 
-        if self.w1[0].is_quant() and not off:
+        if self.w1[0].is_quant() and not off and self.has_norm:
             device_context = self.model.get_device_context(self.device_idx)
             device_context.begin_scratch_alloc()
             self.q_handle = ext_c.make_q_moe_mlp(
@@ -173,7 +193,7 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
             ext_c.free_q_moe_mlp(self.q_handle)
             self.q_handle = None
 
-        self.post_attention_layernorm.unload()
+        if self.post_attention_layernorm is not None: self.post_attention_layernorm.unload()
         self.gate.unload()
         for e in range(self.num_experts):
             self.w1[e].unload()
@@ -188,7 +208,9 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
         # lives in pinned host RAM.
         off = self.offload_experts
         n_gpu = self.num_experts - off
-        fp = self.post_attention_layernorm.weight_footprint() + self.gate.weight_footprint()
+        fp = self.gate.weight_footprint()
+        if self.post_attention_layernorm is not None:
+            fp += self.post_attention_layernorm.weight_footprint()
         for wl in (self.w1, self.w2, self.w3):
             fp += sum(wl[e].weight_footprint() for e in range(n_gpu))
             if off:
@@ -252,7 +274,7 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
     def set_device_idx(self, idx: int | None):
         super().set_device_idx(idx)
 
-        self.post_attention_layernorm.set_device_idx(idx)
+        if self.post_attention_layernorm is not None: self.post_attention_layernorm.set_device_idx(idx)
         self.gate.set_device_idx(idx)
         for e in range(self.num_experts):
             self.w1[e].set_device_idx(idx)
@@ -295,7 +317,8 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
             # rank; forward_tp_sharded allgathers the summed expert output once per block.
             # Offload moves each rank's SHARD of the last N experts to pinned RAM (~world×
             # less RAM/PCIe than replicated offload).
-            self.post_attention_layernorm.tp_load_rank(rank, BROADCAST_RS)
+            if self.post_attention_layernorm is not None:
+                self.post_attention_layernorm.tp_load_rank(rank, BROADCAST_RS)
             self.gate.set_device_idx(rank)
             self.gate.load()
             shared = [{}, {}, {}] if off else None
@@ -319,7 +342,7 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
         # them identically (forward_tp_old gathers/shards the residual around the block).
         # Resident experts use the graph-safe fused kernel; offload moves the last N
         # experts to pinned RAM on EVERY rank with one shared GPU staging slot/projection.
-        self.post_attention_layernorm.set_device_idx(rank)
+        if self.post_attention_layernorm is not None: self.post_attention_layernorm.set_device_idx(rank)
         self.gate.set_device_idx(rank)
         shared = [{}, {}, {}] if off else None
         for e in range(self.num_experts):
@@ -329,7 +352,7 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
                 wl[e].set_device_idx(rank)
                 if is_off:
                     wl[e]._offload_shared = shared[wi]
-        self.post_attention_layernorm.load()
+        if self.post_attention_layernorm is not None: self.post_attention_layernorm.load()
         self.gate.load()
         for e in range(self.num_experts):
             self.w1[e].load()
@@ -349,7 +372,7 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
         # the full MoE output. Mirrors the dense-MLP column->RS->gather flow per expert.
         B, q, H = full.shape
         x = full.view(-1, H)
-        post_norm = self.post_attention_layernorm.forward(x)
+        post_norm = self.post_attention_layernorm.forward(x) if self.has_norm else x
         router_logits = self.gate.forward(post_norm, loras = loras)
         routing_weights = F.softmax(router_logits, dim = -1, dtype = torch.float)
         routing_weights, selected_experts = torch.topk(routing_weights, self.num_experts_per_token, dim = -1)
@@ -407,8 +430,9 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
         if self._tp_shard:
             out_full = self._forward_tp_sharded(full, ctx, loras)
             if ctx.seqpar and not repl_chunk:
-                return ctx.shard_residual(out_full) + hidden_states
-            return out_full + hidden_states
+                out_shard = ctx.shard_residual(out_full)
+                return out_shard + hidden_states if self.has_residual else out_shard
+            return out_full + hidden_states if self.has_residual else out_full
 
         # Resident experts: the fused q_moe_mlp kernel handles routing internally with
         # fixed buffers -> CUDA-graph safe (TP graphs stay ON). Offloaded experts use the
@@ -483,7 +507,8 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
 
         # Layernorm
 
-        hidden_states = self.post_attention_layernorm.forward(hidden_states)
+        if self.has_norm:
+            hidden_states = self.post_attention_layernorm.forward(hidden_states)
         if intermediates: result = { "post_norm": hidden_states }
 
         # Get router logits
@@ -532,7 +557,8 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
             final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
 
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
-        final_hidden_states += residual
+        if self.has_residual:
+            final_hidden_states += residual
 
         if intermediates:
             result["hidden_states"] = final_hidden_states
@@ -571,7 +597,8 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
 
 
     def is_quant(self):
-        return self.q_handle is not None
+        return self.q_handle is not None or \
+            (not self.has_norm and len(self.w1) > 0 and self.w1[0].is_quant())
 
 
     def rank_reduce(self, k):

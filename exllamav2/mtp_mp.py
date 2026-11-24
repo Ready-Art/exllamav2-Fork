@@ -137,6 +137,9 @@ class MTPMPDriver:
         if hasattr(self.d, "observe_tokens"):
             self.d.observe_tokens(prompt_ids)
             self.d.refresh_sparse_head()
+        # Built-in MTP (own draft KV): seed the drafter from the prefill row states.
+        if hasattr(self.d, "prefill_target"):
+            self.d.prefill_target(prompt_ids, prefill_state.float().cpu())
         self.tokens = prompt_ids[0].tolist()
         n = len(self.tokens)
         # prefill_state is (1, n_prompt, H): the state is captured before the
@@ -186,6 +189,9 @@ class MTPMPDriver:
             self.d.feed_context(aux, base_pos)
         else:
             logits, state = self.pg.forward_state(base_tok, last_id_only=True, cpu_logits=True)
+        if hasattr(self.d, "commit_bonus"):
+            self.d.commit_bonus(base_tok, state.float().cpu(),
+                                self.pg.cache.current_seq_len - 1)
         self.state = (base_tok, state.float().cpu(), self.pg.cache.current_seq_len - 1)
         self.base_logits = logits.float().cpu()
         # Re-commit restores an ALIGNED base: no pending bonus, fresh state/logits.
@@ -456,6 +462,13 @@ class MTPMPDriver:
         _t = self._time.perf_counter()
         rewind_to = pos + m_acc + 1 if mode_b else pos + m_acc
         self.pg.mtp_set_seq_len(rewind_to)
+        # Built-in MTP: advance the drafter's own KV over the accepted rows using
+        # the target's verified per-row states (mode B row 0 is the pending bonus).
+        if hasattr(self.d, "commit_accepted") and vstates is not None:
+            n_acc_rows = m_acc + 1 if mode_b else m_acc
+            if n_acc_rows > 0:
+                self.d.commit_accepted(verify_ids[:, :n_acc_rows].cpu(),
+                                       vstates[:, :n_acc_rows].float().cpu(), pos)
         self.t_rewind += self._time.perf_counter() - _t
         _t = self._time.perf_counter()
         self.pending_tokens = draft_flat[:m_acc] + [bonus_id]
@@ -499,6 +512,9 @@ class MTPMPDriver:
             # Legacy protocol: commit the bonus with a dedicated 1-token forward_state.
             base_tok = torch.tensor([[bonus_id]], dtype=torch.long)
             logits, state = self.pg.forward_state(base_tok, last_id_only=True, cpu_logits=True)
+            if hasattr(self.d, "commit_bonus"):
+                self.d.commit_bonus(base_tok, state.float().cpu(),
+                                    self.pg.cache.current_seq_len - 1)
             self.state = (base_tok, state.float().cpu(), self.pg.cache.current_seq_len - 1)
             self.base_logits = logits.float().cpu()
             self.pending_bonus = None

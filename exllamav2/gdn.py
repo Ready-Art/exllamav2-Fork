@@ -177,11 +177,23 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
         key: str,
         layer_idx: int,
         archparams = None,
+        has_norm: bool = True,
+        has_residual: bool = True,
     ):
         super().__init__(model, key, archparams)
         cfg = model.config
         ap = self.archparams
         km = ap.keys
+
+        # Qwen4-Exp (Flash-Next) wraps the block in hyper-connections: the grouped
+        # hc_norm replaces the block's own pre-norm and the residual add happens in
+        # the HC inject module instead. P6 (Qwen3.5) keeps both defaults.
+        self.has_norm = has_norm
+        self.has_residual = has_residual
+        # Gated-norm activation: Qwen3.5 "swish"/silu; Qwen4-Exp output_gate_type
+        # "sigmoid" applies to the GDN gated norm (the attn output gate is always
+        # sigmoid). HF Qwen4ExpTextGatedDeltaNet.
+        self.norm_act = getattr(cfg, "output_gate_type", "silu")
 
         self.layer_idx = layer_idx
         self.hidden_size = cfg.hidden_size
@@ -202,7 +214,8 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
         self.tp_k_a = 0
         self.tp_v_a = 0
 
-        self.pre_layernorm = ExLlamaV2RMSNorm(model, key + km["norm_1"], archparams = ap)
+        self.pre_layernorm = ExLlamaV2RMSNorm(model, key + km["norm_1"], archparams = ap) \
+            if has_norm else None
 
         fused = key + ".linear_attn.in_proj_qkv"
         self.in_proj_q = ExLlamaV2Linear(model, fused, self.hidden_size, self.kd, False,
@@ -217,10 +230,11 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
         self.in_proj_z = ExLlamaV2Linear(model, key + ".linear_attn.in_proj_z",
                                          self.hidden_size, self.vd, False, archparams = ap)
         # Gate logits: fp16, never quantized (48 outputs each; sensitivity).
+        # pad32=False: the gate width is exactly nv (no kernel padding wanted).
         self.in_proj_b = ExLlamaV2Linear(model, key + ".linear_attn.in_proj_b",
-                                         self.hidden_size, self.nv, False, archparams = ap)
+                                         self.hidden_size, self.nv, False, pad32 = False, archparams = ap)
         self.in_proj_a = ExLlamaV2Linear(model, key + ".linear_attn.in_proj_a",
-                                         self.hidden_size, self.nv, False, archparams = ap)
+                                         self.hidden_size, self.nv, False, pad32 = False, archparams = ap)
         self.out_proj = ExLlamaV2Linear(model, key + ".linear_attn.out_proj",
                                         self.vd, self.hidden_size, False, archparams = ap)
 
@@ -230,11 +244,12 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
         self.norm_weight = None
 
         self.submodules = [
-            self.pre_layernorm,
             self.in_proj_q, self.in_proj_k, self.in_proj_v,
             self.in_proj_z, self.in_proj_b, self.in_proj_a,
             self.out_proj,
         ]
+        if self.pre_layernorm is not None:
+            self.submodules.insert(0, self.pre_layernorm)
 
         # Raw (non-linear) weight footprint estimate for lazy-load accounting.
         self.assumed_footprint = 2 * (
@@ -262,7 +277,7 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
 
     @torch.inference_mode()
     def load(self, device_context: bool = True):
-        self.pre_layernorm.load()
+        if self.pre_layernorm is not None: self.pre_layernorm.load()
         self.in_proj_q.load(device_context = device_context)
         self.in_proj_k.load(device_context = device_context)
         self.in_proj_v.load(device_context = device_context)
@@ -337,7 +352,7 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
         ctx = self.model.tp_context
         ctx.set_geometry(self.layer_idx)
 
-        self.pre_layernorm.tp_split(BROADCAST_RS)
+        if self.pre_layernorm is not None: self.pre_layernorm.tp_split(BROADCAST_RS)
         self.in_proj_q.tp_split(BROADCAST_GDN_K, dim = self.dk)
         self.in_proj_k.tp_split(BROADCAST_GDN_K, dim = self.dk)
         self.in_proj_v.tp_split(BROADCAST_GDN_V, dim = self.dv)
@@ -356,8 +371,9 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
         """MP rank-local: load only this rank's shard (mode 2)."""
         cfg = self.model.config
         ctx = self.model.tp_context
+        self.device_idx = rank
 
-        self.pre_layernorm.tp_load_rank(rank, BROADCAST_RS)
+        if self.pre_layernorm is not None: self.pre_layernorm.tp_load_rank(rank, BROADCAST_RS)
 
         self.in_proj_q.tp_load_rank(rank, BROADCAST_GDN_K, dim = self.dk)
         self.in_proj_k.tp_load_rank(rank, BROADCAST_GDN_K, dim = self.dk)
@@ -384,7 +400,6 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
         self._slice_raw_tp()
 
         self.is_tp = True
-        self.set_device_idx(None)
 
     def _slice_raw_tp(self):
         """Slice conv / A_log / dt_bias / norm to this rank's head shard."""
@@ -435,11 +450,13 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
         B, _, C = qkv.shape
         K = self.conv_kernel
         x = qkv[:, 0, :]                              # (B, C)
+        # The state holds the last K-1 RAW inputs; the conv window is state + x.
+        window = torch.cat([conv_state, x.unsqueeze(-1)], dim=-1)   # (B, C, K)
+        w = self.conv1d_weight                        # (C, K)
+        y = (window * w.unsqueeze(0)).sum(-1)         # (B, C)
         # shift state left, append new input
         conv_state[..., :-1].copy_(conv_state[..., 1:])
         conv_state[..., -1].copy_(x)
-        w = self.conv1d_weight                        # (C, K)
-        y = (conv_state * w.unsqueeze(0)).sum(-1)     # (B, C)
         return y.unsqueeze(1)
 
     def _gated_norm(self, o: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
@@ -453,9 +470,12 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
         of = o.reshape(-1, self.dv).float()
         zf = z.reshape(-1, self.dv).float()
         var = of.pow(2).mean(-1, keepdim=True)
-        on = of * torch.rsqrt(var + self.pre_layernorm.variance_epsilon)
+        eps = self.pre_layernorm.variance_epsilon if self.pre_layernorm is not None \
+            else self.model.config.norm_eps
+        on = of * torch.rsqrt(var + eps)
         on = on.to(dtype) * self.norm_weight
-        out = on * F.silu(zf)
+        gate = zf.sigmoid() if self.norm_act == "sigmoid" else F.silu(zf)
+        out = on * gate
         return out.to(dtype).view(shape)
 
     def _scan(self, q, k, v, g, beta, state, chunked: bool):
@@ -542,14 +562,15 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
 
         B, T, _ = hidden_states.shape
         residual = hidden_states
-        x = self.pre_layernorm(hidden_states)
+        x = self.pre_layernorm.forward(hidden_states) if self.has_norm else hidden_states
+        staging = False
 
-        q = self.in_proj_q(x, loras = loras)
-        k = self.in_proj_k(x, loras = loras)
-        v = self.in_proj_v(x, loras = loras)
-        z = self.in_proj_z(x, loras = loras)
-        b = self.in_proj_b(x, loras = loras)
-        a = self.in_proj_a(x, loras = loras)
+        q = self.in_proj_q.forward(x, loras = loras)
+        k = self.in_proj_k.forward(x, loras = loras)
+        v = self.in_proj_v.forward(x, loras = loras)
+        z = self.in_proj_z.forward(x, loras = loras)
+        b = self.in_proj_b.forward(x, loras = loras)
+        a = self.in_proj_a.forward(x, loras = loras)
 
         qkv = torch.cat([q, k, v], dim=-1)
 
@@ -606,8 +627,9 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
         o = self._scan(qh, kh, vh, g, beta, state, chunked=(cache is None or T > 1))
         o = self._gated_norm(o.view(B, T, self.nv, self.dv), z.view(B, T, self.nv, self.dv))
         o = o.view(B, T, self.vd).to(hidden_states.dtype)
-        out = self.out_proj(o, loras = loras)
-        out = out + residual
+        out = self.out_proj.forward(o, loras = loras)
+        if self.has_residual:
+            out = out + residual
 
         if intermediates:
             return {
@@ -653,15 +675,18 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
         if rank_local and ctx.seqpar:
             residual = x
             if ctx.decode_repl and T <= 32:
-                post_norm = self.pre_layernorm.forward(x)
+                post_norm = self.pre_layernorm.forward(x) if self.has_norm else x
             else:
                 full = ctx.gather_residual(x)
-                post_norm = self.pre_layernorm.forward(full)
+                post_norm = self.pre_layernorm.forward(full) if self.has_norm else full
         else:
             x = ctx.broadcast(0, x, BROADCAST_RS)
             residual = x
-            post_norm = self.pre_layernorm.forward(x) if not isinstance(x, list) \
-                else self.pre_layernorm.forward_tp(x, output_split = True)
+            if not self.has_norm:
+                post_norm = x
+            else:
+                post_norm = self.pre_layernorm.forward(x) if not isinstance(x, list) \
+                    else self.pre_layernorm.forward_tp(x, output_split = True)
 
         # Projections. In rank-local mode these are scalar single-device layers;
         # forward_tp degenerates to a local GEMM. In single-process mode they
@@ -774,15 +799,22 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
             vh = vc.view(B, T, nv_l, self.dv)
 
             if rank_local:
-                beta, g = self._gates(b_list[idx], a_list[idx])
+                # b/a are replicated full-width (nv); A_log/dt_bias are sliced to
+                # this rank's value heads by _slice_raw_tp -- match the widths.
+                va_l = self.tp_v_a
+                vb_l = self.tp_v_a + self.tp_nv
+                beta, g = self._gates(b_list[idx][..., va_l:vb_l], a_list[idx][..., va_l:vb_l])
                 A_log = self.A_log
                 dt_bias = self.dt_bias
             else:
                 A_log = self.A_log_full[va:vb]
                 dt_bias = self.dt_bias_full[va:vb]
-                beta = b_list[idx][:, va:vb].sigmoid()
-                g = -A_log.exp() * F.softplus(a_list[idx][:, va:vb] + dt_bias)
+                beta = b_list[idx][..., va:vb].sigmoid()
+                g = -A_log.exp() * F.softplus(a_list[idx][..., va:vb] + dt_bias)
 
+            # b/a run on the flattened (rows, H) residual; the scan wants (B, T, nv).
+            beta = beta.view(B, T, nv_l)
+            g = g.view(B, T, nv_l)
             o = self._scan(qh, kh, vh, g, beta, ssm, chunked=(cache is None or T > 1))
             nw = self.norm_weight if rank_local else self.norm_weight_full
             o = self._gated_norm_with(o.view(B, T, nv_l, self.dv),
@@ -796,18 +828,18 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
                 partial = self.out_proj.forward_tp_row([o], output_split = True)[0]
             partials.append(partial)
 
-        # Reduce partials into the residual stream.
+        # Reduce partials into the residual stream. out_proj is row-parallel:
+        # each rank's partial covers only its value heads, so the partials must
+        # be SUMMED across ranks in every mode (the rank-local loader leaves a
+        # plain single-device GEMM with no built-in reduce).
         if rank_local:
             partial = partials[0]
-            if ctx.seqpar and ctx.decode_repl and T <= 32:
-                out_full = ctx.all_reduce_hidden(partial, "gdn")
-                out_full = out_full + residual
-            elif ctx.seqpar:
+            if ctx.seqpar and not (ctx.decode_repl and T <= 32):
                 out_shard = ctx.reduce_scatter_hidden(partial)
-                out_shard = out_shard + residual
+                if self.has_residual: out_shard = out_shard + residual
                 return out_shard.view(B, T, -1)
-            else:
-                out_full = partial + residual
+            out_full = ctx.all_reduce_hidden(partial, "gdn")
+            if self.has_residual: out_full = out_full + residual
             return out_full.view(B, T, self.hidden_size)
 
         # Single-process: sum partials on the primary device.
@@ -817,7 +849,7 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
         for p in partials[1:]:
             acc = acc + p.to(dev0)
         res0 = residual[0] if isinstance(residual, list) else residual
-        out = acc + res0
+        out = acc + res0 if self.has_residual else acc
         return out.view(B, T, self.hidden_size)
 
     # Raw-tensor helpers for single-process TP (full tensors kept on primary;
@@ -859,9 +891,11 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
 
     def _conv_decode_with(self, qkv, conv_state, w):
         x = qkv[:, 0, :]
+        # State holds the last K-1 raw inputs; the conv window is state + x.
+        window = torch.cat([conv_state, x.unsqueeze(-1)], dim=-1)
+        y = (window * w.unsqueeze(0)).sum(-1)
         conv_state[..., :-1].copy_(conv_state[..., 1:])
         conv_state[..., -1].copy_(x)
-        y = (conv_state * w.unsqueeze(0)).sum(-1)
         return y.unsqueeze(1)
 
     def _gated_norm_with(self, o, z, w):
@@ -870,7 +904,10 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
         of = o.reshape(-1, self.dv).float()
         zf = z.reshape(-1, self.dv).float()
         var = of.pow(2).mean(-1, keepdim=True)
-        on = of * torch.rsqrt(var + self.pre_layernorm.variance_epsilon)
+        eps = self.pre_layernorm.variance_epsilon if self.pre_layernorm is not None \
+            else self.model.config.norm_eps
+        on = of * torch.rsqrt(var + eps)
         on = on.to(dtype) * w
-        out = on * F.silu(zf)
+        gate = zf.sigmoid() if self.norm_act == "sigmoid" else F.silu(zf)
+        out = on * gate
         return out.to(dtype).view(shape)

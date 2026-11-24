@@ -93,6 +93,7 @@ class ExLlamaV2NGramEmbedding(ExLlamaV2Module):
         self._disk = None               # (fd, data_base, row_bytes, num_rows)
         self._stage = None              # grow-only pinned staging
         self._stage_rows = 0
+        self._source = None             # (handles, ranges, num_rows) bf16 source shards
 
     def numel(self) -> int:
         return self._num_rows() * self.head_dim
@@ -100,6 +101,7 @@ class ExLlamaV2NGramEmbedding(ExLlamaV2Module):
     def _num_rows(self) -> int:
         if self.table_ram is not None: return self.table_ram.shape[0]
         if self._disk is not None: return self._disk[3]
+        if self._source is not None: return self._source[2]
         return int(self.head_offsets[-1].item() + self.head_vocab_sizes[-1].item())
 
     def weight_footprint(self) -> int:
@@ -114,6 +116,18 @@ class ExLlamaV2NGramEmbedding(ExLlamaV2Module):
 
     @torch.inference_mode
     def load(self):
+        # Source-checkpoint fallback (calibration / pre-conversion): the original
+        # bf16 shard_N.weight tables are read directly, no dequant. Hash params
+        # come from the checkpoint's <parent>.ngram_heads_* / layer_multipliers.
+        cfg = self.model.config
+        if self.key + ".q_rows" not in cfg.tensor_file_map:
+            shard_keys = sorted(
+                [k for k in cfg.tensor_file_map
+                 if k.startswith(self.key + ".shard_") and k.endswith(".weight")],
+                key = lambda k: int(k.split(".shard_")[1].split(".")[0]))
+            if shard_keys:
+                self._load_source(shard_keys)
+                return
         w = self.load_multi(self.key, [
             "q_rows", "q_row_scales", "head_offsets", "head_vocab_sizes",
             "layer_multipliers", "head_bias"
@@ -146,10 +160,45 @@ class ExLlamaV2NGramEmbedding(ExLlamaV2Module):
         fd = os.open(path, os.O_RDONLY)
         self._disk = (fd, data_base, row_bytes, num_rows)
 
+    def _load_source(self, shard_keys):
+        """Read the ORIGINAL bf16 shards (calibration before convert_ngram)."""
+        from safetensors import safe_open
+        cfg = self.model.config
+        parent = self.key.rsplit(".", 1)[0]
+        aux = self.load_multi(parent, ["ngram_heads_offsets", "ngram_heads_vocab_sizes",
+                                       "layer_multipliers"], cpu = True)
+        self.head_offsets = aux["ngram_heads_offsets"].long().contiguous()
+        self.head_vocab_sizes = aux["ngram_heads_vocab_sizes"].long().contiguous()
+        self.layer_multipliers = aux["layer_multipliers"].long().contiguous()
+        self.head_bias = torch.zeros(self.num_heads, self.head_dim, dtype=torch.half,
+                                     device=self.device())
+        handles = {}
+        ranges = []
+        base = 0
+        for sk in shard_keys:
+            path = cfg.tensor_file_map[sk]
+            f = safe_open(path, framework="pt", device="cpu")
+            handles[sk] = f
+            n = f.get_slice(sk).get_shape()[0]
+            ranges.append((base, base + n, sk))
+            base += n
+        self._source = (handles, ranges, base)
+
+    def _source_rows(self, uids: torch.Tensor) -> torch.Tensor:
+        handles, ranges, _ = self._source
+        parts = []
+        for u in uids.tolist():
+            for lo, hi, sk in ranges:
+                if lo <= u < hi:
+                    parts.append(handles[sk].get_slice(sk)[u - lo:u - lo + 1])
+                    break
+        return torch.cat(parts, dim=0).half()
+
     def unload(self):
         if self._disk is not None:
             os.close(self._disk[0])
             self._disk = None
+        self._source = None
         self.table_ram = None
         self.row_scales = None
         self.head_bias = None
@@ -285,6 +334,10 @@ class ExLlamaV2NGramEmbedding(ExLlamaV2Module):
         ngram_ids = self.compute_ngram_ids(ids, out_len)
         flat = ngram_ids.reshape(-1)
         uids, inverse = torch.unique(flat, return_inverse = True)
+        if self._source is not None:
+            rows = self._source_rows(uids).to(self.device())
+            out = rows.index_select(0, inverse.to(self.device()))
+            return out.view(bsz, out_len, self.ple_embed_dim)
         heads = (torch.searchsorted(self.head_offsets, uids, right = True) - 1) \
             .clamp(0, self.num_heads - 1).to(torch.int32)
         packed = self._gather_packed(uids)

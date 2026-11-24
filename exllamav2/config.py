@@ -474,6 +474,23 @@ class ExLlamaV2Config:
         # Gated-norm activation inside the delta net ("swish" == silu). The full-attention
         # output gate is sigmoid regardless (HF/vLLM/exl3 all agree).
         self.output_gate_type = read(read_config, str, "output_gate_type", "silu", opt_subkey = "text_config")
+
+        # Qwen3.8-Flash-Next (Qwen4Exp): hyper-connections, QSA indexer, PLE n-grams.
+        self.hc_count = read(read_config, int, "hc_count", 1, opt_subkey = "text_config")
+        self.hc_lowrank = read(read_config, int, "hc_lowrank", 0, opt_subkey = "text_config")
+        self.indexer_n_heads = read(read_config, int, "indexer_n_heads", None, opt_subkey = "text_config")
+        self.indexer_kv_heads = read(read_config, int, "indexer_kv_heads", 1, opt_subkey = "text_config")
+        self.indexer_head_dim = read(read_config, int, "indexer_head_dim", None, opt_subkey = "text_config")
+        self.indexer_budget = read(read_config, int, "indexer_budget", 0, opt_subkey = "text_config")
+        self.indexer_compress_ratio = read(read_config, int, "indexer_compress_ratio", 1, opt_subkey = "text_config")
+        self.ple_layer_ids = read(read_config, list, "ple_layer_ids", None, opt_subkey = "text_config")
+        self.ple_embed_dim = read(read_config, int, "ple_embed_dim", 0, opt_subkey = "text_config")
+        self.ple_conv_kernel_size = read(read_config, int, "ple_conv_kernel_size", 4, opt_subkey = "text_config")
+        self.ngram_size = read(read_config, int, "ngram_size", 0, opt_subkey = "text_config")
+        self.heads_per_ngram = read(read_config, int, "heads_per_ngram", 0, opt_subkey = "text_config")
+        self.ngram_vocab_size_base = read(read_config, int, "ngram_vocab_size_base", 0, opt_subkey = "text_config")
+        self.shared_expert_intermediate_size = read(read_config, int, "shared_expert_intermediate_size", 0, opt_subkey = "text_config")
+        self.norm_topk_prob = read(read_config, bool, "norm_topk_prob", True, opt_subkey = "text_config")
         if self.hybrid_linear_attn:
             assert self.linear_num_key_heads and self.linear_num_value_heads \
                 and self.linear_key_head_dim and self.linear_value_head_dim \
@@ -524,9 +541,10 @@ class ExLlamaV2Config:
         _hspl = read(read_config, int, "hidden_size_per_layer_input", 0, opt_subkey = "text_config")
         assert not _hspl, \
             "Gemma-4 per-layer inputs (hidden_size_per_layer_input) are not implemented"
-        _moe = read(read_config, bool, "enable_moe_block", False, opt_subkey = "text_config")
-        assert not _moe, \
-            "Gemma-4 MoE block (enable_moe_block) is not implemented"
+        # Gemma-4 MoE block (Gemma-4-26B-A4B): parallel dense MLP + routed experts.
+        self.enable_moe_block = read(read_config, bool, "enable_moe_block", False, opt_subkey = "text_config")
+        self.top_k_experts = read(read_config, int, "top_k_experts", 0, opt_subkey = "text_config")
+        self.use_double_wide_mlp = read(read_config, bool, "use_double_wide_mlp", False, opt_subkey = "text_config")
 
         # Vision is out of scope for Gemma-4 (PLAN.md §2.9). Attention is therefore always
         # causal, and any non-causal span machinery must not be engaged.
@@ -543,18 +561,32 @@ class ExLlamaV2Config:
         else:
             default_intermediate_size = no_default
 
-        self.intermediate_size = read(
-            read_config,
-            int,
-            ["intermediate_size", "ffn_config->ffn_hidden_size", "n_inner"],
-            default_intermediate_size,
-            opt_subkey = "text_config",
-        )
-        self.num_experts = read(read_config, int, ["num_local_experts", "ffn_config->moe_num_experts", "num_experts"], None)
-        self.num_experts_per_token = read(read_config, int,["num_experts_per_tok", "ffn_config->moe_top_k"], None)
+        self.num_experts = read(read_config, int, ["num_local_experts", "ffn_config->moe_num_experts", "num_experts"], None, opt_subkey = "text_config")
+        self.num_experts_per_token = read(read_config, int, ["num_experts_per_tok", "ffn_config->moe_top_k", "top_k_experts"], None, opt_subkey = "text_config")
 
         if self.arch.lm.is_moe:
-            self.intermediate_size = read(read_config, int, ["moe_intermediate_size"], self.intermediate_size)
+            # MoE archs may carry ONLY moe_intermediate_size (Qwen4-Exp) or both
+            # (Gemma-4-26B: dense MLP + MoE block). Resolve the expert size first.
+            self.moe_intermediate_size = read(read_config, int, ["moe_intermediate_size"],
+                                              None, opt_subkey = "text_config")
+            if self.moe_intermediate_size is None:
+                self.moe_intermediate_size = read(
+                    read_config, int,
+                    ["intermediate_size", "ffn_config->ffn_hidden_size", "n_inner"],
+                    default_intermediate_size, opt_subkey = "text_config")
+            if getattr(self.arch.lm, "gemma4_moe_block", False):
+                self.intermediate_size = read(
+                    read_config, int,
+                    ["intermediate_size", "ffn_config->ffn_hidden_size", "n_inner"],
+                    default_intermediate_size, opt_subkey = "text_config")
+            else:
+                self.intermediate_size = self.moe_intermediate_size
+        else:
+            self.intermediate_size = read(
+                read_config, int,
+                ["intermediate_size", "ffn_config->ffn_hidden_size", "n_inner"],
+                default_intermediate_size, opt_subkey = "text_config")
+            self.moe_intermediate_size = self.intermediate_size
 
         # Logit/embedding/residual scale
 
@@ -789,7 +821,8 @@ class ExLlamaV2Config:
         # vision_tower.* / multi_modal_projector.* tensor instead of erroring on an unknown type.
         self.vision_disabled = False
         if self.arch.arch_string in ("Gemma4ForConditionalGeneration", "Gemma4ForCausalLM",
-                                     "Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM"):
+                                     "Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM",
+                                     "Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM"):
             if self.vision_model_type is not None:
                 self.vision_disabled = True
                 self.vision_model_type = None

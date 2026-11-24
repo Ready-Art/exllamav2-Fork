@@ -1,4 +1,5 @@
 from exllamav2.conversion.qparams import QParams
+from exllamav2.attn import ExLlamaV2Attention
 from exllamav2.ext import exllamav2_ext as ext_c, none_tensor
 import math
 import itertools
@@ -104,7 +105,25 @@ def optimize(job, save_fn, model):
     # PLAN.md §2.6.
     modules_per_layer = 3 if getattr(cfg.arch.lm, "layer_scalar", False) else 2
     num_modules = num_layers * modules_per_layer
-    numel = sum(m.numel() for m in model.modules[first_q_layer : num_modules + first_q_layer])
+    if getattr(cfg.arch.lm, "hc_residual", False):
+        # Qwen4-Exp layers carry 6+ modules (hyper-connection mix/inject pairs,
+        # PLE), so the fixed-stride slice does not describe the quantized set.
+        # Sum the actual quantizable projections instead; the fp16 pass-through
+        # modules (hc/PLE/indexer/router/shared) are outside the bitrate budget.
+        from exllamav2.gdn import ExLlamaV2GatedDeltaNet
+        from exllamav2.moe_mlp import ExLlamaV2MoEMLP
+        numel = 0
+        for m in model.modules:
+            if isinstance(m, ExLlamaV2Attention):
+                numel += m.q_proj.numel() + m.k_proj.numel() + m.o_proj.numel()
+                if m.v_proj is not None: numel += m.v_proj.numel()
+            elif isinstance(m, ExLlamaV2GatedDeltaNet):
+                numel += sum(p.numel() for p in (m.in_proj_q, m.in_proj_k, m.in_proj_v,
+                                                 m.in_proj_z, m.out_proj))
+            elif isinstance(m, ExLlamaV2MoEMLP):
+                numel += sum(l.numel() for l in m.w1 + m.w2 + m.w3)
+    else:
+        numel = sum(m.numel() for m in model.modules[first_q_layer : num_modules + first_q_layer])
 
     target_bpw = job["bits"]
     weight_budget = int(numel * target_bpw)

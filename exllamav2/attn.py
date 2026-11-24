@@ -1970,6 +1970,28 @@ class ExLlamaV2Attention(ExLlamaV2Module):
    ):
         cfg = self.model.config
 
+        # Replicated-attention layer (fewer KV heads than ranks, or tp_kv_replicate
+        # arch): run the ordinary single-device forward locally on the full hidden.
+        # No attention collectives; the seqpar residual flow gathers/shards around it
+        # exactly like the replicated MoE path.
+        if getattr(self, "_tp_replicated", False):
+            ctx = self.model.tp_context
+            repl_chunk = ctx.decode_repl and hidden_states.shape[1] <= 32
+            if ctx.seqpar and not repl_chunk:
+                full = ctx.gather_residual(hidden_states)
+            else:
+                full = hidden_states
+            # forward_torch expects a plain cache (tensor get_kv_state); the MP
+            # rank view returns per-device lists for the TP forward paths.
+            plain_cache = getattr(cache, "_cache", cache)
+            out = self.forward_torch(full, plain_cache, attn_params, past_len,
+                                     intermediates, loras, **kwargs)
+            if intermediates:
+                return out
+            if ctx.seqpar and not repl_chunk:
+                out = ctx.shard_residual(out)
+            return out
+
         # Select the split set and C++ context for this layer's attention geometry (Gemma-4
         # mixes 16-kv-head sliding layers with 4-kv-head full layers). Must happen before any
         # get_split() call, or the residual/output splits use the previous layer's geometry.
@@ -3568,6 +3590,22 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 
         ctx.set_geometry(self.layer_idx)
 
+        # Replicated-attention layers: when a layer has fewer KV heads than ranks
+        # (Gemma-4-26B's 2-head global layers on 4 GPUs, Qwen4-Exp's 2 KV heads),
+        # a disjoint split would leave some ranks headless. Instead EVERY rank loads
+        # the full block and runs it locally (no attention collectives); the KV cache
+        # keeps the full head count on every rank (tp_narrow_cache_to_rank mirrors
+        # this rule). The heavy MoE/GDN weights still shard normally.
+        self._tp_replicated = False
+        _nkv_layer = self.num_key_value_heads
+        if bool(getattr(self.archparams, "tp_kv_replicate", False)) or \
+                _nkv_layer < ctx.num_devices:
+            self._tp_replicated = True
+            self.set_device_idx(rank)
+            self.load()
+            self.is_tp = True
+            return
+
         if self.pre_layernorm is not None:
             # SP: the input norm runs full-width on the allgathered residual, so it keeps
             # the FULL replicated weight even in seqpar mode.
@@ -3699,6 +3737,13 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 
         devs = ctx.num_devices
         scratch = [0] * devs
+
+        # Replicated-attention layers load and run the full block on every rank.
+        if bool(getattr(self.archparams, "tp_kv_replicate", False)) or \
+                self.num_key_value_heads < devs:
+            s = self.scratch_space()
+            self.tp_dq_size = [s] * devs
+            return [s] * devs
 
         def add(res: list[int]):
             for i, s in enumerate(res):

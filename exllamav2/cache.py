@@ -899,13 +899,19 @@ class ExLlamaV2Cache_Hybrid(ExLlamaV2Cache):
                     self.gdn_conv_backup.append(None)
                     self.gdn_ssm_backup.append(None)
                 else:
-                    dev = self.fixed_device if self.fixed_device is not None else self.model.devices[i]
+                    dev = self.fixed_device if self.fixed_device is not None \
+                        else self.model.cache_map.get(i, None)
                     self.gdn_conv_states.append(torch.zeros((self.batch_size, conv_dim, K - 1), dtype=torch.half, device=dev))
                     self.gdn_ssm_states.append(torch.zeros((self.batch_size, nv, dk, dv), dtype=torch.float32, device=dev))
                     self.gdn_conv_backup.append(torch.zeros((self.batch_size, conv_dim, K - 1), dtype=torch.half, device=dev))
                     self.gdn_ssm_backup.append(torch.zeros((self.batch_size, nv, dk, dv), dtype=torch.float32, device=dev))
                 continue
 
+            # GDN state lists are indexed by LAYER idx (None on full-attn layers).
+            self.gdn_conv_states.append(None)
+            self.gdn_ssm_states.append(None)
+            self.gdn_conv_backup.append(None)
+            self.gdn_ssm_backup.append(None)
             if lazy:
                 self.key_states.append(None)
                 self.value_states.append(None)
@@ -914,7 +920,7 @@ class ExLlamaV2Cache_Hybrid(ExLlamaV2Cache):
                 continue
             if copy_from is None:
                 p = self.layer_shapes_basic[i]
-                dev = self.fixed_device if self.fixed_device is not None else self.model.devices[i]
+                dev = self.fixed_device if self.fixed_device is not None else self.model.cache_map.get(i, None)
                 self.key_states.append(torch.zeros(p, dtype=self.dtype, device=dev))
                 self.value_states.append(torch.zeros(p, dtype=self.dtype, device=dev))
                 self.key_scales.append(None)
@@ -944,7 +950,7 @@ class ExLlamaV2Cache_Hybrid(ExLlamaV2Cache):
         nk, nv, dk, dv, conv_dim = self._gdn_local_dims()
         K = cfg.linear_conv_kernel_dim
         for i in range(self.num_hidden_layers):
-            dev = self.fixed_device if self.fixed_device is not None else self.model.devices[i]
+            dev = self.fixed_device if self.fixed_device is not None else self.model.cache_map.get(i, None)
             if cfg.layer_types[i] == "linear_attention":
                 if self.gdn_conv_states[i] is None:
                     self.gdn_conv_states[i] = torch.zeros((self.batch_size, conv_dim, K - 1), dtype=torch.half, device=dev)
@@ -1041,17 +1047,132 @@ class ExLlamaV2Cache_Hybrid(ExLlamaV2Cache):
         for i in range(self.num_hidden_layers):
             if self.key_states[i] is None:
                 continue
-            dev = self.model.devices[i]
+            dev = self.model.cache_map.get(i, None)
             self.key_states[i] = self.key_states[i].to(dev)
             self.value_states[i] = self.value_states[i].to(dev)
         for lst in (self.gdn_conv_states, self.gdn_ssm_states,
                     self.gdn_conv_backup, self.gdn_ssm_backup):
             for i, t in enumerate(lst):
                 if t is not None:
-                    lst[i] = t.to(self.model.devices[i])
+                    lst[i] = t.to(self.model.cache_map.get(i, None))
 
     def roll_left(self):
         raise NotImplementedError("Hybrid cache has no sliding window; roll_left is invalid")
+
+
+class ExLlamaV2Cache_Qwen4Exp(ExLlamaV2Cache_Hybrid):
+    """
+    Qwen3.8-Flash-Next cache: hybrid GDN state + per-full-layer raw indexer keys
+    (un-roped, 1 head x indexer_head_dim) + the PLE dilated/short conv states.
+    The PLE conv inputs depend on the hidden state, so rewinds replay staged
+    inputs (ple_stage) exactly like the GDN scan staging.
+    """
+
+    def __init__(self, model, batch_size = 1, max_seq_len = -1, copy_from = None,
+                 lazy = False, num_key_value_heads = None, fixed_device = None,
+                 gdn_v_range = None):
+        self.idx_k_states = []
+        self.ple_conv_state = None
+        self.ple_backup_conv = None
+        self.ple_backup_prev2 = None
+        self.ple_backup_pos = -1
+        self.ple_prev2 = None
+        self.ple_stage = None
+        self._ple_ids = None
+        super().__init__(model, batch_size, max_seq_len, copy_from, lazy,
+                         num_key_value_heads, fixed_device, gdn_v_range)
+        self._allocate_qwen4exp(lazy)
+        if copy_from is not None and isinstance(copy_from, ExLlamaV2Cache_Qwen4Exp):
+            for i in range(self.num_hidden_layers):
+                if self.idx_k_states[i] is not None and copy_from.idx_k_states[i] is not None:
+                    self.idx_k_states[i].copy_(copy_from.idx_k_states[i])
+            if self.ple_conv_state is not None and copy_from.ple_conv_state is not None:
+                self.ple_conv_state.copy_(copy_from.ple_conv_state)
+                self.ple_prev2 = copy_from.ple_prev2.clone()
+                self.ple_backup_pos = copy_from.ple_backup_pos
+
+    def _ple_layer_idx(self):
+        cfg = self.model.config
+        ids = getattr(cfg, "ple_layer_ids", None) or []
+        return ids[0] - 1 if ids else None
+
+    def _allocate_qwen4exp(self, lazy = False):
+        cfg = self.model.config
+        dev = self.fixed_device if self.fixed_device is not None else None
+        # Indexer keys are small (1 head x indexer_head_dim per token) -- always
+        # allocate eagerly, even when the KV cache itself is lazy.
+        for i in range(self.num_hidden_layers):
+            if cfg.layer_types[i] == "full_attention":
+                d = dev if dev is not None else self.model.cache_map.get(i, None)
+                self.idx_k_states.append(torch.zeros(
+                    (self.batch_size, self.max_seq_len, cfg.indexer_head_dim),
+                    dtype=torch.half, device=d))
+            else:
+                self.idx_k_states.append(None)
+        # PLE conv state is tiny (one layer) -- always allocate, even lazy.
+        pl = self._ple_layer_idx()
+        if pl is not None:
+            d = dev if dev is not None else self.model.cache_map.get(pl, None)
+            H = cfg.hidden_size * cfg.hc_count
+            sl = (cfg.ple_conv_kernel_size - 1) * cfg.ngram_size
+            self.ple_conv_state = torch.zeros((self.batch_size, H, sl), dtype=torch.half, device=d)
+            self.ple_backup_conv = torch.zeros_like(self.ple_conv_state)
+            self.ple_prev2 = torch.full((self.batch_size, 2),
+                                        self.model.config.eos_token_id if isinstance(self.model.config.eos_token_id, int)
+                                        else self.model.config.eos_token_id[0], dtype=torch.long)
+
+    def _q4_tensors(self):
+        out = [t for t in self.idx_k_states if t is not None]
+        for t in (self.ple_conv_state, self.ple_backup_conv):
+            if t is not None:
+                out.append(t)
+        return out
+
+    def footprint(self):
+        return super().footprint() + sum(t.numel() * t.element_size() for t in self._q4_tensors())
+
+    def all_tensors(self):
+        return super().all_tensors() + self._q4_tensors()
+
+    def reset(self):
+        super().reset()
+        self.ple_backup_pos = -1
+        self.ple_stage = None
+        self._ple_ids = None
+        for t in self._q4_tensors():
+            t.zero_()
+        if self.ple_prev2 is not None:
+            eos = self.model.config.eos_token_id
+            self.ple_prev2.fill_(eos if isinstance(eos, int) else eos[0])
+
+    def update_cache_tensors(self):
+        super().update_cache_tensors()
+        cfg = self.model.config
+        for i, t in enumerate(self.idx_k_states):
+            if cfg.layer_types[i] != "full_attention":
+                continue
+            d = self.model.cache_map.get(i, self.fixed_device)
+            if t is None:
+                self.idx_k_states[i] = torch.zeros(
+                    (self.batch_size, self.max_seq_len, cfg.indexer_head_dim),
+                    dtype=torch.half, device=d)
+            else:
+                self.idx_k_states[i] = t.to(d)
+        pl = self._ple_layer_idx()
+        if pl is not None:
+            d = self.model.cache_map.get(pl, None)
+            for attr in ("ple_conv_state", "ple_backup_conv"):
+                t = getattr(self, attr)
+                if t is not None and d is not None:
+                    setattr(self, attr, t.to(d))
+
+    def clone(self):
+        c = ExLlamaV2Cache_Qwen4Exp(
+            self.model, self.batch_size, self.max_seq_len,
+            copy_from=self, lazy=False, fixed_device=self.fixed_device,
+            gdn_v_range=self.gdn_v_range)
+        c.current_seq_len = self.current_seq_len
+        return c
 
 
 class ExLlamaV2Cache_8bit(ExLlamaV2CacheBase):
@@ -1434,9 +1555,15 @@ def tp_narrow_cache_to_rank(cache: ExLlamaV2CacheBase, tp_context, rank: int):
     :param rank:
         Device index this cache belongs to.
     """
+    _cfg = cache.model.config
+    _kv_repl_all = bool(getattr(_cfg.arch.lm, "tp_kv_replicate", False))
     for li in range(cache.num_hidden_layers):
         kvh = cache.layer_num_kv_heads[li]
         if kvh <= 0:
+            continue
+        # Replicated-attention layers (fewer KV heads than ranks, or tp_kv_replicate
+        # arch) keep the FULL head count on every rank -- mirrors attn.tp_load_rank.
+        if _kv_repl_all or kvh < tp_context.num_devices:
             continue
         geo = tp_context.geometry_keys[li]
         sp = tp_context.geometry_splits[geo]["kv"][0]
@@ -1638,7 +1765,9 @@ def tp_rank_cache(
 
     cfg = model.config
     if base is None:
-        if getattr(cfg, "hybrid_linear_attn", False):
+        if getattr(cfg.arch.lm, "hc_residual", False):
+            base = ExLlamaV2Cache_Qwen4Exp
+        elif getattr(cfg, "hybrid_linear_attn", False):
             base = ExLlamaV2Cache_Hybrid
         else:
             base = ExLlamaV2Cache_SWA if getattr(cfg, "sliding_window", 0) else ExLlamaV2Cache
@@ -1667,13 +1796,17 @@ def tp_rank_cache(
         # no num_key_value_heads (it derives per-layer geometry itself) -- mirrors
         # ExLlamaV2Cache_TP. Without this guard, non-Gemma TP archs (Qwen3MoE, Qwen3,
         # Llama) crash here because the MP path always builds an SWA base cache.
-        sp = model.tp_context.get_split(BROADCAST_KV)
-        n = 0
-        for d, a, b in sp:
-            if d == rank:
-                n = b - a
-                break
-        kwargs["num_key_value_heads"] = n
+        if bool(getattr(cfg.arch.lm, "tp_kv_replicate", False)):
+            # Replicated attention: every rank keeps the full KV head count.
+            kwargs["num_key_value_heads"] = cfg.num_key_value_heads
+        else:
+            sp = model.tp_context.get_split(BROADCAST_KV)
+            n = 0
+            for d, a, b in sp:
+                if d == rank:
+                    n = b - a
+                    break
+            kwargs["num_key_value_heads"] = n
 
     cache = base(**kwargs)
     tp_narrow_cache_to_rank(cache, model.tp_context, rank)
@@ -1702,7 +1835,8 @@ class ExLlamaV2Cache_TP(ExLlamaV2CacheBase):
 
         # Hybrid backbones need the GDN-state cache as the per-device base.
         if base is ExLlamaV2Cache and getattr(model.config, "hybrid_linear_attn", False):
-            base = ExLlamaV2Cache_Hybrid
+            base = ExLlamaV2Cache_Qwen4Exp if getattr(model.config.arch.lm, "hc_residual", False) \
+                else ExLlamaV2Cache_Hybrid
 
         # `num_key_value_heads` is only passed when the model has a single attention geometry.
         # For a per-layer-geometry model (Gemma-4: 16 kv heads on sliding layers, 4 on full

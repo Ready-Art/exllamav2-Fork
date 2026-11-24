@@ -164,6 +164,11 @@ class ExLlamaV2:
         emb = ExLlamaV2Embedding(self, cfg.arch.lm_prefix + getattr(archparams, "embed_key", "model.embed_tokens"))
         self.modules += [emb]
 
+        # Qwen4-Exp: widen the embedding into the hc_count-stream hyper-residual.
+        if getattr(cfg.arch.lm, "hc_residual", False):
+            from exllamav2.qwen4_exp import ExLlamaV2HyperConnection
+            self.modules += [ExLlamaV2HyperConnection(self, "hc_expand", "expand")]
+
         if archparams.keys["learned_pos_emb"]:
             pos_emb = ExLlamaV2PosEmbedding(self, archparams.keys["learned_pos_emb"])
             self.modules += [pos_emb]
@@ -191,6 +196,32 @@ class ExLlamaV2:
             if cfg.arch.lm.parallel_decoder_blocks:
                 pd = ExLlamaV2ParallelDecoder(self, layer_key, layer_idx, sliding_window = swa, rope_index = rope_index)
                 self.modules += [pd]
+            elif getattr(cfg.arch.lm, "hc_residual", False):
+                # Qwen3.8-Flash-Next (P7): hyper-connection wrapped blocks. The
+                # residual stream is hc_count x hidden; mix collapses it for the
+                # block, inject scatters the block output back into the streams.
+                from exllamav2.qwen4_exp import (
+                    ExLlamaV2HyperConnection, ExLlamaV2QSAAttention,
+                    ExLlamaV2Qwen4MoE, ExLlamaV2PLELayer,
+                )
+                ple_ids = getattr(cfg, "ple_layer_ids", None) or []
+                if layer_idx + 1 in ple_ids:
+                    self.modules += [ExLlamaV2PLELayer(self, layer_key + ".ple", layer_idx)]
+                if cfg.layer_types[layer_idx] == "linear_attention":
+                    block = ExLlamaV2GatedDeltaNet(self, layer_key, layer_idx,
+                                                   has_norm = False, has_residual = False)
+                    hc_key = layer_key + ".attn_hyper_connection"
+                else:
+                    block = ExLlamaV2QSAAttention(self, layer_key, layer_idx)
+                    hc_key = layer_key + ".attn_hyper_connection"
+                self.modules += [
+                    ExLlamaV2HyperConnection(self, hc_key, "mix", layer_idx, "attn"),
+                    block,
+                    ExLlamaV2HyperConnection(self, hc_key, "inject", layer_idx, "attn"),
+                    ExLlamaV2HyperConnection(self, layer_key + ".mlp_hyper_connection", "mix", layer_idx, "mlp"),
+                    ExLlamaV2Qwen4MoE(self, layer_key, layer_idx),
+                    ExLlamaV2HyperConnection(self, layer_key + ".mlp_hyper_connection", "inject", layer_idx, "mlp"),
+                ]
             elif getattr(cfg, "hybrid_linear_attn", False) and \
                     cfg.layer_types[layer_idx] == "linear_attention":
                 # Qwen3.5 gated-delta-net block replaces self_attn on linear layers.
@@ -200,7 +231,11 @@ class ExLlamaV2:
                 self.modules += [gdn, mlp]
             else:
                 attn = ExLlamaV2Attention(self, layer_key, layer_idx, sliding_window = swa, rope_index = rope_index)
-                if cfg.arch.lm.is_moe: mlp = ExLlamaV2MoEMLP(self, layer_key, layer_idx)
+                if getattr(cfg.arch.lm, "gemma4_moe_block", False):
+                    # Gemma-4-26B-A4B: parallel dense MLP + routed experts per layer.
+                    from exllamav2.gemma4_moe import ExLlamaV2Gemma4MoEBlock
+                    mlp = ExLlamaV2Gemma4MoEBlock(self, layer_key, layer_idx)
+                elif cfg.arch.lm.is_moe: mlp = ExLlamaV2MoEMLP(self, layer_key, layer_idx)
                 else: mlp = ExLlamaV2MLP(self, layer_key, layer_idx)
                 self.modules += [attn, mlp]
 
@@ -210,14 +245,22 @@ class ExLlamaV2:
                     ls = ExLlamaV2LayerScalar(self, layer_key + ".layer_scalar")
                     self.modules += [ls]
 
-        _norm_key = cfg.arch.lm_prefix + getattr(archparams, "norm_key", "model.norm")
-        if cfg.arch.lm.norm == "layernorm":
-            norm = ExLlamaV2LayerNorm(self, _norm_key)
-        elif cfg.arch.lm.norm == "rmsnorm":
-            norm = ExLlamaV2RMSNorm(self, _norm_key)
+        _norm_key_rel = getattr(archparams, "norm_key", "model.norm")
+        if _norm_key_rel is None:
+            # Qwen4-Exp has no final model norm: the global hyper-connection mixer
+            # (grouped RMSNorm + weighted stream sum) produces the head input.
+            from exllamav2.qwen4_exp import ExLlamaV2HyperConnection
+            self.modules += [ExLlamaV2HyperConnection(
+                self, cfg.arch.lm_prefix + "hyper_connection_mixer", "mix_only")]
         else:
-            raise ValueError("unknown norm type")
-        self.modules += [norm]
+            _norm_key = cfg.arch.lm_prefix + _norm_key_rel
+            if cfg.arch.lm.norm == "layernorm":
+                norm = ExLlamaV2LayerNorm(self, _norm_key)
+            elif cfg.arch.lm.norm == "rmsnorm":
+                norm = ExLlamaV2RMSNorm(self, _norm_key)
+            else:
+                raise ValueError("unknown norm type")
+            self.modules += [norm]
 
         self.head_layer_idx = len(self.modules)
         head = ExLlamaV2Linear(
@@ -659,6 +702,10 @@ class ExLlamaV2:
         # residual cuts prefill/long-context collective volume; EXL2_TP_SEQPAR=0 restores
         # the replicated-residual path (slightly faster pure short-ctx decode).
         self.tp_context.seqpar = os.environ.get("EXL2_TP_SEQPAR", "1") != "0"
+        # Qwen4-Exp: the hyper-connection mix reads all hc_count streams, so the
+        # residual must stay full-width on every rank (no hidden-sharded seqpar).
+        if bool(getattr(self.config.arch.lm, "tp_no_seqpar", False)):
+            self.tp_context.seqpar = False
         # Decode/verify-sized forwards keep a FULL-width replicated residual (no tiny
         # post-norm stat all_reduces); prefill chunks keep the seqpar shard flow.
         self.tp_context.decode_repl = self.tp_context.seqpar and \
@@ -690,6 +737,13 @@ class ExLlamaV2:
         if any(isinstance(m, ExLlamaV2MoEMLP) and (m.offload_experts > 0 or m._tp_shard)
                for m in self.modules):
             self.tp_graph.disable("MoE offload/sharding: data-dependent routing is not graph-capturable")
+        # Hybrid backbones (GDN torch scan + hyper-connection stash + PLE n-gram
+        # lookup) are not CUDA-graph-capturable yet; run eager. The GDN CUDA decode
+        # kernel (Qwen27B-Plan.md Phase 1) is the follow-up that re-enables graphs.
+        if getattr(self.config, "hybrid_linear_attn", False):
+            self.tp_graph.disable("Hybrid GDN backbone: eager until the GDN CUDA kernel lands")
+        if getattr(self.config.arch.lm, "gemma4_moe_block", False):
+            self.tp_graph.disable("Gemma-4 MoE block: data-dependent torch routing is not graph-capturable")
 
         # Size the device context for THIS rank only.
         #
@@ -747,6 +801,11 @@ class ExLlamaV2:
                         module.tp_load_rank(rank, BROADCAST_RS)
 
                 elif isinstance(module, ExLlamaV2LayerScalar):
+                    module.tp_load_rank(rank)
+
+                elif type(module).__name__ in ("ExLlamaV2HyperConnection", "ExLlamaV2PLELayer",
+                                               "ExLlamaV2Gemma4MoEBlock"):
+                    # Qwen4-Exp / Gemma-4 MoE block: rank-local loaders.
                     module.tp_load_rank(rank)
 
                 elif isinstance(module, ExLlamaV2Linear):
@@ -1018,7 +1077,10 @@ class ExLlamaV2:
 
         for module in self.modules:
             if isinstance(module, ExLlamaV2Attention) or \
-               isinstance(module, ExLlamaV2ParallelDecoder):
+               isinstance(module, ExLlamaV2ParallelDecoder) or \
+               isinstance(module, ExLlamaV2GatedDeltaNet):
+                # GDN layers carry recurrent cache state (hybrid backbone) and
+                # need a cache_map entry just like attention layers.
                 self.cache_map[module.layer_idx] = module.device()
 
 
@@ -2059,13 +2121,20 @@ class ExLlamaV2:
         ending at `pos`, using the staging recorded by the last MTP verify forward.
         Fans out across per-device caches in single-process TP. newplan.md P6.
         """
+        from exllamav2.qwen4_exp import ExLlamaV2PLELayer
         caches = cache.caches if hasattr(cache, "caches") else [cache]
         for c in caches:
-            if c is None or not getattr(c, "gdn_stage", None):
+            if c is None:
                 continue
-            for m in self.modules:
-                if isinstance(m, ExLlamaV2GatedDeltaNet):
-                    m.rewind_state(c, pos)
+            if getattr(c, "gdn_stage", None):
+                for m in self.modules:
+                    if isinstance(m, ExLlamaV2GatedDeltaNet):
+                        m.rewind_state(c, pos)
+            if getattr(c, "ple_stage", None):
+                for m in self.modules:
+                    if isinstance(m, ExLlamaV2PLELayer):
+                        m.rewind_state(c, pos)
+                c.ple_stage = None
             c.gdn_staging = False
             c.gdn_stage = {}
             c.gdn_stage_start = -1
@@ -2132,6 +2201,11 @@ class ExLlamaV2:
         # assert cache is None or isinstance(cache, list) or batch_size <= cache.batch_size
 
         x = input_ids
+
+        # Qwen4-Exp PLE: the n-gram lookup needs the original token ids (the module
+        # loop only passes the residual). Stash them for the PLE layer.
+        if cache is not None and getattr(self.config.arch.lm, "ple_ngram", False):
+            cache._ple_ids = input_ids
 
         if not attn_params:
             attn_params = ExLlamaV2Attention.Params(batch_size, seq_len, past_len, input_mask, position_offsets)

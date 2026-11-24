@@ -174,6 +174,11 @@ class ExLlamaV2Module:
             if cfg.arch.orig_weights_transposed and len(tensor.shape) == 2:
                 tensor = tensor.T
 
+            # Fused 3D expert tensors (Qwen4-Exp / Gemma-4 MoE: gate_up_proj
+            # [E, 2I, H], down_proj [E, H, I]) slice along the FLATTENED row axis.
+            if len(tensor.shape) == 3:
+                tensor = tensor.reshape(-1, tensor.shape[-1])
+
             if altpack_qkv:
                 ts = tensor.shape
                 h, gs, d = cfg.num_key_value_heads, cfg.num_key_value_groups + 2, cfg.head_dim

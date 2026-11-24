@@ -13,6 +13,8 @@ from exllamav2.model import \
 )
 
 from exllamav2.layer_scalar import ExLlamaV2LayerScalar
+from exllamav2.qwen4_exp import ExLlamaV2HyperConnection, ExLlamaV2PLELayer
+from exllamav2.gemma4_moe import ExLlamaV2Gemma4MoEBlock
 from safetensors import safe_open
 from safetensors.torch import save_file
 from exllamav2.conversion.qparams import QParams, qparams_headoptions, qparams_attn, qparams_mlp, qparams_gdn, get_qparams_reduced
@@ -619,6 +621,15 @@ def measure_quant(job, save_fn, model, hidden_state_offload_layers):
             quantizers["up_proj"] = AdaptiveGPTQ(module.up_proj.linear)
             quantizers["down_proj"] = AdaptiveGPTQ(module.down_proj.linear)
 
+        elif isinstance(module, ExLlamaV2Gemma4MoEBlock):
+            # Gemma-4-26B-A4B: quantize the routed experts; the dense branch,
+            # router and norms stay fp16 (compile copies them through).
+            mode = "block_sparse_moe"
+            for i in range(model.config.num_experts):
+                quantizers[f"w1.{i}"] = AdaptiveGPTQ(module.w1[i].linear)
+                quantizers[f"w3.{i}"] = AdaptiveGPTQ(module.w3[i].linear)
+                quantizers[f"w2.{i}"] = AdaptiveGPTQ(module.w2[i].linear)
+
         elif isinstance(module, ExLlamaV2MoEMLP):
             mode = "block_sparse_moe"
             for i in range(model.config.num_experts):
@@ -651,6 +662,18 @@ def measure_quant(job, save_fn, model, hidden_state_offload_layers):
 
         elif isinstance(module, ExLlamaV2PosEmbedding):
             mode = "pos_emb"
+
+        elif isinstance(module, ExLlamaV2HyperConnection):
+            # fp16 pass-through: run the forward to propagate the (width-changing)
+            # residual, no quantizers. compile.py copies the raw weights.
+            mode = "hc"
+
+        elif isinstance(module, ExLlamaV2PLELayer):
+            # fp16 pass-through. The PLE contribution depends on the calibration
+            # token ids, which the module loop does not carry; calibration runs
+            # without it (identity), compile.py copies the raw weights and the
+            # n-gram table is converted by convert_ngram.py.
+            mode = "ple"
 
         # Reference forward pass
 
@@ -702,7 +725,10 @@ def measure_quant(job, save_fn, model, hidden_state_offload_layers):
                     print(" ## Measurement/inference error (3)")
                     os._exit(1)
 
-                outputs = active.forward(x, cache, attn_params, intermediates = True)
+                if mode == "ple":
+                    outputs = { "hidden_states": x }
+                else:
+                    outputs = active.forward(x, cache, attn_params, intermediates = True)
                 target_device = dev_str if i < hidden_state_offload_layers else "cpu"
 
                 for k, v in outputs.items():
@@ -765,6 +791,9 @@ def measure_quant(job, save_fn, model, hidden_state_offload_layers):
                     ts.append(outputs["hidden_states"].to(target_device))
 
                 if mode == "pos_emb":
+                    ts.append(outputs["hidden_states"].to(target_device))
+
+                if mode in ("hc", "ple"):
                     ts.append(outputs["hidden_states"].to(target_device))
 
             # NOTE: this return must be at the function body level, NOT inside the row loop.

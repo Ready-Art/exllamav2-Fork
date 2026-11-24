@@ -194,9 +194,18 @@ def mp_worker(conn, device, world_size, rank, init_method, uuid_hex, model_dir, 
             elif cmd == "set-seqlen":
                 # MTP: distributed rewind. All ranks must move current_seq_len together
                 # (the SWA ring shift is a deterministic function of it -- BUG 94).
-                ctx["cache"].current_seq_len = args[0]
-                if args[0] == 0:
-                    ctx["cache"].window_beg = 0   # full reset (new sequence)
+                _c = ctx["cache"]
+                _n = args[0]
+                # Hybrid GDN/PLE recurrent state: restore the staged accepted prefix
+                # (verify wrote state for rejected rows too). Full reset zeroes it.
+                if hasattr(_c, "gdn_staging"):
+                    if _n == 0:
+                        _c.reset()
+                    elif getattr(_c, "gdn_stage", None) or getattr(_c, "ple_stage", None):
+                        ctx["model"].gdn_rewind_to(_c, _n)
+                _c.current_seq_len = _n
+                if _n == 0:
+                    _c.window_beg = 0   # full reset (new sequence)
                 conn.send(("ok", None))
             elif cmd == "reset-cache":
                 # MTP validation: zero current_seq_len + window_beg on this rank.
@@ -834,6 +843,13 @@ def _worker_forward(ctx, input_ids, past_len, seq_len, batch_size, last_id_only,
     model = ctx["model"]
     cache = ctx["cache"]
 
+    # Hybrid backbone (Qwen3.5 / Qwen4-Exp): the MTP verify window writes GDN/PLE
+    # state for ALL rows, including rejected ones. Stage the per-token inputs so
+    # the distributed rewind (set-seqlen -> gdn_rewind_to) can restore the exact
+    # accepted-prefix state. Every rank agrees (same flags).
+    if graph_verify and return_row_states and hasattr(cache, "gdn_staging"):
+        cache.gdn_staging = True
+
     # BUG 63: the embedding table is device-resident in a worker (tp_load_rank moves it off
     # the host), so the token ids have to be on that device too.
     dev = ctx["device"]
@@ -1226,6 +1242,12 @@ class TPProcessGroup:
         if getattr(drafter, "is_dflash", False):
             self._enable_dflash(drafter)
             return
+        if getattr(drafter, "is_builtin", False):
+            # Built-in MTP (Qwen3.5 / Qwen4-Exp): the drafter keeps its OWN KV and
+            # borrows the target's embed/head; no joined target-KV shadow exists.
+            self._mtp_kv = None
+            self._enable_builtin_mtp(drafter)
+            return
         # INT8-primary target KV: the drafter's joined full-layer shadow goes INT8
         # too (the gather pipes INT8 directly -- half the bytes, no fp16 full-depth
         # shadow on the drafter device). The P10 INT8 drafter attention path serves
@@ -1322,6 +1344,30 @@ class TPProcessGroup:
                         self.mtp_reset_row(r)
                 except Exception:
                     pass
+
+    def _enable_builtin_mtp(self, drafter):
+        """Built-in MTP wiring: no target-KV shadow, no aux taps. Just a load-time
+        warmup of the target's eager hybrid forward + one drafter window, then a
+        full cache reset. Failure is non-fatal (first request pays the cost)."""
+        if os.environ.get("EXL2_MTP_WARMUP", "1") == "0":
+            return
+        try:
+            import time as _time
+            _t0 = _time.perf_counter()
+            print("[mtp] built-in warmup: target forward + drafter window...", flush=True)
+            dummy = torch.tensor([[0, 0]], dtype=torch.long)
+            _logits, _state = self.forward_state(dummy, last_id_only=True, cpu_logits=True)
+            drafter.gather_target(self)
+            drafter.draft_window(torch.tensor([[0]], dtype=torch.long),
+                                 _state[:, -1:, :].float().cpu(), 2, 1)
+            self.mtp_reset_cache()
+            print(f"[mtp] built-in warmup done in {_time.perf_counter() - _t0:.1f}s", flush=True)
+        except Exception as e:
+            print(f"[mtp] built-in warmup skipped ({type(e).__name__}: {e})", flush=True)
+            try:
+                self.mtp_reset_cache()
+            except Exception:
+                pass
 
     def _enable_dflash(self, drafter):
         """DFlash wiring: aux taps on every rank, the full lm_head copy (vocab
@@ -1437,10 +1483,19 @@ class TPProcessGroup:
         for device, w in sorted(self.workers.items()):
             w.send("set-seqlen", (n,))
             w.recv()
+        # Master rank's own hybrid state mirrors the workers' set-seqlen handler.
+        if hasattr(self.cache, "gdn_staging"):
+            if n == 0:
+                self.cache.reset()
+            elif getattr(self.cache, "gdn_stage", None) or getattr(self.cache, "ple_stage", None):
+                self.model.gdn_rewind_to(self.cache, n)
         self.cache.current_seq_len = n
         # DFlash: the draft context length tracks the committed target length.
         # Round rewinds land at or above ctx_len (no-op); external trims shrink it.
         if getattr(self.mtp_drafter, "is_dflash", False):
+            self.mtp_drafter.trim(n)
+        # Built-in MTP adapter: track the committed length / handle external trims.
+        if hasattr(self.mtp_drafter, "trim") and not getattr(self.mtp_drafter, "is_dflash", False):
             self.mtp_drafter.trim(n)
 
     def snapshot_prompt_ring(self):

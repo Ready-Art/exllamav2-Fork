@@ -141,7 +141,9 @@ def main():
         n = t.get_shape()[0]
         shard_ranges.append((base, base + n, sk))
         base += n
-    assert base == num_rows, f"source rows {base} != hash-param rows {num_rows}"
+    # Shards may be padded (make_ngram_vocab_size_divisible_by); padded rows are
+    # never referenced by the hash (mod prime vocab sizes) and are dropped.
+    assert base >= num_rows, f"source rows {base} < hash-param rows {num_rows}"
 
     def read_rows(a, b):
         parts = []
@@ -155,39 +157,65 @@ def main():
         idx = torch.arange(a, b)
         return (torch.searchsorted(head_offsets, idx, right = True) - 1).clamp(0, num_heads - 1)
 
-    # Per-head bias: sampled row mean (exl3 convention)
+    # Per-head bias: sampled row mean (exl3 convention). Read ONLY the sampled
+    # rows -- a head spans ~20M rows (6 GB), far too big to load whole.
     print(f" -- Computing per-head bias ({num_heads} heads)")
+
+    def read_rows_indexed(idx_list):
+        parts = []
+        for gi in idx_list:
+            for lo, hi, sk in shard_ranges:
+                if lo <= gi < hi:
+                    parts.append(handles[sk].get_slice(sk)[gi - lo:gi - lo + 1])
+                    break
+        return torch.cat(parts, dim = 0)
+
     bias = torch.zeros(num_heads, args.head_dim, dtype = torch.float)
     for h in range(num_heads):
         off = int(head_offsets[h].item())
         size = int(head_vocab_sizes[h].item())
         n = min(size, args.bias_sample_rows)
         step = max(1, size // n)
-        idx = torch.arange(0, size, step)[:n] + off
-        rows = read_rows(int(idx[0].item()), int(idx[-1].item()) + 1)
-        rows = rows.index_select(0, idx - int(idx[0].item())).float()
+        idx = (torch.arange(0, size, step)[:n] + off).tolist()
+        rows = read_rows_indexed(idx).float()
         bias[h] = rows.mean(dim = 0)
     bias = bias.half()
 
-    # Quantize + pack, streaming
+    # Quantize + pack, STREAMING to disk: the Flash-Next table is 320M rows
+    # (~51 GB at 8 bit), far too big to accumulate in host RAM. q_rows goes into
+    # its own safetensors file written chunk by chunk (header + raw payload);
+    # the small aux tensors go into a second file.
     print(f" -- Quantizing {num_rows} rows x {args.head_dim} @ {args.bits} bit")
-    packed_chunks = []
-    scale_chunks = []
-    for a in range(0, num_rows, args.chunk):
-        b = min(a + args.chunk, num_rows)
-        rows = read_rows(a, b).to(dev).float()
-        heads = head_of(a, b)
-        resid = rows - bias[heads].to(dev).float()
-        scale = resid.abs().amax(dim = 1).clamp_min(1e-12) / denom
-        q = torch.clamp(torch.round(resid / scale[:, None]) + zero, 0, maxq).to(torch.int64)
-        packed_chunks.append(pack_rows(q, args.bits).cpu())
-        scale_chunks.append(scale.half().cpu())
-        if (a // args.chunk) % 64 == 0:
-            print(f"    {b}/{num_rows} rows")
-
     os.makedirs(args.out_dir, exist_ok = True)
+    words = args.head_dim * args.bits // 32
+    row_bytes = words * 4
+    rows_path = os.path.join(args.out_dir, "ngram-rows-00001.safetensors")
+    import struct
+    header = {
+        key + ".q_rows": {
+            "dtype": "I32", "shape": [num_rows, words],
+            "data_offsets": [0, num_rows * row_bytes],
+        },
+        "__metadata__": {"format": "pt"},
+    }
+    hb = json.dumps(header).encode("utf-8")
+    hb += b" " * ((8 - len(hb) % 8) % 8)
+    scale_chunks = []
+    with open(rows_path, "wb") as rf:
+        rf.write(struct.pack("<Q", len(hb)))
+        rf.write(hb)
+        for a in range(0, num_rows, args.chunk):
+            b = min(a + args.chunk, num_rows)
+            rows = read_rows(a, b).to(dev).float()
+            heads = head_of(a, b)
+            resid = rows - bias[heads].to(dev).float()
+            scale = resid.abs().amax(dim = 1).clamp_min(1e-12) / denom
+            q = torch.clamp(torch.round(resid / scale[:, None]) + zero, 0, maxq).to(torch.int64)
+            rf.write(pack_rows(q, args.bits).cpu().numpy().tobytes())
+            scale_chunks.append(scale.half().cpu())
+            if (a // args.chunk) % 64 == 0:
+                print(f"    {b}/{num_rows} rows")
     out = {
-        key + ".q_rows": torch.cat(packed_chunks, dim = 0),
         key + ".q_row_scales": torch.cat(scale_chunks, dim = 0),
         key + ".head_offsets": head_offsets,
         key + ".head_vocab_sizes": head_vocab_sizes,
@@ -203,7 +231,7 @@ def main():
     }
     with open(os.path.join(args.out_dir, "ngram_config.json"), "w") as f:
         json.dump(cfg, f, indent = 4)
-    print(f" -- Wrote {out_path} ({os.path.getsize(out_path) / 1e9:.2f} GB)")
+    print(f" -- Wrote {rows_path} ({os.path.getsize(rows_path) / 1e9:.2f} GB) + {out_path}")
 
 
 if __name__ == "__main__":
