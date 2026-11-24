@@ -267,9 +267,17 @@ class TPGraphRunner:
         finally:
             # BUG 110: stop routing dev1-3 allocations to the pool (capture_begin/end handles
             # dev0 internally). Always run, even if capture failed, so the allocators recover.
+            # releasePool balances THIS capture's beginAllocateToPool incref; the manager's
+            # standing reference (graph_pool) keeps use_count >= 1 for the next recapture.
+            # Without the balance the count would ratchet up by 1 per recapture; without
+            # the standing reference it would hit 0 and the next recapture would assert.
             for _d in _pooled_devs:
                 try:
                     torch._C._cuda_endAllocateToPool(_d, _pool)
+                except Exception:
+                    pass
+                try:
+                    torch._C._cuda_releasePool(_d, _pool)
                 except Exception:
                     pass
             for _c in (ctx.ext_tp_contexts.values() if ctx.ext_tp_contexts
@@ -335,14 +343,85 @@ class TPGraphManager:
         # timeout, dd.txt). The old graph of a shape is released before its recapture,
         # so reusing its pool keeps the reserved footprint flat.
         self._graph_pools: dict[tuple, object] = {}
+        # Standing references that keep each pool's allocator use_count >= 1 across
+        # recaptures (see graph_pool). _pool_devs: devices with a manual standing
+        # begin+end reference; _pool_dummies: dev0/host standing reference graphs.
+        self._pool_devs: dict[tuple, list] = {}
+        self._pool_dummies: dict[tuple, tuple] = {}
 
     def graph_pool(self, key: tuple):
-        """Stable private graph pool for a shape, created once and reused on recapture."""
+        """Stable private graph pool for a shape, created once and reused on recapture.
+
+        torch's allocator ASSERTs use_count > 0 when a capture reuses an existing
+        pool id (create_or_incref_pool, CUDACachingAllocator.cpp:3473), and
+        releasePool -- run by the CUDAGraph destructor -- decrements use_count to 0
+        when the shape's old graph is released before recapture. A bare stable pool
+        therefore dies on its FIRST recapture ("it->second->use_count > 0 INTERNAL
+        ASSERT FAILED", verify-capture fallback / rank desync). Keep a standing
+        reference per pool so the count never reaches 0 while the shape lives:
+
+        * dev1-N: a manual beginAllocateToPool + endAllocateToPool pair. begin
+          increfs; end only closes the allocation scope (no decref), so the +1
+          stands without routing any later eager allocation into the pool. Each
+          capture's own begin is balanced by a releasePool in capture()'s finally.
+        * dev0 + the HOST (pinned) allocator: capture_begin/end incref both, and
+          the graph destructor releases both -- but only dev0 has a Python binding
+          (_cuda_releasePool is device-only). A tiny dummy CUDAGraph captured into
+          the pool and kept alive provides the standing +1 on both.
+        """
         pool = self._graph_pools.get(key)
         if pool is None:
             pool = torch.cuda.graph_pool_handle()
             self._graph_pools[key] = pool
+            ctx = self.model.tp_context
+            dev0 = ctx.device
+            devs = [d for d in ctx.all_devices() if d != dev0]
+            for d in devs:
+                torch._C._cuda_beginAllocateToPool(d, pool)
+                torch._C._cuda_endAllocateToPool(d, pool)
+            self._pool_devs[key] = devs
+            # Dummy standing-reference graph (dev0 + host allocator). Captured on
+            # dev0's TP stream; the caller (capture) has already synced dev0.
+            g = torch.cuda.CUDAGraph()
+            keep = None
+            with torch.cuda.device(dev0):
+                prev = torch.cuda.current_stream(dev0)
+                torch.cuda.set_stream(ctx.streams_dev[dev0])
+                try:
+                    g.capture_begin(pool=pool)
+                    keep = torch.zeros(1, device=dev0)
+                    g.capture_end()
+                except Exception:
+                    # Roll back the standing references so a retry starts clean.
+                    try:
+                        g.capture_end()
+                    except Exception:
+                        pass
+                    for d in devs:
+                        try:
+                            torch._C._cuda_releasePool(d, pool)
+                        except Exception:
+                            pass
+                    self._graph_pools.pop(key, None)
+                    self._pool_devs.pop(key, None)
+                    raise
+                finally:
+                    torch.cuda.set_stream(prev)
+            self._pool_dummies[key] = (g, keep)
         return pool
+
+    def release_pools(self):
+        """Drop every standing pool reference (permanent graph disable / teardown):
+        use_count -> 0 makes the pools freeable so the allocator can reclaim them."""
+        for key, pool in self._graph_pools.items():
+            for d in self._pool_devs.get(key, []):
+                try:
+                    torch._C._cuda_releasePool(d, pool)
+                except Exception:
+                    pass
+        self._pool_dummies.clear()
+        self._graph_pools.clear()
+        self._pool_devs.clear()
 
     def p2p_epoch(self, key: tuple, p2p) -> int:
         """Enter the shape's permanent P2P slot region for warmup + capture.
@@ -457,3 +536,4 @@ class TPGraphManager:
         for k in list(self.runners.keys()):
             self.runners.pop(k).release()
         self.runners.clear()
+        self.release_pools()
