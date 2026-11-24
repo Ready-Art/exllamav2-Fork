@@ -86,7 +86,7 @@ def _parent_watchdog(parent_pid):
 
 
 def mp_worker(conn, device, world_size, rank, init_method, uuid_hex, model_dir, gpu_split,
-              max_seq_len, cache_tokens, cache_base_name, max_batch = 1):
+              max_seq_len, cache_tokens, cache_base_name, max_batch = 1, max_input_len = 2048):
     """
     Worker process entry point. Owns one GPU for the lifetime of the model.
 
@@ -107,6 +107,7 @@ def mp_worker(conn, device, world_size, rank, init_method, uuid_hex, model_dir, 
         cfg.prepare()
         cfg.arch_compat_overrides()
         cfg.max_seq_len = max_seq_len
+        cfg.max_input_len = max_input_len
 
         model = ExLlamaV2(cfg)
         # Load ONLY this rank's shard. load_tp() would materialise every module in full on
@@ -904,7 +905,7 @@ class TPProcessGroup:
     """
 
     def __init__(self, model_dir, gpu_split, max_seq_len, cache_tokens, cache_base_name,
-                 master_device = 0, verbose = False, max_batch = 1):
+                 master_device = 0, verbose = False, max_batch = 1, max_input_len = 2048):
         import multiprocessing
         multiprocessing.set_start_method("spawn", force = True)
         torch.multiprocessing.set_sharing_strategy("file_system")
@@ -912,6 +913,7 @@ class TPProcessGroup:
         self.model_dir = model_dir
         self.gpu_split = gpu_split
         self.max_seq_len = max_seq_len
+        self.max_input_len = max_input_len
         self.cache_tokens = cache_tokens
         self.cache_base_name = cache_base_name
         self.master_device = master_device
@@ -958,7 +960,7 @@ class TPProcessGroup:
                 args = (child_conn, device, self._world_size, rank, self._init_method,
                         uuid_hex, self.model_dir, self.gpu_split, self.max_seq_len,
                         self.cache_tokens * self.max_batch, self.cache_base_name,
-                        self.max_batch),
+                        self.max_batch, self.max_input_len),
                 daemon = True,
             )
             proc.start()
@@ -978,6 +980,7 @@ class TPProcessGroup:
         cfg.prepare()
         cfg.arch_compat_overrides()
         cfg.max_seq_len = self.max_seq_len
+        cfg.max_input_len = self.max_input_len
 
         model = ExLlamaV2(cfg)
         model.load_tp_rank(self.master_device, self.gpu_split,
