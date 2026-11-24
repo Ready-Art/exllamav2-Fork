@@ -199,7 +199,10 @@ class TPGraphRunner:
         # (the bonus graph crashed on its second replay, after the verify capture recycled its
         # dev1-3 buffers). Explicitly begin allocation-to-pool on every other device for the
         # duration of the capture so ALL graph buffers are pool-owned (live as long as the graph).
-        _pool = torch.cuda.graph_pool_handle()
+        # Reuse the shape's stable pool across recaptures (the old graph was released
+        # before this capture) so KV-envelope churn does not ratchet reserved VRAM.
+        _pool = (self.tp_graph.graph_pool(self.key)
+                 if self.tp_graph is not None else torch.cuda.graph_pool_handle())
         _pooled_devs = [d for d in ctx.all_devices() if d != dev0]
         for _d in _pooled_devs:
             torch._C._cuda_beginAllocateToPool(_d, _pool)
@@ -321,6 +324,21 @@ class TPGraphManager:
         # Stable P2P arena epoch per graph shape (see p2p_epoch). Survives runner
         # drops/clears: a recaptured shape reuses its region instead of leaking one.
         self._p2p_epochs: dict[tuple, int] = {}
+        # Stable private graph memory pool per shape, reused across recaptures of the
+        # same shape (KV-envelope churn). A fresh graph_pool_handle() per recapture
+        # carves a new pool and frees the old each time, ratcheting allocator reserved
+        # memory until the device pegs and a recapture OOM-desyncs the ranks (NCCL
+        # timeout, dd.txt). The old graph of a shape is released before its recapture,
+        # so reusing its pool keeps the reserved footprint flat.
+        self._graph_pools: dict[tuple, object] = {}
+
+    def graph_pool(self, key: tuple):
+        """Stable private graph pool for a shape, created once and reused on recapture."""
+        pool = self._graph_pools.get(key)
+        if pool is None:
+            pool = torch.cuda.graph_pool_handle()
+            self._graph_pools[key] = pool
+        return pool
 
     def p2p_epoch(self, key: tuple, p2p) -> int:
         """Enter the shape's permanent P2P slot region for warmup + capture.
