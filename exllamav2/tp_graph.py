@@ -78,6 +78,10 @@ class TPGraphRunner:
         self.device = device
         self.key = key
         self.tp_context = tp_context
+        # Owning TPGraphManager, set by the caller (model.py). capture() uses it to reuse
+        # the stable per-shape graph pool; None falls back to a fresh pool. Must exist as
+        # an attribute so the `is not None` guard in capture() cannot itself AttributeError.
+        self.tp_graph = None
         self.graph: torch.cuda.CUDAGraph | None = None
         self.capture_stream: torch.cuda.Stream | None = None
         self.num_replays = 0

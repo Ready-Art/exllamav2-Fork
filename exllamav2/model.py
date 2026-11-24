@@ -1798,6 +1798,10 @@ class ExLlamaV2:
                 runner.input_buf = input_buf
                 runner.state_buf = state_buf
                 runner.aux_buf = aux_buf
+                # capture() reuses the manager's stable per-shape graph pool (graph_pool(key))
+                # so KV-envelope recaptures do not ratchet reserved VRAM. The runner has no
+                # pool of its own; give it the manager reference (None -> fresh pool fallback).
+                runner.tp_graph = self.tp_graph
                 # Stage the real inputs so warmup and capture run at the caller's position with the
                 # caller's tokens (the warmup KV writes are idempotent: same rows, same values).
                 stage_inputs(input_buf)
