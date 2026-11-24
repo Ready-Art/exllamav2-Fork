@@ -1190,6 +1190,20 @@ class ExLlamaV2:
         past_len = cache.current_seq_len
         assert past_len + q_len <= cache.max_seq_len, "Total sequence length exceeds cache size in model.forward"
 
+        # INT8-primary prefill staging: the full-layer fp16 buffers exist ONLY
+        # during prefill (the fp16 attention kernels read them); every chunk is
+        # quantized into the INT8 primary as it lands, and the staging is freed
+        # when the prefill ends. Row-view batch prefills are staged by the slot
+        # scheduler around its chunk loop; a row-view forward that finds no
+        # active staging (adapter solo path) owns its own begin/end here.
+        _i8_own_staging = False
+        if (getattr(cache, "int8_primary", False) and q_len > 1
+                and not kwargs.get("graph_verify", False)):
+            from exllamav2.cache import _RowCacheView
+            if not isinstance(cache, _RowCacheView) or not cache.i8_staging_active():
+                cache.begin_prefill_staging(past_len + q_len)
+                _i8_own_staging = True
+
         # Split sequence
 
         result = None
@@ -1217,6 +1231,8 @@ class ExLlamaV2:
                     1 if (_ctx.abort_flag is not None and _ctx.abort_flag.is_set()) else 0)
                 _dist.all_reduce(_ctx._abort_dev, op = _dist.ReduceOp.MAX)
                 if _ctx._abort_dev.item():
+                    if _i8_own_staging:
+                        cache.end_prefill_staging()
                     return None
 
             # Limit chunk_size to max_input_len
@@ -1332,6 +1348,8 @@ class ExLlamaV2:
             # the next chunk's collective.
             if abort_event and abort_event.is_set() \
                     and (self.tp_context is None or self.tp_context.rank is None):
+                if _i8_own_staging:
+                    cache.end_prefill_staging()
                 return
 
             if _trace:
@@ -1377,6 +1395,9 @@ class ExLlamaV2:
             last_state = r.get("last_state")
             if r.get("row_states") is not None:
                 row_states = r["row_states"]
+
+        if _i8_own_staging:
+            cache.end_prefill_staging()
 
         # BUG 117: checkpoint the FI plan buffers right after a long prefill so the
         # guard evidence distinguishes "corrupted during prefill" from "corrupted by
@@ -1451,6 +1472,13 @@ class ExLlamaV2:
         B = len(seq_lens)
         for m in self.modules:
             if not isinstance(m, ExLlamaV2Attention):
+                continue
+            # INT8-primary full layers never use FI wrappers (int8_attn_fast serves
+            # decode AND verify, graph-safe without plans). Skip planning entirely:
+            # no fp16 KV exists for the wrapper to page-view, and the wrapper VRAM
+            # and per-replay plan work are pure waste in this mode.
+            if (not m.sliding_window and getattr(cache, "int8_primary", False)
+                    and cache.get_kv_i8(m.layer_idx)[0] is not None):
                 continue
             # SWA layers keep K/V in a ring: row i's valid length is ring-relative
             # (seq_len - window_beg + i + 1), clamped to the ring depth. Full layers use
@@ -1828,6 +1856,9 @@ class ExLlamaV2:
                     break
                 except Exception as e:
                     _capture_err = e
+                    if os.environ.get("EXL2_TP_GRAPH_DEBUG", "0") != "0":
+                        import traceback
+                        print("[TP graph] capture traceback:\n" + traceback.format_exc(), flush=True)
                     ctx.graph_mode = False
                     runner = None
                 finally:

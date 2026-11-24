@@ -306,6 +306,25 @@ __global__ void int8_decode_merge_kernel
     o[((long)b * num_qo_heads + h) * HD + d] = __float2half(num * inv);
 }
 
+void int8_merge_cuda
+(
+    float* po,
+    float* pl,
+    half* o,
+    int num_head_rows,
+    int batch_size,
+    int num_splits,
+    int head_dim,
+    cudaStream_t stream
+)
+{
+    dim3 mgrid(num_head_rows, batch_size);
+    if (head_dim == 512)
+        int8_decode_merge_kernel<512><<<mgrid, 512, 0, stream>>>(po, pl, o, num_head_rows, num_splits);
+    else if (head_dim == 256)
+        int8_decode_merge_kernel<256><<<mgrid, 256, 0, stream>>>(po, pl, o, num_head_rows, num_splits);
+}
+
 void int8_decode_cuda
 (
     const half* q,

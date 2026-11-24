@@ -115,6 +115,57 @@ void kv_quant_chunk
     int head_dim
 );
 
+void kv_quant_new
+(
+    torch::Tensor src_k,
+    torch::Tensor src_v,
+    torch::Tensor k_i8,
+    torch::Tensor v_i8,
+    torch::Tensor k_scale,
+    torch::Tensor v_scale,
+    torch::Tensor pos,
+    int batch_size,
+    int q_len,
+    int kv_heads,
+    int head_dim,
+    torch::Tensor row_map
+);
+
+void kv_dequant
+(
+    torch::Tensor k_i8,
+    torch::Tensor v_i8,
+    torch::Tensor k_scale,
+    torch::Tensor v_scale,
+    torch::Tensor dst_k,
+    torch::Tensor dst_v,
+    int start,
+    int n,
+    int kv_heads,
+    int head_dim
+);
+
+void int8_attn_fast
+(
+    torch::Tensor q,
+    torch::Tensor k_i8,
+    torch::Tensor v_i8,
+    torch::Tensor k_scale,
+    torch::Tensor v_scale,
+    torch::Tensor o,
+    torch::Tensor po,
+    torch::Tensor pl,
+    torch::Tensor kv_len_dev,
+    int batch_size,
+    int q_len,
+    int num_qo_heads,
+    int num_kv_heads,
+    int num_splits,
+    double sm_scale,
+    int head_dim,
+    torch::Tensor row_map
+);
+
 void int8_decode
 (
     torch::Tensor q,

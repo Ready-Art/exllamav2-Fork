@@ -436,17 +436,21 @@ Kill switch `EXL2_PROMPT_OFFLOAD=0`; decision logging `EXL2_OFFLOAD_DEBUG=1`. `c
 the per-row VRAM depth — RAM extends the *number* of cached lineages, not a single
 conversation's attendable depth.
 
-### INT8 KV cache shadow (opt-in, default fp16)
+### INT8 KV cache — PRIMARY storage (opt-in, default fp16)
 
 Ampere has no FP8, so K/V are quantized to symmetric per-(token, head) **INT8 with fp16
-scales** and dequantized in-register by a custom split-KV flash-decode kernel (one warp per
-CTA, GQA, hd256/512, graph-safe). The shadow halves the decode KV read on the full-attention
-layers — the dominant bandwidth cost at long context. The fp16 cache stays primary
-(verify/prefill/SWA unchanged); the shadow adds ~50% KV VRAM. Batch-safe (per-row kv_lens).
+scales** and read by a custom **multi-warp split-KV attention kernel** (4 warps/CTA + 4-key
+unroll — the occupancy fix for the old warp-per-CTA family; GQA, hd256/512, graph-safe)
+serving **both decode and MTP verify**. INT8 is the **only** full-depth KV storage on the
+full-attention layers: **no fp16 shadow alongside**, so KV VRAM is **halved (~−50%)** and
+the decode/verify KV read is halved with it. fp16 full-depth buffers exist only as
+**transient prefill staging** (prefill kernels read fp16): allocated per prefill, each chunk
+quantized into the INT8 primary as it lands, freed when prefill ends; continuation prefills
+dequantize the INT8 prefix back into staging. SWA rings stay fp16. With MTP, the drafter's
+joined KV shadow goes INT8-primary automatically and the gather pipes INT8 directly (half
+the pipe bytes). Batch-safe (per-row kv_lens + row_map); clone/offload/restore move INT8.
+Full layers with head_dim 256/512; logit-softcap models stay fp16.
 Through TabbyAPI: `model.kv_cache_int8: true` (sets `EXL2_KV_INT8`). Default off.
-(INT8-**primary** target storage — dropping the fp16 copy to *reduce* KV VRAM — needs
-INT8 verify/prefill reader kernels and is in progress; the MTP shadow below already
-uses INT8-primary storage.)
 
 ### INT8 MTP drafter (opt-in, default fp16)
 
@@ -513,7 +517,7 @@ when disabled. Each is independent — enable any combination.
 
 | Feature | TabbyAPI option | Env var | Effect | VRAM |
 |---|---|---|---|---|
-| Target KV INT8 **shadow** | `model.kv_cache_int8: true` | `EXL2_KV_INT8=1` | faster base decode (full layers) | **+~50% KV** (fp16 kept primary) |
+| Target KV INT8 **primary** | `model.kv_cache_int8: true` | `EXL2_KV_INT8=1` | decode + verify read INT8 (full layers) | **−~50% KV** (no fp16 shadow) |
 | MTP drafter INT8 **weights** | `draft_model.mtp_int8_weights: true` | `EXL2_MTP_INT8_W=1` | +12% gen @25k | ~neutral |
 | MTP KV INT8 **primary** | `draft_model.mtp_int8_kv: true` | `EXL2_MTP_INT8_KV=1` | halved long-ctx draft KV read | **−~40% MTP shadow** |
 | MoE expert offload | `model.moe_offload_experts: N` | `EXL2_MOE_OFFLOAD=N` | fit big MoE on small cards | experts → host RAM |
@@ -529,7 +533,7 @@ model:
   tensor_parallel_backend: mp
   gpu_split: [22, 22, 22, 22]
   cache_size: 160000
-  kv_cache_int8: true          # target decode INT8 shadow (speed; +KV VRAM)
+  kv_cache_int8: true          # target INT8-primary KV (decode + verify; −KV VRAM)
   # moe_offload_experts: 8     # for MoE models: last 8 experts/layer -> pinned RAM
 draft_model:
   draft_mode: mtp

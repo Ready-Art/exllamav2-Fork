@@ -197,6 +197,170 @@ void kv_quant_shadow_cuda
     );
 }
 
+// INT8-primary write: quantize the NEW rows (src batch,q_len,kvh,hd) directly into
+// the full-depth INT8 destination. Same per-(token,head) symmetric scheme and
+// device-side position logic as kv_quant_shadow_kernel, but src and dst depths
+// differ (src is the fresh q_len-row projection output, not a cache buffer).
+__global__ void kv_quant_new_kernel
+(
+    const half* __restrict__ src_k,
+    const half* __restrict__ src_v,
+    int8_t* __restrict__ k_i8,
+    int8_t* __restrict__ v_i8,
+    half* __restrict__ k_scale,
+    half* __restrict__ v_scale,
+    const int32_t* __restrict__ pos,
+    const int32_t* __restrict__ row_map,
+    int batch_size,
+    int q_len,
+    int kv_heads,
+    int head_dim,
+    int dst_depth
+)
+{
+    int idx = blockIdx.x;
+    int head = idx % kv_heads;
+    int row = idx / kv_heads;
+    int b = row / q_len;
+    int t = row - b * q_len;
+
+    int p = pos[b];
+    if (p < 0) return;
+    int cache_b = row_map ? row_map[b] : b;
+    int dst_row = p + t;
+    if (dst_row >= dst_depth) return;
+
+    long soff = (((long)b * q_len + t) * kv_heads + head) * head_dim;
+    long doff = (((long)cache_b * dst_depth + dst_row) * kv_heads + head) * head_dim;
+    const half* kp = src_k + soff;
+    const half* vp = src_v + soff;
+
+    float mk = 0.0f, mv = 0.0f;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x)
+    {
+        mk = fmaxf(mk, fabsf(__half2float(kp[i])));
+        mv = fmaxf(mv, fabsf(__half2float(vp[i])));
+    }
+    __shared__ float red[512];
+    red[threadIdx.x] = mk;
+    red[blockDim.x + threadIdx.x] = mv;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (threadIdx.x < s)
+        {
+            red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
+            red[blockDim.x + threadIdx.x] = fmaxf(red[blockDim.x + threadIdx.x], red[blockDim.x + threadIdx.x + s]);
+        }
+        __syncthreads();
+    }
+    half shk = __float2half(red[0] / 127.0f);
+    half shv = __float2half(red[blockDim.x] / 127.0f);
+    float usk = __half2float(shk); if (usk == 0.0f) usk = 1e-8f;
+    float usv = __half2float(shv); if (usv == 0.0f) usv = 1e-8f;
+
+    long ss = ((long)cache_b * dst_depth + dst_row) * kv_heads + head;
+    if (threadIdx.x == 0)
+    {
+        k_scale[ss] = shk;
+        v_scale[ss] = shv;
+    }
+    float inv_k = 1.0f / usk, inv_v = 1.0f / usv;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x)
+    {
+        int qk = (int)rintf(__half2float(kp[i]) * inv_k);
+        int qv = (int)rintf(__half2float(vp[i]) * inv_v);
+        qk = max(-127, min(127, qk));
+        qv = max(-127, min(127, qv));
+        k_i8[doff + i] = (int8_t)qk;
+        v_i8[doff + i] = (int8_t)qv;
+    }
+}
+
+void kv_quant_new_cuda
+(
+    cudaStream_t stream,
+    const half* src_k,
+    const half* src_v,
+    int8_t* k_i8,
+    int8_t* v_i8,
+    half* k_scale,
+    half* v_scale,
+    const int32_t* pos,
+    const int32_t* row_map,
+    int batch_size,
+    int q_len,
+    int kv_heads,
+    int head_dim,
+    int dst_depth
+)
+{
+    int blocks = batch_size * q_len * kv_heads;
+    if (blocks <= 0) return;
+    kv_quant_new_kernel<<<blocks, 256, 0, stream>>>
+    (
+        src_k, src_v, k_i8, v_i8, k_scale, v_scale,
+        pos, row_map, batch_size, q_len, kv_heads, head_dim, dst_depth
+    );
+}
+
+// INT8 -> fp16 dequantize (prefill continuation staging). One thread per element;
+// scale is the fp16-rounded per-(token,head) value written by the quant kernels.
+__global__ void kv_dequant_kernel
+(
+    const int8_t* __restrict__ k_i8,
+    const int8_t* __restrict__ v_i8,
+    const half* __restrict__ k_scale,
+    const half* __restrict__ v_scale,
+    half* __restrict__ dst_k,
+    half* __restrict__ dst_v,
+    int start,
+    int n,
+    int kv_heads,
+    int head_dim
+)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n * kv_heads * head_dim;
+    if (idx >= total) return;
+    int row_elems = kv_heads * head_dim;
+    int t = idx / row_elems;
+    int rem = idx - t * row_elems;
+    int head = rem / head_dim;
+    long soff = ((long)(start + t) * kv_heads + head) * head_dim + (rem - head * head_dim);
+    long ss = (long)(start + t) * kv_heads + head;
+    float sk = __half2float(k_scale[ss]);
+    float sv = __half2float(v_scale[ss]);
+    dst_k[idx] = __float2half((float)k_i8[soff] * sk);
+    dst_v[idx] = __float2half((float)v_i8[soff] * sv);
+}
+
+void kv_dequant_cuda
+(
+    cudaStream_t stream,
+    const int8_t* k_i8,
+    const int8_t* v_i8,
+    const half* k_scale,
+    const half* v_scale,
+    half* dst_k,
+    half* dst_v,
+    int start,
+    int n,
+    int kv_heads,
+    int head_dim
+)
+{
+    int total = n * kv_heads * head_dim;
+    if (total <= 0) return;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    kv_dequant_kernel<<<blocks, threads, 0, stream>>>
+    (
+        k_i8, v_i8, k_scale, v_scale, dst_k, dst_v,
+        start, n, kv_heads, head_dim
+    );
+}
+
 // Quantize a contiguous fp16 chunk (n, kvh, hd) into ONE row of a full-depth INT8
 // destination at absolute row dst_row (source and destination depths differ -- the
 // MTP gather stages deltas through a small fp16 buffer when INT8 is primary).

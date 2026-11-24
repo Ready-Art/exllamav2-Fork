@@ -33,6 +33,20 @@ void int8_decode_cuda
     cudaStream_t stream
 );
 
+// Merge split-KV partials (shared by the fast attention variant): po/pl are
+// (batch, num_splits, HR, HD/2) with HR = nq*q_len flattened head-rows.
+void int8_merge_cuda
+(
+    float* po,
+    float* pl,
+    half* o,
+    int num_head_rows,
+    int batch_size,
+    int num_splits,
+    int head_dim,
+    cudaStream_t stream
+);
+
 // INT8 verify attention (q_len rows, causal limit kv_len_dev[b]-q_len+r+1 per row).
 // q (batch, q_len, nq, HD); partials po/pl sized (batch, splits, nq*q_len, ...).
 void int8_verify_cuda

@@ -2196,7 +2196,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                 print(f"[TP] layer {self.layer_idx} hd={self.head_dim} kvh={self.num_key_value_heads} "
                       f"nkg={self.num_key_value_groups} rope_idx={self.rope_index} "
                       f"split=({a},{b}) q={tuple(q[idx].shape)} k={tuple(k[idx].shape)} v={tuple(v[idx].shape)} "
-                      f"kcache={None if k_cache is None else tuple(k_cache[idx].shape)} "
+                      f"kcache={None if k_cache is None or k_cache[idx] is None else tuple(k_cache[idx].shape)} "
                       f"past={past_len} qlen={q_len}", flush=True)
 
             if k_cache is not None:
@@ -2213,7 +2213,9 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                 # 256". Keep the head_dim guard.
                 if has_flash_attn_with_paged and not cfg.no_flash_attn and self.head_dim <= 256 \
                         and not self.model.tp_context.graph_mode \
-                        and getattr(attn_params, "batch_seq_lens", None) is None:
+                        and getattr(attn_params, "batch_seq_lens", None) is None \
+                        and not (getattr(cache, "int8_primary", False)
+                                 and cache.get_kv_i8(self.layer_idx)[idx] is not None):
                     # (Multi-batch capture warmup bypasses FA2: its cache_seqlens KV write
                     # addresses batch rows 0..B-1 at one scalar position, which is wrong
                     # for a non-identity slot row map / per-row positions. The eager
@@ -2302,66 +2304,96 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                                 dev, self.model.tp_context.pos
                             )
                         )
-                        ext_c.kv_write(
-                            k[idx],
-                            v[idx],
-                            k_cache[idx],
-                            v_cache[idx],
-                            _write_pos,
-                            batch_size,
-                            q_len,
-                            k[idx].shape[2],
-                            self.head_dim,
-                            self.model.tp_context.row_map_tp.get(
-                                dev, self.model.tp_context.row_map
-                            )
-                        )
-                        # INT8 KV shadow (opt-in): quantize the rows just written so the
-                        # int8 flash-decode kernel reads half the bytes. Same device-side
-                        # position/row_map -> graph-safe. Full layers only (SWA rings fp16).
-                        _sh = getattr(cache, "kv_i8", None)
-                        if _sh and self.layer_idx in _sh:
-                            _ki, _vi, _ks, _vs = _sh[self.layer_idx]
-                            ext_c.kv_quant_shadow(
-                                k_cache[idx], v_cache[idx], _ki, _vi, _ks, _vs,
+                        _i8pair = cache.get_kv_i8(self.layer_idx)[idx] \
+                            if getattr(cache, "int8_primary", False) else None
+                        if _i8pair is not None:
+                            # INT8 PRIMARY: quantize the new projection rows straight
+                            # into the INT8 cache -- no full-depth fp16 copy exists.
+                            # Same device-side position/row_map -> graph-safe.
+                            _ki, _vi, _ks, _vs = _i8pair
+                            ext_c.kv_quant_new(
+                                k[idx], v[idx], _ki, _vi, _ks, _vs,
                                 _write_pos, batch_size, q_len,
                                 k[idx].shape[2], self.head_dim,
                                 self.model.tp_context.row_map_tp.get(
                                     dev, self.model.tp_context.row_map
                                 )
                             )
+                        else:
+                            ext_c.kv_write(
+                                k[idx],
+                                v[idx],
+                                k_cache[idx],
+                                v_cache[idx],
+                                _write_pos,
+                                batch_size,
+                                q_len,
+                                k[idx].shape[2],
+                                self.head_dim,
+                                self.model.tp_context.row_map_tp.get(
+                                    dev, self.model.tp_context.row_map
+                                )
+                            )
                         _fi_key = (
-                            dev, q[idx].shape[2], k_cache[idx].shape[2],
+                            dev, q[idx].shape[2],
+                            _i8pair[0].shape[2] if _i8pair is not None else k_cache[idx].shape[2],
                             self.head_dim, self.scaling,
                             self.sliding_window if self.sliding_window else -1
                         )
                         _ctx = self.model.tp_context
-                        if (_fi_hd and q_len == 1 and not self.sliding_window
-                                and getattr(cache, "kv_i8", None)
-                                and self.layer_idx in cache.kv_i8):
-                            # INT8 KV shadow decode: half the KV bytes of the fp16 FI path.
+                        if (_i8pair is not None and q_len == 1
+                                and not self.sliding_window):
+                            # INT8 PRIMARY decode: half the KV bytes of the fp16 FI path.
                             # Batch-safe: per-row kv_lens (kernel reads kv_len_dev[row]).
                             # The add MUST write a PERSISTENT buffer: a temporary result is
                             # freed after the call and the graph-private allocator reuses its
                             # address during capture, so the baked kernel pointer would alias
                             # another buffer on replay (frozen kv_len -> degenerate output).
                             _pl = _ctx.get_past_len_tp(_ctx.geometry_key_active)
-                            if _pl is not None and _pl.numel() >= batch_size:
-                                _src = _pl[:batch_size]
+                            if _pl is not None and _pl[idx].numel() >= batch_size:
+                                _src = _pl[idx][:batch_size]
                             elif torch.is_tensor(_write_pos):
                                 _src = _write_pos.expand(batch_size)
                             else:
                                 _src = torch.full((batch_size,), int(_write_pos),
                                                   dtype = torch.int32, device = dev)
                             _kvl_bufs = _ctx.__dict__.setdefault("_int8_kvl", {})
-                            _kvl = _kvl_bufs.get((dev, idx, batch_size))
+                            _kvl = _kvl_bufs.get((dev, idx, batch_size, 1))
                             if _kvl is None:
                                 _kvl = torch.zeros(batch_size, dtype = torch.int32, device = dev)
-                                _kvl_bufs[(dev, idx, batch_size)] = _kvl
+                                _kvl_bufs[(dev, idx, batch_size, 1)] = _kvl
                             torch.add(_src, 1, out = _kvl)
                             attn_output = self._attn_int8_decode(
-                                q[idx], k_cache[idx], v_cache[idx], dev, batch_size,
-                                _kvl, cache
+                                q[idx], dev, batch_size, _kvl, _i8pair,
+                                self.model.tp_context.row_map_tp.get(
+                                    dev, self.model.tp_context.row_map
+                                )
+                            )
+                        elif (_i8pair is not None and q_len > 1
+                                and not self.sliding_window):
+                            # INT8 PRIMARY verify (MTP window, q_len rows): the fast
+                            # multi-warp kernel reads the INT8 prefix once per kv-head
+                            # with per-row causal frontiers. Same persistent-kv_len
+                            # contract as decode (frontier = past + q_len here).
+                            _pl = _ctx.get_past_len_tp(_ctx.geometry_key_active)
+                            if _pl is not None and _pl[idx].numel() >= batch_size:
+                                _src = _pl[idx][:batch_size]
+                            elif torch.is_tensor(_write_pos):
+                                _src = _write_pos.expand(batch_size)
+                            else:
+                                _src = torch.full((batch_size,), int(_write_pos),
+                                                  dtype = torch.int32, device = dev)
+                            _kvl_bufs = _ctx.__dict__.setdefault("_int8_kvl", {})
+                            _kvl = _kvl_bufs.get((dev, idx, batch_size, q_len))
+                            if _kvl is None:
+                                _kvl = torch.zeros(batch_size, dtype = torch.int32, device = dev)
+                                _kvl_bufs[(dev, idx, batch_size, q_len)] = _kvl
+                            torch.add(_src, q_len, out = _kvl)
+                            attn_output = self._attn_int8_verify(
+                                q[idx], dev, batch_size, q_len, _kvl, _i8pair,
+                                self.model.tp_context.row_map_tp.get(
+                                    dev, self.model.tp_context.row_map
+                                )
                             )
                         elif (_fi_hd and q_len == 1
                                 and (_fi_key + (batch_size,)) in _ctx.fi_decode):
@@ -2499,6 +2531,8 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                         # a negative rel only drops leading rows of the chunk.
                         _swa_win = self.sliding_window if self.sliding_window else 0
                         _bsl = getattr(attn_params, "batch_seq_lens", None)
+                        _i8pair_e = cache.get_kv_i8(self.layer_idx)[idx] \
+                            if getattr(cache, "int8_primary", False) else None
                         if _bsl is not None:
                             # Multi-batch capture WARMUP (eager): write each batch row's
                             # K/V to its OWN cache row at its OWN position (ring-relative
@@ -2509,6 +2543,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                             _rmap = attn_params.batch_row_map
                             _wbs = attn_params.batch_window_begs
                             _max_end = 0
+                            _pos_list, _r_list = [], []
                             for _bi in range(batch_size):
                                 _r = _rmap[_bi]
                                 if _swa_win:
@@ -2519,11 +2554,23 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                                     _drop_b = 0
                                     _ca_b = _bsl[_bi]
                                 _cb_b = _ca_b + q_len - _drop_b
-                                k_cache[idx][_r:_r + 1, _ca_b:_cb_b, :, :].copy_(
-                                    k[idx][_bi:_bi + 1, _drop_b:, :, :])
-                                v_cache[idx][_r:_r + 1, _ca_b:_cb_b, :, :].copy_(
-                                    v[idx][_bi:_bi + 1, _drop_b:, :, :])
+                                if _i8pair_e is not None:
+                                    _pos_list.append(_ca_b)
+                                    _r_list.append(_r)
+                                else:
+                                    k_cache[idx][_r:_r + 1, _ca_b:_cb_b, :, :].copy_(
+                                        k[idx][_bi:_bi + 1, _drop_b:, :, :])
+                                    v_cache[idx][_r:_r + 1, _ca_b:_cb_b, :, :].copy_(
+                                        v[idx][_bi:_bi + 1, _drop_b:, :, :])
                                 _max_end = max(_max_end, _cb_b)
+                            if _i8pair_e is not None:
+                                _ki, _vi, _ks, _vs = _i8pair_e
+                                ext_c.kv_quant_new(
+                                    k[idx], v[idx], _ki, _vi, _ks, _vs,
+                                    torch.tensor(_pos_list, dtype = torch.int32, device = dev),
+                                    batch_size, q_len, k[idx].shape[2], self.head_dim,
+                                    torch.tensor(_r_list, dtype = torch.int32, device = dev)
+                                )
                             _drop = 0
                             cache_a = max(0, _max_end - q_len)
                             cache_b = cache_a + q_len
@@ -2536,9 +2583,56 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                                 _drop = 0
                                 cache_a = attn_params.past_len
                             cache_b = cache_a + q_len - _drop
-                            k_cache[idx][:batch_size, cache_a:cache_b, :, :].copy_(k[idx][:, _drop:, :, :])
-                            v_cache[idx][:batch_size, cache_a:cache_b, :, :].copy_(v[idx][:, _drop:, :, :])
-                        if _swa_win:
+                            if _i8pair_e is not None:
+                                # INT8 PRIMARY: quantize the new rows straight into the
+                                # INT8 cache. During prefill the fp16 staging ALSO gets
+                                # the rows (the fp16 prefill attention reads it); the
+                                # per-chunk quantize keeps INT8 consistent at every chunk
+                                # boundary, so end_prefill_staging is a pure free.
+                                _ki, _vi, _ks, _vs = _i8pair_e
+                                ext_c.kv_quant_new(
+                                    k[idx][:, _drop:, :, :].contiguous(),
+                                    v[idx][:, _drop:, :, :].contiguous(),
+                                    _ki, _vi, _ks, _vs,
+                                    torch.tensor([cache_a], dtype = torch.int32, device = dev),
+                                    batch_size, q_len - _drop, k[idx].shape[2], self.head_dim,
+                                    none_tensor
+                                )
+                                if cache.i8_staging_active():
+                                    k_cache[idx][:batch_size, cache_a:cache_b, :, :].copy_(
+                                        k[idx][:, _drop:, :, :])
+                                    v_cache[idx][:batch_size, cache_a:cache_b, :, :].copy_(
+                                        v[idx][:, _drop:, :, :])
+                                    for _bi in range(batch_size):
+                                        cache.note_i8_fill(_bi, cache_b)
+                            else:
+                                k_cache[idx][:batch_size, cache_a:cache_b, :, :].copy_(k[idx][:, _drop:, :, :])
+                                v_cache[idx][:batch_size, cache_a:cache_b, :, :].copy_(v[idx][:, _drop:, :, :])
+                        if (_i8pair_e is not None and not _swa_win
+                                and (q_len == 1 or not cache.i8_staging_active())):
+                            # INT8 PRIMARY eager attention: decode (q_len=1) and
+                            # verify (q_len>1, no fp16 staging) read the INT8 cache
+                            # directly. Prefill chunks (staging active) fall through
+                            # to the fp16 paths below -- staging holds their K/V.
+                            _rmap_e = torch.tensor(attn_params.batch_row_map,
+                                                   dtype = torch.int32, device = dev) \
+                                if _bsl is not None else None
+                            if q_len == 1:
+                                _kvl = torch.full((batch_size,), cache_b,
+                                                  dtype = torch.int32, device = dev)
+                                attn_output = self._attn_int8_decode(
+                                    q[idx], dev, batch_size, _kvl, _i8pair_e, _rmap_e)
+                            else:
+                                if _bsl is not None:
+                                    _kvl = torch.tensor(
+                                        [_bsl[_bi] + q_len for _bi in range(batch_size)],
+                                        dtype = torch.int32, device = dev)
+                                else:
+                                    _kvl = torch.full((batch_size,), cache_b,
+                                                      dtype = torch.int32, device = dev)
+                                attn_output = self._attn_int8_verify(
+                                    q[idx], dev, batch_size, q_len, _kvl, _i8pair_e, _rmap_e)
+                        elif _swa_win:
                             _ql = q_len - _drop
                             _fi_swa = (
                                 use_flashinfer(cfg)
@@ -2585,14 +2679,6 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                                     cfg,
                                     mask_override = _swa_mask
                                 )
-                        elif (_fi_hd and q_len == 1 and batch_size == 1
-                                and not self.sliding_window
-                                and getattr(cache, "kv_i8", None)
-                                and self.layer_idx in cache.kv_i8):
-                            attn_output = self._attn_int8_decode(
-                                q[idx], k_cache[idx], v_cache[idx], dev, batch_size,
-                                torch.tensor([cache_b], dtype = torch.int32, device = dev), cache
-                            )
                         elif _fi_hd and q_len == 1 and batch_size == 1:
                             # PERF: hd512 single-token decode via FlashInfer single_decode
                             # (~5x faster than the torch GEMV at 16k, gap widens with ctx).
@@ -2601,6 +2687,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                             )
                         elif (_fi_hd and q_len > 1 and batch_size == 1
                                 and not self.sliding_window
+                                and _i8pair_e is None
                                 and os.environ.get("EXL2_VERIFY_HD512_SPLIT", "0") != "0"
                                 and q_len * self.num_key_value_groups <= 32):
                             attn_output = self._attn_verify_split(
@@ -3044,18 +3131,21 @@ class ExLlamaV2Attention(ExLlamaV2Module):
             return hidden_states
 
 
-    def _attn_int8_decode(self, q, k_cache, v_cache, dev, batch_size, kv_len_dev, cache):
+    def _attn_int8_decode(self, q, dev, batch_size, kv_len_dev, i8pair, row_map = None):
         """
-        INT8 KV flash-decode (q_len=1, full layers, EXL2_KV_INT8=1). Reads the INT8 shadow
-        (half the KV bytes of fp16) with per-(token,head) fp16 scales, dequant in-register.
-        Graph-safe: device-side kv_len, persistent per-device partial buffers.
+        INT8 PRIMARY flash-decode (q_len=1, full layers, EXL2_KV_INT8=1). Reads the
+        INT8 primary cache (half the KV bytes of fp16) with per-(token,head) fp16
+        scales via the fast multi-warp kernel. Graph-safe: device-side kv_len,
+        persistent per-device partial buffers. row_map: logical batch row ->
+        physical cache row (batched graphs over an active slot subset); None =
+        identity (scalar / row-narrowed eager paths).
         """
         ctx = self.model.tp_context
-        ki, vi, ks, vs = cache.kv_i8[self.layer_idx]
+        ki, vi, ks, vs = i8pair
         nq = q.shape[2]
-        nkv = k_cache.shape[2]
+        nkv = ki.shape[2]
         hd = self.head_dim
-        depth = k_cache.shape[1]
+        depth = ki.shape[1]
         splits = max(8, min(256, depth // 512))
         bufs = ctx.__dict__.get("_int8_dec_bufs")
         if bufs is None:
@@ -3068,10 +3158,44 @@ class ExLlamaV2Attention(ExLlamaV2Module):
             bufs[(dev, batch_size, nq, splits)] = b
         po, pl = b
         o = torch.empty(batch_size, nq, hd, device = dev, dtype = torch.half)
-        ext_c.int8_decode(q.view(batch_size, nq, hd).contiguous(), ki, vi, ks, vs,
-                          o, po, pl, kv_len_dev, batch_size, nq, nkv, splits,
-                          self.scaling, hd)
+        ext_c.int8_attn_fast(q.view(batch_size, nq, hd).contiguous(), ki, vi, ks, vs,
+                             o, po, pl, kv_len_dev, batch_size, 1, nq, nkv, splits,
+                             self.scaling, hd,
+                             row_map if row_map is not None else none_tensor)
         return o.view(batch_size, 1, nq * hd)
+
+    def _attn_int8_verify(self, q, dev, batch_size, q_len, kv_len_dev, i8pair, row_map = None):
+        """
+        INT8 PRIMARY verify attention (q_len MTP window rows, full layers). Row r's
+        causal frontier is kv_len_dev[b] - q_len + r + 1 (kv_len_dev = past + q_len,
+        the frontier AFTER the window's K/V was quantized into the primary cache).
+        Fast multi-warp kernel; graph-safe persistent partials, same contract as
+        _attn_int8_decode. q: (B, q_len, nq, hd).
+        """
+        ctx = self.model.tp_context
+        ki, vi, ks, vs = i8pair
+        nq = q.shape[2]
+        nkv = ki.shape[2]
+        hd = self.head_dim
+        depth = ki.shape[1]
+        splits = max(8, min(256, depth // 512))
+        hr = nq * q_len
+        bufs = ctx.__dict__.get("_int8_ver_bufs")
+        if bufs is None:
+            bufs = {}
+            ctx._int8_ver_bufs = bufs
+        b = bufs.get((dev, batch_size, hr, splits))
+        if b is None:
+            b = (torch.empty(batch_size, splits, hr, hd, device = dev, dtype = torch.float32),
+                 torch.empty(batch_size, splits, hr, 2, device = dev, dtype = torch.float32))
+            bufs[(dev, batch_size, hr, splits)] = b
+        po, pl = b
+        o = torch.empty(batch_size, q_len, nq, hd, device = dev, dtype = torch.half)
+        ext_c.int8_attn_fast(q.view(batch_size, q_len, nq, hd).contiguous(),
+                             ki, vi, ks, vs, o, po, pl, kv_len_dev,
+                             batch_size, q_len, nq, nkv, splits, self.scaling, hd,
+                             row_map if row_map is not None else none_tensor)
+        return o.view(batch_size, q_len, nq * hd)
 
     def _attn_verify_split(self, q, k_cache, v_cache, q_len, dev):
         """

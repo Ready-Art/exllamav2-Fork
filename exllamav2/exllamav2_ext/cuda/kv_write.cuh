@@ -51,6 +51,47 @@ void kv_quant_shadow_cuda
     int cache_len
 );
 
+// INT8-PRIMARY write: quantize the NEW K/V rows (src: batch, q_len, kvh, hd)
+// straight into the full-depth INT8 cache at device-side pos[b]+t / row_map[b].
+// No fp16 cache copy exists in this mode -- this replaces kv_write + quant_shadow
+// for full-attention layers. Graph-safe (same position logic as kv_write_cuda).
+void kv_quant_new_cuda
+(
+    cudaStream_t stream,
+    const half* src_k,
+    const half* src_v,
+    int8_t* k_i8,
+    int8_t* v_i8,
+    half* k_scale,
+    half* v_scale,
+    const int32_t* pos,
+    const int32_t* row_map,
+    int batch_size,
+    int q_len,
+    int kv_heads,
+    int head_dim,
+    int dst_depth
+);
+
+// Dequantize INT8 KV rows [start, start+n) of ONE cache row (src: depth, kvh, hd
+// + scales depth, kvh) into a contiguous fp16 chunk (n, kvh, hd). Eager-only
+// (prefill continuation staging / gather fallback); the read-side scale rounding
+// matches kv_quant_* exactly so a quant->dequant round trip is the stored value.
+void kv_dequant_cuda
+(
+    cudaStream_t stream,
+    const int8_t* k_i8,
+    const int8_t* v_i8,
+    const half* k_scale,
+    const half* v_scale,
+    half* dst_k,
+    half* dst_v,
+    int start,
+    int n,
+    int kv_heads,
+    int head_dim
+);
+
 // Quantize a contiguous fp16 chunk (n, kvh, hd) into one row of a full-depth INT8
 // destination at absolute row dst_row (source/destination depths differ).
 void kv_quant_chunk_cuda

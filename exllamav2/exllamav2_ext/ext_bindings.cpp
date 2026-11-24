@@ -210,4 +210,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         py::arg("batch_size"), py::arg("q_len"), py::arg("num_qo_heads"), py::arg("num_kv_heads"),
         py::arg("num_splits"), py::arg("sm_scale"), py::arg("head_dim"),
         py::arg("row_map") = torch::Tensor());
+    m.def("int8_attn_fast", &int8_attn_fast, "int8_attn_fast",
+        py::arg("q"), py::arg("k_i8"), py::arg("v_i8"), py::arg("k_scale"), py::arg("v_scale"),
+        py::arg("o"), py::arg("po"), py::arg("pl"), py::arg("kv_len_dev"),
+        py::arg("batch_size"), py::arg("q_len"), py::arg("num_qo_heads"), py::arg("num_kv_heads"),
+        py::arg("num_splits"), py::arg("sm_scale"), py::arg("head_dim"),
+        py::arg("row_map") = torch::Tensor());
+    m.def("kv_quant_new", &kv_quant_new, "kv_quant_new",
+        py::arg("src_k"), py::arg("src_v"), py::arg("k_i8"), py::arg("v_i8"),
+        py::arg("k_scale"), py::arg("v_scale"), py::arg("pos"),
+        py::arg("batch_size"), py::arg("q_len"), py::arg("kv_heads"),
+        py::arg("head_dim"), py::arg("row_map") = torch::Tensor());
+    m.def("kv_dequant", &kv_dequant, "kv_dequant",
+        py::arg("k_i8"), py::arg("v_i8"), py::arg("k_scale"), py::arg("v_scale"),
+        py::arg("dst_k"), py::arg("dst_v"), py::arg("start"),
+        py::arg("n"), py::arg("kv_heads"), py::arg("head_dim"));
 }

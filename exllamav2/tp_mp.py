@@ -207,6 +207,15 @@ def mp_worker(conn, device, world_size, rank, init_method, uuid_hex, model_dir, 
                 # MTP: return this rank's K/V rows [start:end] of one layer (the parent
                 # joins the four ranks' slices along the kv-head axis).
                 conn.send(("ok", _worker_kv_slice(ctx, *args)))
+            elif cmd == "i8-stage-begin":
+                # INT8-primary batch prefill: open the fp16 staging for one row
+                # (the scheduler owns the lifecycle around its chunk loop).
+                row, needed = args
+                ctx["cache"].begin_prefill_staging(needed, row = row)
+                conn.send(("ok", None))
+            elif cmd == "i8-stage-end":
+                ctx["cache"].end_prefill_staging(row = args[0])
+                conn.send(("ok", None))
             elif cmd == "kv-pack":
                 # MTP gather batching: both drafter source layers' K/V deltas packed
                 # into one pinned CPU tensor (see _worker_kv_pack).
@@ -283,6 +292,13 @@ def mp_worker(conn, device, world_size, rank, init_method, uuid_hex, model_dir, 
                         else:
                             kc[dst, :p].copy_(kc[src, :p])
                             vc[dst, :p].copy_(vc[src, :p])
+                    # INT8 primary full layers: the INT8 tensors ARE the KV --
+                    # copy them (and their scales) directly; no fp16 exists.
+                    for l, (ki, vi, ks, vs) in getattr(cache, "kv_i8", {}).items():
+                        ki[dst, :p].copy_(ki[src, :p])
+                        vi[dst, :p].copy_(vi[src, :p])
+                        ks[dst, :p].copy_(ks[src, :p])
+                        vs[dst, :p].copy_(vs[src, :p])
                 cache.seq_lens[dst] = p
                 cache.window_begs[dst] = wb
                 _requant_shadow_row(cache, dst, p)
@@ -446,8 +462,15 @@ def _worker_kv_slice(ctx, layer_idx, start, end):
     Returns 3-D ``(S, kvh, hd)`` tensors -- the same layout the single-process
     drafter path builds (``key_states[layer][0, :len]``) -- so the parent can join
     the four ranks along the kv-head axis (dim 1) and feed FlashInfer directly.
+    INT8-primary full layers have no fp16 buffer: dequantize the requested slice.
     """
     cache = ctx["cache"]
+    if cache.key_states[layer_idx] is None and layer_idx in getattr(cache, "kv_i8", {}):
+        width = cache.kv_i8[layer_idx][0].shape[1]
+        start = max(0, min(start, width))
+        end = max(start, min(end, width))
+        k, v = _dequant_full_slice(ctx, layer_idx, 0, start, end)
+        return (k.cpu(), v.cpu())
     width = cache.key_states[layer_idx].shape[1]
     start = max(0, min(start, width))
     end = max(start, min(end, width))
@@ -461,7 +484,11 @@ def _requant_shadow_row(cache, row, n):
     Re-quantize the INT8 KV shadow for a row whose fp16 KV was just cloned/restored.
     The shadow is derived state: a raw fp16 copy (clone-row, restore-row) leaves it
     stale, and the int8 decode would read garbage for the copied prefix.
+    INT8-PRIMARY mode: clone/restore copy the INT8 tensors themselves -- nothing
+    to re-quantize (and no fp16 source exists).
     """
+    if getattr(cache, "int8_primary", False):
+        return
     sh = getattr(cache, "kv_i8", None)
     if not sh or n <= 0:
         return
@@ -495,7 +522,7 @@ def _clone_swa_ring(cache):
     with torch.inference_mode():
         out = {}
         for l in range(len(cache.key_states)):
-            if cache.key_states[l].shape[1] != ring:
+            if cache.key_states[l] is None or cache.key_states[l].shape[1] != ring:
                 continue
             kc, vc = cache.key_states[l], cache.value_states[l]
             k = torch.empty(kc.shape, dtype = kc.dtype, pin_memory = True)
@@ -553,7 +580,19 @@ def _pack_row_offload(ctx, row, pos, wb):
     n = max(0, min(pos - wb, ring))
     blocks = []
     total = 0
+    i8 = getattr(cache, "kv_i8", {})
     for l in range(len(cache.key_states)):
+        if l in i8:
+            # INT8 primary: pack the INT8 K/V + fp16 scales (half the bytes of
+            # fp16 -- the offload tier shrinks with the cache).
+            ki = i8[l][0]
+            rows = pos
+            if rows <= 0:
+                continue
+            kh, hd = ki.shape[2], ki.shape[3]
+            blocks.append((l, rows, kh, hd, "i8"))
+            total += 2 * rows * kh * hd + 4 * rows * kh
+            continue
         kc = cache.key_states[l]
         if kc is None:
             continue
@@ -561,15 +600,22 @@ def _pack_row_offload(ctx, row, pos, wb):
         if rows <= 0:
             continue
         kh, hd = kc.shape[2], kc.shape[3]
-        blocks.append((l, rows, kh, hd))
-        total += 2 * rows * kh * hd
+        blocks.append((l, rows, kh, hd, "h"))
+        total += 4 * rows * kh * hd
     stag = ctx.get("offload_staging")
     if stag is None or stag.numel() < total:
-        stag = ctx["offload_staging"] = torch.empty(max(total, 1), dtype = torch.half,
+        stag = ctx["offload_staging"] = torch.empty(max(total, 1), dtype = torch.uint8,
                                                     pin_memory = True)
     o = 0
-    for (l, rows, kh, hd) in blocks:
-        for t in (cache.key_states[l][row, :rows], cache.value_states[l][row, :rows]):
+    for (l, rows, kh, hd, kind) in blocks:
+        if kind == "i8":
+            ki, vi, ks, vs = i8[l]
+            srcs = (ki[row, :rows].view(torch.uint8), vi[row, :rows].view(torch.uint8),
+                    ks[row, :rows].view(torch.uint8), vs[row, :rows].view(torch.uint8))
+        else:
+            srcs = (cache.key_states[l][row, :rows].view(torch.uint8),
+                    cache.value_states[l][row, :rows].view(torch.uint8))
+        for t in srcs:
             stag[o:o + t.numel()].view(t.shape).copy_(t, non_blocking = True)
             o += t.numel()
     torch.cuda.current_stream().synchronize()
@@ -588,13 +634,27 @@ def _restore_row_offload(cache, row, flat, meta, p, wb):
     ring = cache.kv_state_size
     o = 0
     with torch.inference_mode():
-        for (l, rows, kh, hd) in blocks:
+        for (l, rows, kh, hd, kind) in blocks:
+            if kind == "i8":
+                ki, vi, ks, vs = cache.kv_i8[l]
+                take = min(p, rows)
+                nb = rows * kh * hd
+                k = flat[o:o + nb].view(torch.int8).view(rows, kh, hd); o += nb
+                v = flat[o:o + nb].view(torch.int8).view(rows, kh, hd); o += nb
+                ns = rows * kh
+                sk = flat[o:o + 2 * ns].view(torch.half).view(rows, kh); o += 2 * ns
+                sv = flat[o:o + 2 * ns].view(torch.half).view(rows, kh); o += 2 * ns
+                if take > 0:
+                    ki[row, :take].copy_(k[:take], non_blocking = True)
+                    vi[row, :take].copy_(v[:take], non_blocking = True)
+                    ks[row, :take].copy_(sk[:take], non_blocking = True)
+                    vs[row, :take].copy_(sv[:take], non_blocking = True)
+                continue
             kc, vc = cache.key_states[l], cache.value_states[l]
             take = min(p - wb, rows) if kc.shape[1] == ring else min(p, rows)
-            k = flat[o:o + rows * kh * hd].view(rows, kh, hd)
-            o += rows * kh * hd
-            v = flat[o:o + rows * kh * hd].view(rows, kh, hd)
-            o += rows * kh * hd
+            nb = 2 * rows * kh * hd
+            k = flat[o:o + nb].view(torch.half).view(rows, kh, hd); o += nb
+            v = flat[o:o + nb].view(torch.half).view(rows, kh, hd); o += nb
             if take > 0:
                 kc[row, :take].copy_(k[:take], non_blocking = True)
                 vc[row, :take].copy_(v[:take], non_blocking = True)
@@ -647,34 +707,95 @@ def _attach_ring_snapshot(ctx, row, entry_id):
             ctx.setdefault("ring_backup_rows_seq", {})[row] = seq
 
 
-def _worker_kv_pack(ctx, lf, fl0, fl1, ls, sl0, sl1):
+def _i8_gather_mode(ctx, drafter_i8):
+    """MTP gather wire format for this rank: "i8" = pipe the INT8 primary directly
+    (drafter stores INT8, half the pipe bytes); "deq" = dequantize to fp16 first
+    (drafter keeps an fp16 shadow -- GQA-incompatible drafters); "fp16" = legacy."""
+    if not getattr(ctx["cache"], "int8_primary", False):
+        return "fp16"
+    return "i8" if drafter_i8 else "deq"
+
+
+def _dequant_full_slice(ctx, layer, row, a, b):
+    """fp16 view of INT8-primary rows [a, b) of one full layer (gather fallback /
+    kv-slice). Grow-only GPU staging; the caller consumes it before the next call."""
+    from exllamav2.ext import exllamav2_ext as ext_c
+    cache = ctx["cache"]
+    ki, vi, ks, vs = cache.kv_i8[layer]
+    n = b - a
+    kvh, hd = ki.shape[2], ki.shape[3]
+    stag = ctx.get("kv_deq_staging")
+    if stag is None or stag.shape[0] < n:
+        stag = ctx["kv_deq_staging"] = torch.empty(
+            (max(n, 1), 2, kvh, hd), dtype = torch.half, device = ki.device)
+    ext_c.kv_dequant(ki[row], vi[row], ks[row], vs[row],
+                     stag[:n, 0], stag[:n, 1], a, n, kvh, hd)
+    return stag[:n, 0], stag[:n, 1]
+
+
+def _worker_kv_pack(ctx, lf, fl0, fl1, ls, sl0, sl1, mode = "fp16"):
     """MTP gather batching: this rank's K/V deltas for BOTH drafter source layers in
     ONE pinned CPU tensor (one pipe message instead of two commands + two replies).
 
-    Flat layout: [K_full | V_full | K_swa | V_swa], each (rows, kvh_local, hd). The
-    parent knows every shape from the request args and unpacks zero-copy views.
-    Grow-only pinned staging (the first, full-length gather is the largest; steady
-    deltas are a handful of rows). The four D2H copies are async on the worker's
-    stream with a single sync, instead of four synchronous .cpu() round trips.
+    fp16/deq layout: [K_full | V_full | K_swa | V_swa], each (rows, kvh_local, hd).
+    i8 layout: a 3-tuple (k8v8 uint8 [K_full|V_full] int8 bytes, ksvs fp16
+    [K_scale|V_scale], swa fp16 [K_swa|V_swa]) -- the INT8 primary crosses the pipe
+    directly (half the bytes), no re-quantize on the parent. The parent knows every
+    shape from the request args and unpacks zero-copy views. Grow-only pinned
+    staging; async D2H + a single sync.
     """
     cache = ctx["cache"]
 
     def clamp(layer, a, b):
-        width = cache.key_states[layer].shape[1]
+        width = cache.kv_i8[layer][0].shape[1] if layer in cache.kv_i8 \
+            else cache.key_states[layer].shape[1]
         a = max(0, min(a, width))
         b = max(a, min(b, width))
         return a, b
 
     fl0, fl1 = clamp(lf, fl0, fl1)
     sl0, sl1 = clamp(ls, sl0, sl1)
-    kf = cache.key_states[lf][0, fl0:fl1].detach()
-    vf = cache.value_states[lf][0, fl0:fl1].detach()
+    if mode == "i8":
+        ki, vi, ks, vs = cache.kv_i8[lf]
+        df = fl1 - fl0
+        fkh, hd = ki.shape[2], ki.shape[3]
+        skh = cache.key_states[ls].shape[2]
+        ds = sl1 - sl0
+        n8 = 2 * df * fkh * hd
+        ns = 2 * df * fkh
+        nswa = 2 * ds * skh * cache.layer_head_dims[ls]
+        stag = ctx.get("kv_pack_staging")
+        if stag is None or stag.numel() < n8 + 2 * ns + 2 * nswa:
+            stag = ctx["kv_pack_staging"] = torch.empty(
+                max(n8 + 2 * ns + 2 * nswa, 1), dtype = torch.uint8, pin_memory = True)
+        k8 = stag[:n8]
+        ksvs = stag[n8:n8 + 2 * ns].view(torch.half)
+        swa = stag[n8 + 2 * ns:n8 + 2 * ns + 2 * nswa].view(torch.half)
+        o = 0
+        for t in (ki[0, fl0:fl1], vi[0, fl0:fl1]):
+            k8[o:o + t.numel()].view(t.shape).copy_(t, non_blocking = True)
+            o += t.numel()
+        o = 0
+        for t in (ks[0, fl0:fl1], vs[0, fl0:fl1]):
+            ksvs[o:o + t.numel()].view(t.shape).copy_(t, non_blocking = True)
+            o += t.numel()
+        o = 0
+        for t in (cache.key_states[ls][0, sl0:sl1], cache.value_states[ls][0, sl0:sl1]):
+            swa[o:o + t.numel()].view(t.shape).copy_(t, non_blocking = True)
+            o += t.numel()
+        torch.cuda.current_stream().synchronize()
+        return (k8, ksvs, swa)
+    if mode == "deq":
+        kf, vf = _dequant_full_slice(ctx, lf, 0, fl0, fl1)
+    else:
+        kf = cache.key_states[lf][0, fl0:fl1].detach()
+        vf = cache.value_states[lf][0, fl0:fl1].detach()
     ks = cache.key_states[ls][0, sl0:sl1].detach()
     vs = cache.value_states[ls][0, sl0:sl1].detach()
     n = kf.numel() + vf.numel() + ks.numel() + vs.numel()
-    stag = ctx.get("kv_pack_staging")
+    stag = ctx.get("kv_pack_staging_h")
     if stag is None or stag.numel() < n:
-        stag = ctx["kv_pack_staging"] = torch.empty(n, dtype = torch.half, pin_memory = True)
+        stag = ctx["kv_pack_staging_h"] = torch.empty(n, dtype = torch.half, pin_memory = True)
     o = 0
     for t in (kf, vf, ks, vs):
         stag[o:o + t.numel()].view(t.shape).copy_(t, non_blocking = True)
@@ -813,35 +934,78 @@ def _worker_forward_state_row(ctx, row, input_ids, last_id_only):
     return (r, None)
 
 
-def _worker_kv_pack_batch(ctx, lf, ls, specs):
+def _worker_kv_pack_batch(ctx, lf, ls, specs, mode = "fp16"):
     """Multi-batch MTP gather: this rank's per-row K/V deltas for both drafter source
     layers in ONE pinned CPU tensor. ``specs`` is a list of (row, fl0, fl1, sl0, sl1)
     in the parent's request order; the flat layout concatenates each row's
     [K_full | V_full | K_swa | V_swa] block, so the parent unpacks zero-copy views
-    with the shapes it already knows."""
+    with the shapes it already knows. i8 mode: 3-tuple (int8 K/V bytes, fp16 scales,
+    fp16 SWA), each concatenating the rows in spec order (see _worker_kv_pack)."""
     cache = ctx["cache"]
 
     def clamp(layer, a, b):
-        width = cache.key_states[layer].shape[1]
+        width = cache.kv_i8[layer][0].shape[1] if layer in cache.kv_i8 \
+            else cache.key_states[layer].shape[1]
         a = max(0, min(a, width))
         b = max(a, min(b, width))
         return a, b
+
+    if mode == "i8":
+        ki, vi, ks, vs = cache.kv_i8[lf]
+        fkh, hd = ki.shape[2], ki.shape[3]
+        skh = cache.key_states[ls].shape[2]
+        shd = cache.layer_head_dims[ls]
+        n8 = ns = nswa = 0
+        clamped = []
+        for row, fl0, fl1, sl0, sl1 in specs:
+            fl0, fl1 = clamp(lf, fl0, fl1)
+            sl0, sl1 = clamp(ls, sl0, sl1)
+            clamped.append((row, fl0, fl1, sl0, sl1))
+            n8 += 2 * (fl1 - fl0) * fkh * hd
+            ns += 2 * (fl1 - fl0) * fkh
+            nswa += 2 * (sl1 - sl0) * skh * shd
+        stag = ctx.get("kv_pack_staging")
+        if stag is None or stag.numel() < n8 + 2 * ns + 2 * nswa:
+            stag = ctx["kv_pack_staging"] = torch.empty(
+                max(n8 + 2 * ns + 2 * nswa, 1), dtype = torch.uint8, pin_memory = True)
+        k8 = stag[:n8]
+        ksvs = stag[n8:n8 + 2 * ns].view(torch.half)
+        swa = stag[n8 + 2 * ns:n8 + 2 * ns + 2 * nswa].view(torch.half)
+        o8 = os_ = osw = 0
+        for row, fl0, fl1, sl0, sl1 in clamped:
+            for t in (ki[row, fl0:fl1], vi[row, fl0:fl1]):
+                k8[o8:o8 + t.numel()].view(t.shape).copy_(t, non_blocking = True)
+                o8 += t.numel()
+            for t in (ks[row, fl0:fl1], vs[row, fl0:fl1]):
+                ksvs[os_:os_ + t.numel()].view(t.shape).copy_(t, non_blocking = True)
+                os_ += t.numel()
+            for t in (cache.key_states[ls][row, sl0:sl1],
+                      cache.value_states[ls][row, sl0:sl1]):
+                swa[osw:osw + t.numel()].view(t.shape).copy_(t, non_blocking = True)
+                osw += t.numel()
+        torch.cuda.current_stream().synchronize()
+        return (k8, ksvs, swa)
 
     parts = []
     n = 0
     for row, fl0, fl1, sl0, sl1 in specs:
         fl0, fl1 = clamp(lf, fl0, fl1)
         sl0, sl1 = clamp(ls, sl0, sl1)
-        for t in (cache.key_states[lf][row, fl0:fl1],
-                  cache.value_states[lf][row, fl0:fl1],
-                  cache.key_states[ls][row, sl0:sl1],
-                  cache.value_states[ls][row, sl0:sl1]):
+        if mode == "deq":
+            # D2H immediately: the dequant staging is reused by the next row.
+            kf, vf = _dequant_full_slice(ctx, lf, row, fl0, fl1)
+            full = (kf.cpu(), vf.cpu())
+        else:
+            full = (cache.key_states[lf][row, fl0:fl1],
+                    cache.value_states[lf][row, fl0:fl1])
+        for t in full + (cache.key_states[ls][row, sl0:sl1],
+                         cache.value_states[ls][row, sl0:sl1]):
             parts.append(t.detach())
             n += t.numel()
-    stag = ctx.get("kv_pack_staging")
+    stag = ctx.get("kv_pack_staging_h")
     if stag is None or stag.numel() < n:
-        stag = ctx["kv_pack_staging"] = torch.empty(max(n, 1), dtype = torch.half,
-                                                    pin_memory = True)
+        stag = ctx["kv_pack_staging_h"] = torch.empty(max(n, 1), dtype = torch.half,
+                                                      pin_memory = True)
     o = 0
     for t in parts:
         stag[o:o + t.numel()].view(t.shape).copy_(t, non_blocking = True)
@@ -1062,6 +1226,13 @@ class TPProcessGroup:
         if getattr(drafter, "is_dflash", False):
             self._enable_dflash(drafter)
             return
+        # INT8-primary target KV: the drafter's joined full-layer shadow goes INT8
+        # too (the gather pipes INT8 directly -- half the bytes, no fp16 full-depth
+        # shadow on the drafter device). The P10 INT8 drafter attention path serves
+        # it; GQA-incompatible drafters keep fp16 via worker-side dequant ("deq").
+        if getattr(self.cache, "int8_primary", False) \
+                and drafter.num_q_heads % drafter.num_global_kv_heads == 0:
+            drafter._int8_kv = True
         # Allocate the joined KV shadow NOW, at load time with a clean allocator --
         # not lazily on the first gather after a long prefill (debug10.txt OOM).
         self._mtp_kv = None
@@ -1314,6 +1485,8 @@ class TPProcessGroup:
             w.recv()
         self.cache.current_seq_len = 0
         self.cache.window_beg = 0
+        if getattr(self.cache, "int8_primary", False):
+            self.cache.end_prefill_staging()
         # reset the MTP gather shadow so the next gather starts fresh -- keep the
         # buffers allocated (freeing them forces a post-prefill realloc; debug10.txt)
         self._reset_mtp_kv()
@@ -1357,6 +1530,8 @@ class TPProcessGroup:
                         kv += t.numel() * t.element_size()
                     elif isinstance(t, (list, tuple)):
                         kv += sum(x.numel() * x.element_size() for x in t if torch.is_tensor(x))
+            for pair in getattr(self.cache, "kv_i8", {}).values():
+                kv += sum(t.numel() * t.element_size() for t in pair)
             ndev = torch.cuda.device_count()
             per = " ".join(f"dev{i}={mb(torch.cuda.memory_allocated(i)):.0f}" for i in range(ndev))
             print(f"[vram] master torch alloc MiB: {per} (reserved dev0="
@@ -1517,6 +1692,9 @@ class TPProcessGroup:
         with torch.inference_mode():
             for _k in ("kf", "vf", "ks", "vs"):
                 st[_k].zero_()
+            for _k in ("kf8", "vf8", "kfs", "vfs"):
+                if _k in st:
+                    st[_k].zero_()
         st["fl"] = 0
         st["sl"] = 0
         st["wb"] = 0
@@ -1535,6 +1713,9 @@ class TPProcessGroup:
         with torch.inference_mode():
             for _k in ("kf", "vf", "ks", "vs"):
                 st[_k][r].zero_()
+            for _k in ("kf8", "vf8", "kfs", "vfs"):
+                if _k in st:
+                    st[_k][r].zero_()
         st["fls"][r] = 0
         st["sls"][r] = 0
         st["wbs"][r] = 0
@@ -1632,12 +1813,24 @@ class TPProcessGroup:
         sw = self._kv_head_widths(ls)
         df = seq_len - st["fl"]
         ds = swa_len - swa_start
+        mode = _i8_gather_mode(self.master_ctx, getattr(d, "_int8_kv", False))
         # issue every request first (workers copy in parallel), then collect
         for device, w in sorted(self.workers.items()):
-            w.send("kv-pack", (lf, st["fl"], seq_len, ls, swa_start, swa_len))
+            w.send("kv-pack", (lf, st["fl"], seq_len, ls, swa_start, swa_len, mode))
         # master's own slices, on CPU like the workers' so the join is uniform
-        full_k = [mc.key_states[lf][0, st["fl"]:seq_len].detach().cpu()]
-        full_v = [mc.value_states[lf][0, st["fl"]:seq_len].detach().cpu()]
+        if mode == "i8":
+            _ki, _vi, _ks, _vs = mc.kv_i8[lf]
+            full_k = [_ki[0, st["fl"]:seq_len].detach().cpu()]
+            full_v = [_vi[0, st["fl"]:seq_len].detach().cpu()]
+            full_ks = [_ks[0, st["fl"]:seq_len].detach().cpu()]
+            full_vs = [_vs[0, st["fl"]:seq_len].detach().cpu()]
+        elif mode == "deq":
+            _mk, _mv = _dequant_full_slice(self.master_ctx, lf, 0, st["fl"], seq_len)
+            full_k = [_mk.cpu()]
+            full_v = [_mv.cpu()]
+        else:
+            full_k = [mc.key_states[lf][0, st["fl"]:seq_len].detach().cpu()]
+            full_v = [mc.value_states[lf][0, st["fl"]:seq_len].detach().cpu()]
         swa_k = [mc.key_states[ls][0, swa_start:swa_len].detach().cpu()]
         swa_v = [mc.value_states[ls][0, swa_start:swa_len].detach().cpu()]
         if _trace:
@@ -1645,20 +1838,47 @@ class TPProcessGroup:
             _t0 = _tc()
         for device, w in sorted(self.workers.items()):
             flat = w.recv()
-            o = 0
             fkh, skh = fw.get(device, 0), sw.get(device, 0)
-            for rows, kh, hd, acc in ((df, fkh, d.global_head_dim, full_k),
-                                      (df, fkh, d.global_head_dim, full_v),
-                                      (ds, skh, d.head_dim, swa_k),
-                                      (ds, skh, d.head_dim, swa_v)):
-                n = rows * kh * hd
-                acc.append(flat[o:o + n].view(rows, kh, hd))
-                o += n
+            if mode == "i8":
+                k8, ksvs, swa = flat
+                o = 0
+                for rows, kh, hd, acc in ((df, fkh, d.global_head_dim, full_k),
+                                          (df, fkh, d.global_head_dim, full_v)):
+                    n = rows * kh * hd
+                    acc.append(k8[o:o + n].view(torch.int8).view(rows, kh, hd))
+                    o += n
+                o = 0
+                for rows, kh, acc in ((df, fkh, full_ks), (df, fkh, full_vs)):
+                    n = rows * kh
+                    acc.append(ksvs[o:o + n].view(rows, kh))
+                    o += n
+                o = 0
+                for rows, kh, hd, acc in ((ds, skh, d.head_dim, swa_k),
+                                          (ds, skh, d.head_dim, swa_v)):
+                    n = rows * kh * hd
+                    acc.append(swa[o:o + n].view(rows, kh, hd))
+                    o += n
+            else:
+                o = 0
+                for rows, kh, hd, acc in ((df, fkh, d.global_head_dim, full_k),
+                                          (df, fkh, d.global_head_dim, full_v),
+                                          (ds, skh, d.head_dim, swa_k),
+                                          (ds, skh, d.head_dim, swa_v)):
+                    n = rows * kh * hd
+                    acc.append(flat[o:o + n].view(rows, kh, hd))
+                    o += n
         if _trace:
             _tm["recv"] = _tc() - _t0
             _t0 = _tc()
         if df > 0:
-            if st.get("i8p"):
+            if mode == "i8":
+                # INT8 crosses the pipe directly: join along the kv-head axis and
+                # copy into the drafter's INT8 primary shadow -- no re-quantize.
+                st["kf8"][0, st["fl"]:seq_len].copy_(torch.cat(full_k, dim = 1))
+                st["vf8"][0, st["fl"]:seq_len].copy_(torch.cat(full_v, dim = 1))
+                st["kfs"][0, st["fl"]:seq_len].copy_(torch.cat(full_ks, dim = 1))
+                st["vfs"][0, st["fl"]:seq_len].copy_(torch.cat(full_vs, dim = 1))
+            elif st.get("i8p"):
                 self._stage_full_delta(None, st["fl"],
                                        torch.cat(full_k, dim = 1), torch.cat(full_v, dim = 1))
             else:
@@ -1751,35 +1971,79 @@ class TPProcessGroup:
             specs.append((r, fl0, seq_len, swa_start, swa_len))
             meta.append((seq_len, swa_len, swa_start, df, ds))
 
+        mode = _i8_gather_mode(self.master_ctx, getattr(d, "_int8_kv", False))
         for device, w in sorted(self.workers.items()):
-            w.send("kv-pack-batch", (lf, ls, specs))
+            w.send("kv-pack-batch", (lf, ls, specs, mode))
 
         parts = []
         for (r, fl0, fl1, sl0, sl1) in specs:
-            parts.append([
-                [mc.key_states[lf][r, fl0:fl1].detach().cpu()],
-                [mc.value_states[lf][r, fl0:fl1].detach().cpu()],
-                [mc.key_states[ls][r, sl0:sl1].detach().cpu()],
-                [mc.value_states[ls][r, sl0:sl1].detach().cpu()],
-            ])
+            if mode == "i8":
+                _ki, _vi, _ks, _vs = mc.kv_i8[lf]
+                parts.append([
+                    [_ki[r, fl0:fl1].detach().cpu()],
+                    [_vi[r, fl0:fl1].detach().cpu()],
+                    [mc.key_states[ls][r, sl0:sl1].detach().cpu()],
+                    [mc.value_states[ls][r, sl0:sl1].detach().cpu()],
+                    [_ks[r, fl0:fl1].detach().cpu()],
+                    [_vs[r, fl0:fl1].detach().cpu()],
+                ])
+            elif mode == "deq":
+                _mk, _mv = _dequant_full_slice(self.master_ctx, lf, r, fl0, fl1)
+                parts.append([
+                    [_mk.cpu()], [_mv.cpu()],
+                    [mc.key_states[ls][r, sl0:sl1].detach().cpu()],
+                    [mc.value_states[ls][r, sl0:sl1].detach().cpu()],
+                ])
+            else:
+                parts.append([
+                    [mc.key_states[lf][r, fl0:fl1].detach().cpu()],
+                    [mc.value_states[lf][r, fl0:fl1].detach().cpu()],
+                    [mc.key_states[ls][r, sl0:sl1].detach().cpu()],
+                    [mc.value_states[ls][r, sl0:sl1].detach().cpu()],
+                ])
         for device, w in sorted(self.workers.items()):
             flat = w.recv()
-            o = 0
             fkh, skh = fw.get(device, 0), sw.get(device, 0)
-            for bi in range(len(specs)):
-                df, ds = meta[bi][3], meta[bi][4]
-                for rows_n, kh, hd, acc in ((df, fkh, d.global_head_dim, parts[bi][0]),
-                                            (df, fkh, d.global_head_dim, parts[bi][1]),
-                                            (ds, skh, d.head_dim, parts[bi][2]),
-                                            (ds, skh, d.head_dim, parts[bi][3])):
-                    n = rows_n * kh * hd
-                    acc.append(flat[o:o + n].view(rows_n, kh, hd))
-                    o += n
+            if mode == "i8":
+                k8, ksvs, swa = flat
+                o8 = os_ = osw = 0
+                for bi in range(len(specs)):
+                    df, ds = meta[bi][3], meta[bi][4]
+                    for rows_n, kh, hd, acc in ((df, fkh, d.global_head_dim, parts[bi][0]),
+                                                (df, fkh, d.global_head_dim, parts[bi][1])):
+                        n = rows_n * kh * hd
+                        acc.append(k8[o8:o8 + n].view(torch.int8).view(rows_n, kh, hd))
+                        o8 += n
+                    for rows_n, kh, acc in ((df, fkh, parts[bi][4]), (df, fkh, parts[bi][5])):
+                        n = rows_n * kh
+                        acc.append(ksvs[os_:os_ + n].view(rows_n, kh))
+                        os_ += n
+                    for rows_n, kh, hd, acc in ((ds, skh, d.head_dim, parts[bi][2]),
+                                                (ds, skh, d.head_dim, parts[bi][3])):
+                        n = rows_n * kh * hd
+                        acc.append(swa[osw:osw + n].view(rows_n, kh, hd))
+                        osw += n
+            else:
+                o = 0
+                for bi in range(len(specs)):
+                    df, ds = meta[bi][3], meta[bi][4]
+                    for rows_n, kh, hd, acc in ((df, fkh, d.global_head_dim, parts[bi][0]),
+                                                (df, fkh, d.global_head_dim, parts[bi][1]),
+                                                (ds, skh, d.head_dim, parts[bi][2]),
+                                                (ds, skh, d.head_dim, parts[bi][3])):
+                        n = rows_n * kh * hd
+                        acc.append(flat[o:o + n].view(rows_n, kh, hd))
+                        o += n
         for bi, r in enumerate(rows):
             seq_len, swa_len, swa_start, df, ds = meta[bi]
             fl0 = specs[bi][1]
             if df > 0:
-                if st.get("i8p"):
+                if mode == "i8":
+                    st["kf8"][r, fl0:seq_len].copy_(torch.cat(parts[bi][0], dim = 1))
+                    st["vf8"][r, fl0:seq_len].copy_(torch.cat(parts[bi][1], dim = 1))
+                    st["kfs"][r, fl0:seq_len].copy_(torch.cat(parts[bi][4], dim = 1))
+                    st["vfs"][r, fl0:seq_len].copy_(torch.cat(parts[bi][5], dim = 1))
+                elif st.get("i8p"):
                     self._stage_full_delta(r, fl0,
                                            torch.cat(parts[bi][0], dim = 1),
                                            torch.cat(parts[bi][1], dim = 1))
@@ -1866,6 +2130,31 @@ class TPProcessGroup:
             w.recv()
         return out
 
+    def prefill_staging_begin(self, row, needed):
+        """INT8-primary batch prefill: open the fp16 staging for row ``row`` on
+        every rank (depth >= needed = the position this prefill will reach).
+        The scheduler calls this once before its chunk loop; the per-chunk KV
+        write quantizes into the INT8 primary, so decode rounds interleaved
+        between chunks read consistent INT8 for every committed row."""
+        if not getattr(self.cache, "int8_primary", False):
+            return
+        for device, w in sorted(self.workers.items()):
+            w.send("i8-stage-begin", (row, needed))
+        self.cache.begin_prefill_staging(needed, row = row)
+        for device, w in sorted(self.workers.items()):
+            w.recv()
+
+    def prefill_staging_end(self, row):
+        """Close the row's fp16 staging (frees the full-depth fp16 buffers once
+        no row is prefilling). Safe to call when staging was never opened."""
+        if not getattr(self.cache, "int8_primary", False):
+            return
+        for device, w in sorted(self.workers.items()):
+            w.send("i8-stage-end", (row,))
+        self.cache.end_prefill_staging(row = row)
+        for device, w in sorted(self.workers.items()):
+            w.recv()
+
     def forward_row(self, row, input_ids, last_id_only = True, preprocess_only = False):
         """Eager prefill chunk into one cache row (the scheduler drives the chunk loop
         so decode rounds can interleave between chunks). Returns the master's logits
@@ -1943,6 +2232,11 @@ class TPProcessGroup:
                 else:
                     kc[dst, :p].copy_(kc[src, :p])
                     vc[dst, :p].copy_(vc[src, :p])
+            for l, (ki, vi, ks, vs) in getattr(mc, "kv_i8", {}).items():
+                ki[dst, :p].copy_(ki[src, :p])
+                vi[dst, :p].copy_(vi[src, :p])
+                ks[dst, :p].copy_(ks[src, :p])
+                vs[dst, :p].copy_(vs[src, :p])
         mc.seq_lens[dst] = p
         mc.window_begs[dst] = wb
         st = self._mtp_kv

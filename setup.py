@@ -78,6 +78,7 @@ setup_kwargs = (
                     "exllamav2/exllamav2_ext/cuda/cache.cu",
                     "exllamav2/exllamav2_ext/cuda/kv_write.cu",
                     "exllamav2/exllamav2_ext/cuda/int8_decode.cu",
+                    "exllamav2/exllamav2_ext/cuda/int8_attn_fast.cu",
                     "exllamav2/exllamav2_ext/cuda/mtp_int8.cu",
                     "exllamav2/exllamav2_ext/cuda/util.cu",
                     "exllamav2/exllamav2_ext/cuda/softcap.cu",

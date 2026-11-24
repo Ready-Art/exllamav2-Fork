@@ -440,32 +440,161 @@ class ExLlamaV2Cache_SWA(ExLlamaV2Cache):
             # Now allocate the full-length buffers for the non-sliding layers only.
             self._allocate_full_attention()
 
-        # INT8 KV shadow (opt-in, default fp16): per-(token,head) symmetric INT8 + fp16
-        # scales for the FULL layers, read by the int8 flash-decode kernel. Ampere has
-        # no FP8; INT8 halves the decode KV read. SWA rings stay fp16 (tiny).
-        self.int8_shadow = os.environ.get("EXL2_KV_INT8", "0") != "0"
+        # INT8 KV PRIMARY (opt-in EXL2_KV_INT8, default fp16): per-(token,head)
+        # symmetric INT8 + fp16 scales are the ONLY full-depth KV storage for the
+        # FULL layers -- no fp16 copy is kept alongside (the old "shadow" design
+        # added +50% KV VRAM; primary halves it). fp16 full-depth buffers exist
+        # only as transient PREFILL staging (begin/end_prefill_staging): prefill
+        # attention kernels read fp16, each chunk is quantized into the INT8
+        # primary as it lands, and the staging is freed when prefill ends.
+        # Decode/verify read INT8 directly (int8_attn_fast). SWA rings stay fp16.
+        # `int8_shadow` is kept as an alias -- existing presence checks gate on it.
+        self.int8_primary = os.environ.get("EXL2_KV_INT8", "0") != "0"
+        if self.int8_primary and getattr(cfg, "attn_logit_softcapping", None):
+            # The INT8 attention kernels do not apply logit softcapping.
+            print("[kv-i8] EXL2_KV_INT8 ignored: model uses attn_logit_softcapping", flush=True)
+            self.int8_primary = False
+        if self.int8_primary and not bool(getattr(cfg.arch.lm, "tp_per_layer_geometry", False)):
+            # The fused (non-per-layer-geometry) TP attention kernel reads fp16 KV
+            # directly; INT8-primary dispatch lives in the per-layer geometry path.
+            print("[kv-i8] EXL2_KV_INT8 ignored: model lacks tp_per_layer_geometry", flush=True)
+            self.int8_primary = False
+        if self.int8_primary:
+            _bad_hd = {self.layer_head_dims[i] for i in range(self.num_hidden_layers)
+                       if not self.is_swa_layer[i] and self.layer_num_kv_heads[i] > 0}
+            _bad_hd -= {256, 512}
+            if _bad_hd:
+                # Per-layer gate: unsupported head dims keep fp16 (kv_i8 skips them).
+                print(f"[kv-i8] full layers with head_dim {sorted(_bad_hd)} stay fp16 "
+                      f"(INT8 kernels serve hd 256/512)", flush=True)
+        self.int8_shadow = self.int8_primary
         self.kv_i8: dict = {}
-        if self.int8_shadow and not lazy:
-            self._allocate_int8_shadow()
+        # Per-row count of valid fp16 staging rows (prefill bookkeeping).
+        self._i8_stage_fill = [0] * batch_size
+        self._i8_stage_rows: set = set()
+        # INT8 primary tensors are allocated by _allocate_full_attention (non-lazy)
+        # or update_cache_tensors (lazy/autosplit) -- never twice.
 
     def _allocate_int8_shadow(self):
-        """INT8 shadow tensors for full-attention layers (opt-in via EXL2_KV_INT8)."""
+        """INT8 PRIMARY tensors for full-attention layers (opt-in EXL2_KV_INT8).
+        Allocated at load and NEVER reallocated: CUDA graphs bake these addresses."""
         self.kv_i8 = {}
-        if not getattr(self, "int8_shadow", False):
+        if not getattr(self, "int8_primary", False):
             return
         for i in range(self.num_hidden_layers):
-            if self.is_swa_layer[i] or self.key_states[i] is None:
+            if self.is_swa_layer[i] or self.layer_num_kv_heads[i] <= 0:
                 continue
-            k = self.key_states[i]
             kvh = self.layer_num_kv_heads[i]
             hd = self.layer_head_dims[i]
-            depth = k.shape[1]
+            if hd not in (256, 512):
+                continue
+            device = self.model.cache_map.get(i, self.fixed_device)
+            depth = self.layer_shapes_wk[i][1]
             self.kv_i8[i] = (
-                torch.zeros((self.batch_size, depth, kvh, hd), dtype = torch.int8, device = k.device),
-                torch.zeros((self.batch_size, depth, kvh, hd), dtype = torch.int8, device = k.device),
-                torch.zeros((self.batch_size, depth, kvh), dtype = torch.half, device = k.device),
-                torch.zeros((self.batch_size, depth, kvh), dtype = torch.half, device = k.device),
+                torch.zeros((self.batch_size, depth, kvh, hd), dtype = torch.int8, device = device),
+                torch.zeros((self.batch_size, depth, kvh, hd), dtype = torch.int8, device = device),
+                torch.zeros((self.batch_size, depth, kvh), dtype = torch.half, device = device),
+                torch.zeros((self.batch_size, depth, kvh), dtype = torch.half, device = device),
             )
+
+    # ------------------------------------------------------------------ INT8-primary
+    # fp16 prefill staging. The full-depth fp16 buffers live ONLY between
+    # begin_prefill_staging and end_prefill_staging; every committed chunk is
+    # quantized into kv_i8 by the attention write path, so the INT8 primary is
+    # always consistent with the staging content at chunk boundaries.
+
+    def begin_prefill_staging(self, needed: int, row: int | None = None):
+        """Allocate (or grow) the fp16 prefill staging for full layers and fill
+        the prefix [0, current_seq_len) of the prefilled row(s) from the INT8
+        primary (continuation prefill). `needed` = past_len + prompt_len (the
+        depth this prefill will reach); staging is page-rounded and grow-only
+        within a prefill phase, so short prompts never pay full-depth VRAM."""
+        if not self.int8_primary:
+            return
+        from exllamav2.ext import exllamav2_ext as ext_c
+        page = self.page_size
+        depth = ((max(needed, page) + page - 1) // page) * page
+        depth = min(depth, self.max_seq_len)
+        # row=None is the scalar (batch-1 logical) path: row 0, current_seq_len.
+        # Explicit rows are the batch scheduler's per-slot staging (seq_lens[row]).
+        rows = set([row] if row is not None else [0])
+        _devs = set()
+        with torch.inference_mode():
+            for i in range(self.num_hidden_layers):
+                if self.is_swa_layer[i] or i not in self.kv_i8:
+                    continue
+                _devs.add(self.kv_i8[i][0].device.index)
+                cur = self.key_states[i]
+                if cur is None or cur.shape[1] < depth:
+                    device = self.model.cache_map.get(i, self.fixed_device)
+                    shape = (self.batch_size, depth) + tuple(self.layer_shapes_wk[i][2:])
+                    self.key_states[i] = torch.zeros(shape, dtype = self.dtype, device = device).contiguous()
+                    self.value_states[i] = torch.zeros(shape, dtype = self.dtype, device = device).contiguous()
+                    # Fresh buffer: EVERY active staging row lost its fp16 content;
+                    # the INT8 primary (committed per chunk) is the authoritative
+                    # prefix source -- restore all of them, not just this call's row
+                    # (a nested short-prompt prefill may grow the buffer mid-way
+                    # through another row's long prefill).
+                    self._i8_stage_fill = [0] * self.batch_size
+                    rows |= self._i8_stage_rows
+                ki, vi, ks, vs = self.kv_i8[i]
+                kvh, hd = ki.shape[2], ki.shape[3]
+                for r in rows:
+                    seq = self.seq_lens[r] if (row is not None and hasattr(self, "seq_lens")) \
+                        else self.current_seq_len
+                    seq = min(seq, depth)
+                    fill = self._i8_stage_fill[r]
+                    if seq > fill:
+                        ext_c.kv_dequant(ki[r], vi[r], ks[r], vs[r],
+                                         self.key_states[i][r, fill:seq],
+                                         self.value_states[i][r, fill:seq],
+                                         fill, seq - fill, kvh, hd)
+                    self._i8_stage_fill[r] = max(fill, seq)
+                    self._i8_stage_rows.add(r)
+        # The dequant runs on each device's CURRENT stream; the prefill attention
+        # runs on the TP streams. Sync every affected device so no TP-stream read
+        # races the dequant (eager-only path; cheap against a prefill).
+        for _d in _devs:
+            torch.cuda.synchronize(_d)
+
+    def end_prefill_staging(self, row: int | None = None):
+        """Release the fp16 staging once no row is prefilling. The INT8 primary
+        already holds every committed row (per-chunk quantize), so this is a pure
+        free -- steady-state KV VRAM is INT8-only."""
+        if not self.int8_primary:
+            return
+        if row is not None:
+            self._i8_stage_rows.discard(row)
+            if self._i8_stage_rows:
+                return
+        else:
+            self._i8_stage_rows.clear()
+        with torch.inference_mode():
+            for i in range(self.num_hidden_layers):
+                if self.is_swa_layer[i] or i not in self.kv_i8:
+                    continue
+                self.key_states[i] = None
+                self.value_states[i] = None
+        self._i8_stage_fill = [0] * self.batch_size
+
+    def i8_staging_active(self, row: int | None = None) -> bool:
+        if not self.int8_primary:
+            return False
+        if row is not None:
+            return row in self._i8_stage_rows
+        return bool(self._i8_stage_rows)
+
+    def get_kv_i8(self, layer_idx: int):
+        """Per-device INT8 primary tensors for one layer: a list aligned with the
+        TP split (one element per rank cache). None when the layer has no INT8
+        storage (SWA ring or fp16 mode)."""
+        return [self.kv_i8.get(layer_idx)]
+
+    def note_i8_fill(self, row: int, end: int):
+        """The attention write path quantized staging rows [.., end) into the
+        INT8 primary -- advance the row's valid fp16 staging frontier."""
+        if self.int8_primary and end > self._i8_stage_fill[row]:
+            self._i8_stage_fill[row] = end
 
     def _allocate_rings(self):
 
@@ -515,6 +644,22 @@ class ExLlamaV2Cache_SWA(ExLlamaV2Cache):
                     (self.batch_size, self.kv_state_size, kvh, hd),
                     dtype = self.dtype, device = v
                 ).contiguous()
+            elif getattr(self, "int8_primary", False) \
+                    and self.layer_head_dims[k] in (256, 512):
+                # INT8 primary: no full-depth fp16 buffer; the INT8 tensors are
+                # the storage. Keep existing ones (graph-baked addresses) unless
+                # the layer moved device.
+                if k in self.kv_i8 and str(self.kv_i8[k][0].device) == str(v):
+                    continue
+                kvh = self.layer_num_kv_heads[k]
+                hd = self.layer_head_dims[k]
+                depth = self.layer_shapes_wk[k][1]
+                self.kv_i8[k] = (
+                    torch.zeros((self.batch_size, depth, kvh, hd), dtype = torch.int8, device = v),
+                    torch.zeros((self.batch_size, depth, kvh, hd), dtype = torch.int8, device = v),
+                    torch.zeros((self.batch_size, depth, kvh), dtype = torch.half, device = v),
+                    torch.zeros((self.batch_size, depth, kvh), dtype = torch.half, device = v),
+                )
             else:
                 self.key_states[k] = torch.zeros(
                     self.layer_shapes_wk[k], dtype = self.dtype, device = v
@@ -523,13 +668,16 @@ class ExLlamaV2Cache_SWA(ExLlamaV2Cache):
                     self.layer_shapes_wv[k], dtype = self.dtype, device = v
                 ).contiguous()
 
-        if getattr(self, "int8_shadow", False):
-            self._allocate_int8_shadow()
-
     def _allocate_full_attention(self):
-        """Allocate full-length KV buffers for the non-sliding layers only."""
+        """Allocate full-length KV storage for the non-sliding layers only.
+        INT8-primary mode: the INT8 tensors ARE the storage (fp16 stays None
+        until prefill staging); fp16 mode: full-depth fp16 buffers as before."""
+        if getattr(self, "int8_primary", False):
+            self._allocate_int8_shadow()
         for i in range(self.num_hidden_layers):
             if self.is_swa_layer[i]:
+                continue
+            if getattr(self, "int8_primary", False) and i in self.kv_i8:
                 continue
             device = self.model.cache_map.get(i, self.fixed_device)
             kvh = self.layer_num_kv_heads[i]
@@ -541,9 +689,17 @@ class ExLlamaV2Cache_SWA(ExLlamaV2Cache):
                 self.layer_shapes_wv[i], dtype = self.dtype, device = device
             ).contiguous()
 
+    def all_tensors(self):
+        ts = [t for t in self.key_states + self.value_states if t is not None]
+        for pair in self.kv_i8.values():
+            ts += list(pair)
+        return ts
+
     def reset(self):
         self.current_seq_len = 0
         self.window_beg = 0
+        if getattr(self, "int8_primary", False):
+            self.end_prefill_staging()
 
     def ring_size(self, layer_idx: int) -> int:
         """Number of tokens the ring for this layer can hold (0 for full-attention layers)."""
@@ -1403,6 +1559,32 @@ class _RowCacheView(ExLlamaV2CacheBase):
         return [t[self._row:self._row + 1] if t is not None else None
                 for t in self._rc.value_states]
 
+    @property
+    def kv_i8(self):
+        # Row-narrowed INT8 primary: the eager row-view paths (prefill chunks,
+        # heal decode) address row 0 of their (narrowed) tensors, which must be
+        # this slot's physical row -- same contract as key_states above.
+        return {l: tuple(t[self._row:self._row + 1] for t in pair)
+                for l, pair in self._rc.kv_i8.items()}
+
+    def begin_prefill_staging(self, needed, row = None):
+        self._rc.begin_prefill_staging(needed, row = self._row)
+
+    def end_prefill_staging(self, row = None):
+        self._rc.end_prefill_staging(row = self._row)
+
+    def i8_staging_active(self, row = None):
+        return self._rc.i8_staging_active(row = self._row)
+
+    def get_kv_i8(self, layer_idx):
+        pair = self._rc.kv_i8.get(layer_idx)
+        if pair is None:
+            return [None]
+        return [tuple(t[self._row:self._row + 1] for t in pair)]
+
+    def note_i8_fill(self, row, end):
+        self._rc.note_i8_fill(self._row, end)
+
     def get_kv_state(self, layer_idx, batch_size, offset, width, page_size = 0,
                      cache_seqlens = None, block_table = None):
         ks, vs = self._rc.get_kv_state(layer_idx, batch_size, offset, width,
@@ -1593,6 +1775,35 @@ class ExLlamaV2Cache_TP(ExLlamaV2CacheBase):
         # BUG 94: SWA ring bookkeeping (see ExLlamaV2Cache_SWA.window_beg).
         self.window_beg = 0
 
+    @property
+    def int8_primary(self):
+        return any(getattr(c, "int8_primary", False) for c in self.caches if c is not None)
+
+    @property
+    def int8_shadow(self):
+        return self.int8_primary
+
+    def get_kv_i8(self, layer_idx: int):
+        return [c.kv_i8.get(layer_idx) if c is not None else None for c in self.caches]
+
+    def begin_prefill_staging(self, needed: int, row = None):
+        for c in self.caches:
+            if c is not None:
+                c.begin_prefill_staging(needed, row = row)
+
+    def end_prefill_staging(self, row = None):
+        for c in self.caches:
+            if c is not None:
+                c.end_prefill_staging(row = row)
+
+    def i8_staging_active(self, row = None):
+        return any(c.i8_staging_active(row = row) for c in self.caches if c is not None)
+
+    def note_i8_fill(self, row, end):
+        for c in self.caches:
+            if c is not None:
+                c.note_i8_fill(row, end)
+
     def shift_ring(self, layer_idx: int, shift_tokens: int):
         """BUG 94: shift every per-device ring slice (see ExLlamaV2Cache_SWA.shift_ring)."""
         for cache in self.caches:
@@ -1694,3 +1905,4 @@ class ExLlamaV2Cache_TP(ExLlamaV2CacheBase):
     def reset(self):
         self.current_seq_len = 0
         self.window_beg = 0
+        self.end_prefill_staging()

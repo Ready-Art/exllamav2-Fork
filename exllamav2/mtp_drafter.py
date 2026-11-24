@@ -484,8 +484,27 @@ class Gemma4AssistantDrafter:
         # Full layer (59): each device holds a slice of the global kv heads (1 head on a
         # 4-way split); joining them along the kv-head axis (dim 1 of the sliced (S, nkv, hd)
         # tensor) reconstructs the full (S, num_global_kv_heads, global_head_dim) cache.
-        k_full = torch.cat([c.key_states[self.t_last_full][0, :seq_len].to(self.dev, non_blocking = True) for _, c in per_dev], dim = 1)
-        v_full = torch.cat([c.value_states[self.t_last_full][0, :seq_len].to(self.dev, non_blocking = True) for _, c in per_dev], dim = 1)
+        # INT8-primary caches have no fp16 full-layer buffer: dequantize each rank's
+        # slice into a transient fp16 tensor first (single-process TP path; the MP
+        # production path pipes INT8 through gather_kv_mtp instead).
+        if getattr(cache, "int8_primary", False) \
+                and any(self.t_last_full in getattr(c, "kv_i8", {}) for _, c in per_dev):
+            from exllamav2.ext import exllamav2_ext as ext_c
+            ks, vs = [], []
+            for _, c in per_dev:
+                ki, vi, ksc, vsc = c.kv_i8[self.t_last_full]
+                kvh, hd = ki.shape[2], ki.shape[3]
+                tk = torch.empty(seq_len, kvh, hd, dtype = torch.half, device = ki.device)
+                tv = torch.empty(seq_len, kvh, hd, dtype = torch.half, device = ki.device)
+                ext_c.kv_dequant(ki[0], vi[0], ksc[0], vsc[0], tk, tv, 0, seq_len, kvh, hd)
+                torch.cuda.synchronize(ki.device)
+                ks.append(tk.to(self.dev, non_blocking = True))
+                vs.append(tv.to(self.dev, non_blocking = True))
+            k_full = torch.cat(ks, dim = 1)
+            v_full = torch.cat(vs, dim = 1)
+        else:
+            k_full = torch.cat([c.key_states[self.t_last_full][0, :seq_len].to(self.dev, non_blocking = True) for _, c in per_dev], dim = 1)
+            v_full = torch.cat([c.value_states[self.t_last_full][0, :seq_len].to(self.dev, non_blocking = True) for _, c in per_dev], dim = 1)
         self.kv_full = (k_full, v_full)
         self.kv_full_len = seq_len
 
