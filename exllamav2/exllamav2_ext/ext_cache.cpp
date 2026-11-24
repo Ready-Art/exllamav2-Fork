@@ -16,6 +16,7 @@
 #include "cuda/int8_decode.cuh"
 #include "cuda/int8_attn_fast.cuh"
 #include "cuda/int8_hmma.cuh"
+#include "cuda/int8_fa2.cuh"
 #include "cuda/mtp_int8.cuh"
 
 #include "cpp/util.h"
@@ -381,6 +382,68 @@ void int8_attn_fast
 
 // HMMA (tensor-core) INT8 verify attention — same buffer contract as int8_attn_fast.
 // Serves hd512 full-layer verify windows with NQ=(nq/nkv)*q_len in {16,32}; the
+// FA2-style pipelined INT8 verify attention (balanced-warp mma + cp.async INT8 tiles).
+// Same contract as int8_attn_hmma; launcher no-ops on unsupported geometries.
+void int8_attn_fa2
+(
+    torch::Tensor q,
+    torch::Tensor k_i8,
+    torch::Tensor v_i8,
+    torch::Tensor k_scale,
+    torch::Tensor v_scale,
+    torch::Tensor o,
+    torch::Tensor po,
+    torch::Tensor pl,
+    torch::Tensor kv_len_dev,
+    int batch_size,
+    int q_len,
+    int num_qo_heads,
+    int num_kv_heads,
+    int num_splits,
+    double sm_scale,
+    int head_dim,
+    torch::Tensor row_map
+)
+{
+    TORCH_CHECK_DTYPE(q, kHalf);
+    TORCH_CHECK_DTYPE(k_i8, kChar);
+    TORCH_CHECK_DTYPE(v_i8, kChar);
+    TORCH_CHECK_DTYPE(k_scale, kHalf);
+    TORCH_CHECK_DTYPE(v_scale, kHalf);
+    TORCH_CHECK_DTYPE(o, kHalf);
+    TORCH_CHECK_DTYPE(po, kFloat);
+    TORCH_CHECK_DTYPE(pl, kFloat);
+    TORCH_CHECK_DTYPE(kv_len_dev, kInt);
+    TORCH_CHECK(kv_len_dev.numel() == 1 || kv_len_dev.numel() == batch_size,
+                "int8_attn_fa2: kv_len_dev must be scalar or per-batch-row");
+
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    int depth = (int) k_i8.size(1);
+    const int32_t* row_map_ptr = NULL;
+    if (row_map.defined() && !row_map.device().is_meta() && row_map.numel() > 0)
+    {
+        TORCH_CHECK_DTYPE(row_map, kInt);
+        TORCH_CHECK(row_map.numel() >= batch_size, "int8_attn_fa2: row_map too short");
+        row_map_ptr = (const int32_t*) row_map.data_ptr();
+    }
+    int8_attn_fa2_cuda
+    (
+        (const half*) q.data_ptr(),
+        (const int8_t*) k_i8.data_ptr(),
+        (const int8_t*) v_i8.data_ptr(),
+        (const half*) k_scale.data_ptr(),
+        (const half*) v_scale.data_ptr(),
+        (half*) o.data_ptr(),
+        (float*) po.data_ptr(),
+        (float*) pl.data_ptr(),
+        (const int*) kv_len_dev.data_ptr(),
+        row_map_ptr,
+        depth, batch_size, q_len, num_qo_heads, num_kv_heads, num_splits,
+        (float) sm_scale, head_dim, stream
+    );
+}
+
 // launcher no-ops on other geometries (caller falls back to int8_attn_fast).
 void int8_attn_hmma
 (

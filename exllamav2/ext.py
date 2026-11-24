@@ -242,6 +242,7 @@ if build_jit:
         "cuda/int8_decode.cu",
         "cuda/int8_attn_fast.cu",
         "cuda/int8_hmma.cu",
+        "cuda/int8_fa2.cu",
         "cuda/util.cu",
         "cuda/softcap.cu",
         "cuda/tp.cu",

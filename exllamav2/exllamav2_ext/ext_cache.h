@@ -187,6 +187,27 @@ void int8_attn_hmma
     torch::Tensor row_map
 );
 
+void int8_attn_fa2
+(
+    torch::Tensor q,
+    torch::Tensor k_i8,
+    torch::Tensor v_i8,
+    torch::Tensor k_scale,
+    torch::Tensor v_scale,
+    torch::Tensor o,
+    torch::Tensor po,
+    torch::Tensor pl,
+    torch::Tensor kv_len_dev,
+    int batch_size,
+    int q_len,
+    int num_qo_heads,
+    int num_kv_heads,
+    int num_splits,
+    double sm_scale,
+    int head_dim,
+    torch::Tensor row_map
+);
+
 void int8_decode
 (
     torch::Tensor q,

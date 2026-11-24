@@ -456,10 +456,30 @@ conversation's attendable depth.
 Ampere has no FP8, so K/V are quantized to symmetric per-(token, head) **INT8 with fp16
 scales** and read by custom split-KV attention kernels (GQA, graph-safe, per-row kv_lens +
 row_map): **decode** uses a multi-warp CUDA-core kernel (`int8_attn_fast`), and **MTP
-verify** uses an **HMMA tensor-core kernel** (`int8_attn_hmma`, `nvcuda::wmma` m16n16k16,
-flash-attention tiled with HD split across warps + online softmax) for hd512 windows whose
-per-kv-head query count is 16/32 (Gemma-4 W=1/W=3); other verify geometries fall back to the
-warp kernel. `EXL2_INT8_HMMA=0` forces the warp kernel everywhere (kill switch / A-B).
+verify** on hd512 windows whose per-kv-head query count is 16/32 (Gemma-4 W=1/W=3) uses an
+**FA2-style pipelined tensor-core kernel** (`int8_attn_fa2`, `mma.m16n8k16` + `cp.async`);
+other verify geometries fall back to the warp kernel.
+
+The FA2 kernel exists because both earlier INT8 verify kernels lost to FlashInfer's fp16
+paged prefill at long context — halving the KV bytes does not help when the kernel is
+compute-bound per key. The warp kernel is CUDA-core bound (~35 GB/s effective); the HMMA
+kernel (`int8_attn_hmma`, `nvcuda::wmma` m16n16k16, HD split across warps) ran QK^T on only
+the `hs==0` warp of each query tile, so 6 of 8 warps idled through QK and the phase was ~4x
+longer than the PV that followed. `int8_attn_fa2` balances both phases: every warp does QK
+for its 8-key sub-tile **and** PV for its 128-column HD slice, K/V stream through
+double-buffered `cp.async` INT8 smem tiles and are dequantized to half in registers at
+fragment-load time (no half smem tiles — that is what fits hd512 in sm86's 101376 B block
+limit), and the cross-warp online softmax reduces only per-row m/l partials, never the full
+score tile. `sm_scale*log2(e)` is applied to the fp32 accumulator, not pre-scaled into Q.
+
+Measured same-session on 4x3090, live per-rank geometry (nq8/kvh1, q_len 4), against the
+**live** FI fp16 paged-prefill path (not ragged): at kv=100k **0.544 ms vs FI 0.796 ms
+(1.46x)**, vs HMMA 2.440 ms (4.49x) and the warp kernel 2.893 ms (5.32x); parity cos
+0.99997 including batched row_map. The crossover matters: at kv=25.6k it is still 0.69x FI,
+and at 4k roughly parity — the win is in the long-context regime where the KV read dominates.
+
+Kill switches / A-B: `EXL2_INT8_FA2=0` falls back to HMMA, `EXL2_INT8_HMMA=0` then falls back
+to the warp kernel. Harness: `mtp/int8_fa2_test.py`.
 INT8 is the **only** full-depth KV storage on the
 full-attention layers: **no fp16 shadow alongside**, so KV VRAM is **halved (~−50%)** and
 the decode/verify KV read is halved with it. fp16 full-depth buffers exist only as
