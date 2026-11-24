@@ -139,11 +139,23 @@ class ExLlamaV2DeviceContext:
         # sincos_size and reads `column + half_dim`, so a 128-wide table makes it rotate the wrong
         # span and silently corrupts the 512-dim layers.
 
-        has_global = getattr(cfg, "layer_types", None) is not None
+        # Hybrid linear-attention backbones (Qwen3.5) use layer_types for linear/full
+        # routing, not a second attention geometry: one default-NEOX table spanning
+        # head_dim * partial_rotary_factor (64 of 256) serves every full layer. The rope
+        # kernel pairs (i, i + sincos_size/2), so a 64-wide table rotates exactly the
+        # first 64 dims, matching HF Qwen3_5TextRotaryEmbedding. newplan.md P6.
+        _hybrid = getattr(cfg, "hybrid_linear_attn", False)
+        has_global = getattr(cfg, "layer_types", None) is not None and not _hybrid
 
         thetas = [cfg.rotary_embedding_base]
         scales = [cfg.scale_pos_emb]
-        table_head_dims = [cfg.global_head_dim if has_global else cfg.head_dim]
+        if has_global:
+            _base_head_dim = cfg.global_head_dim
+        elif _hybrid:
+            _base_head_dim = int(cfg.head_dim * cfg.partial_rotary_factor)
+        else:
+            _base_head_dim = cfg.head_dim
+        table_head_dims = [_base_head_dim]
         table_rope_types = [cfg.rope_type_global if has_global else None]
         table_rope_props = [cfg.rope_partial_rotary_factor_global if has_global else None]
 

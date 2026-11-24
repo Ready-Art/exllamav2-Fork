@@ -3,6 +3,7 @@ from exllamav2.model import \
     ExLlamaV2Embedding,
     ExLlamaV2PosEmbedding,
     ExLlamaV2Attention,
+    ExLlamaV2GatedDeltaNet,
     ExLlamaV2MLP,
     ExLlamaV2MoEMLP,
     ExLlamaV2ParallelDecoder,
@@ -274,6 +275,42 @@ def quant_attn(job, module, hidden_states, target_states, quantizers, attn_param
     torch.cuda.empty_cache()
 
 
+def quant_gdn(job, module, hidden_states, target_states, quantizers, attn_params, strat, devices = None, stager = None):
+    """
+    Quantize the gated-delta-net projections (Qwen3.5, newplan.md P6). q/k/v/z share
+    the post-norm Hessian; out_proj gets its own from the gated-norm output. in_proj_b/a
+    are fp16 and never quantized.
+    """
+
+    devices = devices or [0]
+    primary = devices[0]
+
+    quantizers["in_proj_q"].hessian_device = primary
+    quantizers["out_proj"].hessian_device = primary
+
+    quantizers["in_proj_q"].prepare_hessian()
+    quantizers["in_proj_k"].reuse_h_hessian(quantizers["in_proj_q"])
+    quantizers["in_proj_v"].reuse_h_hessian(quantizers["in_proj_q"])
+    quantizers["in_proj_z"].reuse_h_hessian(quantizers["in_proj_q"])
+    quantizers["out_proj"].prepare_hessian()
+
+    tasks = [
+        (module.in_proj_q, quantizers["in_proj_q"], strat["in_proj_q"], 0),
+        (module.in_proj_k, quantizers["in_proj_k"], strat["in_proj_k"], 1),
+        (module.in_proj_v, quantizers["in_proj_v"], strat["in_proj_v"], 2),
+        (module.in_proj_z, quantizers["in_proj_z"], strat["in_proj_z"], 3),
+        (module.out_proj, quantizers["out_proj"], strat["out_proj"], 4),
+    ]
+
+    _quant_group(job, tasks, devices, "gdn", stager)
+
+    for k in ["in_proj_q", "in_proj_k", "in_proj_v", "in_proj_z", "out_proj"]:
+        if k in quantizers: del quantizers[k]
+
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 def quant_mlp(job, module, hidden_states, target_states, quantizers, attn_params, strat, reuse_h_up_proj = None,
               devices = None, stager = None):
 
@@ -504,6 +541,15 @@ def quant(job, save_fn, model):
                 quantizers["v_proj"] = mk_q(module.v_proj.linear)
             quantizers["o_proj"] = mk_q(module.o_proj.linear)
 
+        elif isinstance(module, ExLlamaV2GatedDeltaNet):
+            # Qwen3.5 gated delta net (newplan.md P6). in_proj_b/a stay fp16.
+            mode = "gdn"
+            quantizers["in_proj_q"] = mk_q(module.in_proj_q.linear)
+            quantizers["in_proj_k"] = mk_q(module.in_proj_k.linear)
+            quantizers["in_proj_v"] = mk_q(module.in_proj_v.linear)
+            quantizers["in_proj_z"] = mk_q(module.in_proj_z.linear)
+            quantizers["out_proj"] = mk_q(module.out_proj.linear)
+
         elif isinstance(module, ExLlamaV2MLP):
             mode = "mlp"
             has_mlp = model.config.arch.lm.mlp_gate
@@ -580,6 +626,10 @@ def quant(job, save_fn, model):
                 quantizers["q_proj"].add_batch(outputs["post_norm"])  # Reuse H for K and V
                 quantizers["o_proj"].add_batch(outputs["attn_output"])
 
+            if mode == "gdn":
+                quantizers["in_proj_q"].add_batch(outputs["post_norm"])  # Reuse H for k/v/z
+                quantizers["out_proj"].add_batch(outputs["pre_out"])
+
             if mode == "mlp":
                 quantizers["up_proj"].add_batch(outputs["post_norm"])  # Reuse H for gate_proj
                 quantizers["down_proj"].add_batch(outputs["pre_down"])
@@ -621,6 +671,11 @@ def quant(job, save_fn, model):
             strat = strategy[module.key + "." + mode]
             quant_attn(job, module, hidden_states, target_states, quantizers, attn_params, strat,
                        devices = devices, stager = stager)
+
+        if mode == "gdn":
+            strat = strategy[module.key + "." + mode]
+            quant_gdn(job, module, hidden_states, target_states, quantizers, attn_params, strat,
+                      devices = devices, stager = stager)
 
         if mode == "mlp":
             strat = strategy[module.key + "." + mode]

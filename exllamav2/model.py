@@ -39,6 +39,7 @@ from exllamav2.layernorm import ExLlamaV2LayerNorm
 from exllamav2.attn import ExLlamaV2Attention, has_flash_attn, has_xformers
 from exllamav2.layer_scalar import ExLlamaV2LayerScalar
 from exllamav2.lora import ExLlamaV2Lora
+from exllamav2.gdn import ExLlamaV2GatedDeltaNet
 from exllamav2.mlp import ExLlamaV2MLP
 from exllamav2.moe_mlp import ExLlamaV2MoEMLP
 from exllamav2.parallel_decoder import ExLlamaV2ParallelDecoder
@@ -190,6 +191,13 @@ class ExLlamaV2:
             if cfg.arch.lm.parallel_decoder_blocks:
                 pd = ExLlamaV2ParallelDecoder(self, layer_key, layer_idx, sliding_window = swa, rope_index = rope_index)
                 self.modules += [pd]
+            elif getattr(cfg, "hybrid_linear_attn", False) and \
+                    cfg.layer_types[layer_idx] == "linear_attention":
+                # Qwen3.5 gated-delta-net block replaces self_attn on linear layers.
+                # newplan.md P6.
+                gdn = ExLlamaV2GatedDeltaNet(self, layer_key, layer_idx)
+                mlp = ExLlamaV2MLP(self, layer_key, layer_idx)
+                self.modules += [gdn, mlp]
             else:
                 attn = ExLlamaV2Attention(self, layer_key, layer_idx, sliding_window = swa, rope_index = rope_index)
                 if cfg.arch.lm.is_moe: mlp = ExLlamaV2MoEMLP(self, layer_key, layer_idx)
@@ -539,6 +547,8 @@ class ExLlamaV2:
                     module.tp_split()
                 if isinstance(module, ExLlamaV2Attention):
                     module.tp_split()
+                if isinstance(module, ExLlamaV2GatedDeltaNet):
+                    module.tp_split()
                 if isinstance(module, ExLlamaV2MLP):
                     module.tp_split()
                 if isinstance(module, ExLlamaV2RMSNorm):
@@ -717,6 +727,9 @@ class ExLlamaV2:
                         module.tp_load_rank(rank)
 
                 elif isinstance(module, ExLlamaV2Attention):
+                    module.tp_load_rank(rank)
+
+                elif isinstance(module, ExLlamaV2GatedDeltaNet):
                     module.tp_load_rank(rank)
 
                 elif isinstance(module, ExLlamaV2MLP):
@@ -2004,6 +2017,24 @@ class ExLlamaV2:
         if return_row_states or return_last_state:
             return logits, torch.cat(state_rows, dim = 0)
         return logits
+
+    def gdn_rewind_to(self, cache, pos: int):
+        """
+        Restore the hybrid backbone's gated-delta-net recurrent state to the prefix
+        ending at `pos`, using the staging recorded by the last MTP verify forward.
+        Fans out across per-device caches in single-process TP. newplan.md P6.
+        """
+        caches = cache.caches if hasattr(cache, "caches") else [cache]
+        for c in caches:
+            if c is None or not getattr(c, "gdn_stage", None):
+                continue
+            for m in self.modules:
+                if isinstance(m, ExLlamaV2GatedDeltaNet):
+                    m.rewind_state(c, pos)
+            c.gdn_staging = False
+            c.gdn_stage = {}
+            c.gdn_stage_start = -1
+            c.gdn_stage_len = 0
 
     @torch.inference_mode()
     # @profile

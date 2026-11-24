@@ -100,6 +100,7 @@ def mp_worker(conn, device, world_size, rank, init_method, uuid_hex, model_dir, 
         ctx = _init_pg(device, world_size, rank, init_method, uuid_hex)
 
         from exllamav2 import ExLlamaV2, ExLlamaV2Config
+        from exllamav2 import cache as _cache_mod
         from exllamav2.cache import ExLlamaV2Cache_SWA
 
         cfg = ExLlamaV2Config()
@@ -109,6 +110,10 @@ def mp_worker(conn, device, world_size, rank, init_method, uuid_hex, model_dir, 
         cfg.max_seq_len = max_seq_len
         cfg.max_input_len = max_input_len
 
+        # Resolve the cache base the parent asked for (hybrid GDN-state cache for
+        # Qwen3.5, SWA ring cache for Gemma-4, plain otherwise). newplan.md P6.
+        _cache_base = getattr(_cache_mod, cache_base_name, None) or ExLlamaV2Cache_SWA
+
         model = ExLlamaV2(cfg)
         # Load ONLY this rank's shard. load_tp() would materialise every module in full on
         # this process, which defeats the entire purpose (the model does not fit on one card).
@@ -117,14 +122,14 @@ def mp_worker(conn, device, world_size, rank, init_method, uuid_hex, model_dir, 
         # load_tp()+tp_split() in order100.md.
         model.load_tp_rank(rank, gpu_split,
                            expect_cache_tokens = cache_tokens,
-                           expect_cache_base = ExLlamaV2Cache_SWA,
+                           expect_cache_base = _cache_base,
                            load_head = (rank == 0),
                            max_batch = max_batch)
 
         # Per-rank KV cache: this rank's slice of the KV split, under each layer's own
         # geometry. ExLlamaV2Cache_TP would build all four devices' caches.
         from exllamav2.cache import tp_rank_cache
-        cache = tp_rank_cache(model, rank, base = ExLlamaV2Cache_SWA,
+        cache = tp_rank_cache(model, rank, base = _cache_base,
                               max_seq_len = max_seq_len, batch_size = max_batch)
 
         ctx["model"] = model
@@ -973,6 +978,7 @@ class TPProcessGroup:
         # The master loads its own shard in-process, exactly as the workers do. It keeps
         # lm_head, so the logits are already local and sampling needs no extra hop.
         from exllamav2 import ExLlamaV2, ExLlamaV2Config
+        from exllamav2 import cache as _cache_mod
         from exllamav2.cache import ExLlamaV2Cache_SWA, tp_rank_cache
 
         cfg = ExLlamaV2Config()
@@ -982,13 +988,15 @@ class TPProcessGroup:
         cfg.max_seq_len = self.max_seq_len
         cfg.max_input_len = self.max_input_len
 
+        _cache_base = getattr(_cache_mod, self.cache_base_name, None) or ExLlamaV2Cache_SWA
+
         model = ExLlamaV2(cfg)
         model.load_tp_rank(self.master_device, self.gpu_split,
                            expect_cache_tokens = self.cache_tokens * self.max_batch,
-                           expect_cache_base = ExLlamaV2Cache_SWA,
+                           expect_cache_base = _cache_base,
                            load_head = True,
                            max_batch = self.max_batch)
-        cache = tp_rank_cache(model, self.master_device, base = ExLlamaV2Cache_SWA,
+        cache = tp_rank_cache(model, self.master_device, base = _cache_base,
                               max_seq_len = self.max_seq_len, batch_size = self.max_batch)
 
         self.model = model

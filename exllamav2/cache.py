@@ -645,6 +645,259 @@ class ExLlamaV2Cache_SWA(ExLlamaV2Cache):
         self.current_seq_len -= 1
 
 
+class ExLlamaV2Cache_Hybrid(ExLlamaV2Cache):
+    """
+    Cache for hybrid linear-attention backbones (Qwen3.5 / Qwen3.8, newplan.md P6).
+
+    Full-attention layers keep ordinary FP16 K/V. Linear-attention (gated delta
+    net) layers have NO K/V; they carry a depthwise short-conv state (last K-1
+    raw inputs per channel, fp16) and a per-value-head recurrent state (fp32),
+    plus a one-deep backup of both for the single-token rewind protocol (token
+    healing / speculative rejection). The backup is stashed before the last
+    token of every forward; rewinding current_seq_len to gdn_backup_pos restores
+    it on the next forward (see gdn.py::_local_state).
+
+    Recurrent state is destructive, so arbitrary truncation below the snapshot
+    is not possible: prompt-cache reuse must extend the cached lineage or fully
+    reset (the fork generator's non-MP path always resets).
+
+    gdn_v_range: (a, b) value-head slice owned by this cache in MP rank-local
+    mode; None allocates the full head set (single-GPU, or per-device caches in
+    single-process TP where each device slices its own range at forward time).
+    """
+
+    def __init__(
+        self,
+        model: ExLlamaV2,
+        batch_size: int = 1,
+        max_seq_len: int = -1,
+        copy_from: ExLlamaV2Cache | None = None,
+        lazy: bool = False,
+        num_key_value_heads: int | None = None,
+        fixed_device: int | None = None,
+        gdn_v_range: tuple | None = None,
+    ):
+        self.gdn_v_range = gdn_v_range
+        self.gdn_conv_states = []
+        self.gdn_ssm_states = []
+        self.gdn_conv_backup = []
+        self.gdn_ssm_backup = []
+        self.gdn_backup_pos = -1
+        # MTP verify staging (newplan.md P6). When gdn_staging is set, a multi-token
+        # forward records its per-token scan inputs + conv history + a base-state
+        # snapshot so gdn_rewind_to() can restore the state to any accepted prefix.
+        self.gdn_staging = False
+        self.gdn_stage_start = -1
+        self.gdn_stage_len = 0
+        self.gdn_stage = {}
+        super().__init__(model, batch_size, max_seq_len, copy_from, lazy,
+                         num_key_value_heads, fixed_device)
+
+    def _gdn_local_dims(self):
+        cfg = self.model.config
+        nk, nv = cfg.linear_num_key_heads, cfg.linear_num_value_heads
+        dk, dv = cfg.linear_key_head_dim, cfg.linear_value_head_dim
+        group = nv // nk
+        if self.gdn_v_range is not None:
+            a, b = self.gdn_v_range
+            nv = b - a
+            nk = nv // group
+        conv_dim = 2 * nk * dk + nv * dv
+        return nk, nv, dk, dv, conv_dim
+
+    def build_layer_shapes(self):
+        super().build_layer_shapes()
+        cfg = self.model.config
+        for li in range(self.num_hidden_layers):
+            if cfg.layer_types[li] == "linear_attention":
+                self.layer_num_kv_heads[li] = 0
+                self.layer_shapes_basic[li] = (self.batch_size, self.max_seq_len, 0, self.layer_head_dims[li])
+                self.layer_shapes_wk[li] = (self.batch_size, self.max_seq_len, 0, self.layer_head_dims[li])
+                self.layer_shapes_wv[li] = (self.batch_size, self.max_seq_len, 0, self.layer_head_dims[li])
+                self.layer_shapes_s[li] = (self.batch_size, self.max_seq_len, 0, self.layer_head_dims[li] // 32)
+
+    def create_state_tensors(self, copy_from: ExLlamaV2Cache | None, lazy: bool):
+        cfg = self.model.config
+        self.key_states = []
+        self.value_states = []
+        self.key_scales = []
+        self.value_scales = []
+        self.gdn_conv_states = []
+        self.gdn_ssm_states = []
+        self.gdn_conv_backup = []
+        self.gdn_ssm_backup = []
+        self.gdn_backup_pos = -1
+
+        nk, nv, dk, dv, conv_dim = self._gdn_local_dims()
+        K = cfg.linear_conv_kernel_dim
+
+        for i in range(self.num_hidden_layers):
+            if cfg.layer_types[i] == "linear_attention":
+                self.key_states.append(None)
+                self.value_states.append(None)
+                self.key_scales.append(None)
+                self.value_scales.append(None)
+                if lazy:
+                    self.gdn_conv_states.append(None)
+                    self.gdn_ssm_states.append(None)
+                    self.gdn_conv_backup.append(None)
+                    self.gdn_ssm_backup.append(None)
+                else:
+                    dev = self.fixed_device if self.fixed_device is not None else self.model.devices[i]
+                    self.gdn_conv_states.append(torch.zeros((self.batch_size, conv_dim, K - 1), dtype=torch.half, device=dev))
+                    self.gdn_ssm_states.append(torch.zeros((self.batch_size, nv, dk, dv), dtype=torch.float32, device=dev))
+                    self.gdn_conv_backup.append(torch.zeros((self.batch_size, conv_dim, K - 1), dtype=torch.half, device=dev))
+                    self.gdn_ssm_backup.append(torch.zeros((self.batch_size, nv, dk, dv), dtype=torch.float32, device=dev))
+                continue
+
+            if lazy:
+                self.key_states.append(None)
+                self.value_states.append(None)
+                self.key_scales.append(None)
+                self.value_scales.append(None)
+                continue
+            if copy_from is None:
+                p = self.layer_shapes_basic[i]
+                dev = self.fixed_device if self.fixed_device is not None else self.model.devices[i]
+                self.key_states.append(torch.zeros(p, dtype=self.dtype, device=dev))
+                self.value_states.append(torch.zeros(p, dtype=self.dtype, device=dev))
+                self.key_scales.append(None)
+                self.value_scales.append(None)
+            else:
+                self.key_states.append(copy_from.key_states[i].clone())
+                self.value_states.append(copy_from.value_states[i].clone())
+                self.key_scales.append(None)
+                self.value_scales.append(None)
+
+        if copy_from is not None and isinstance(copy_from, ExLlamaV2Cache_Hybrid):
+            for i in range(self.num_hidden_layers):
+                if cfg.layer_types[i] != "linear_attention":
+                    continue
+                if lazy:
+                    continue
+                self.gdn_conv_states[i] = copy_from.gdn_conv_states[i].clone()
+                self.gdn_ssm_states[i] = copy_from.gdn_ssm_states[i].clone()
+                self.gdn_conv_backup[i] = copy_from.gdn_conv_backup[i].clone()
+                self.gdn_ssm_backup[i] = copy_from.gdn_ssm_backup[i].clone()
+            self.gdn_backup_pos = copy_from.gdn_backup_pos
+
+    def _allocate_hybrid(self):
+        """Materialise KV (full layers) + GDN state after lazy construction
+        (tp_narrow_cache_to_rank pattern, mirrors SWA's _allocate_rings)."""
+        cfg = self.model.config
+        nk, nv, dk, dv, conv_dim = self._gdn_local_dims()
+        K = cfg.linear_conv_kernel_dim
+        for i in range(self.num_hidden_layers):
+            dev = self.fixed_device if self.fixed_device is not None else self.model.devices[i]
+            if cfg.layer_types[i] == "linear_attention":
+                if self.gdn_conv_states[i] is None:
+                    self.gdn_conv_states[i] = torch.zeros((self.batch_size, conv_dim, K - 1), dtype=torch.half, device=dev)
+                    self.gdn_ssm_states[i] = torch.zeros((self.batch_size, nv, dk, dv), dtype=torch.float32, device=dev)
+                    self.gdn_conv_backup[i] = torch.zeros((self.batch_size, conv_dim, K - 1), dtype=torch.half, device=dev)
+                    self.gdn_ssm_backup[i] = torch.zeros((self.batch_size, nv, dk, dv), dtype=torch.float32, device=dev)
+            else:
+                if self.key_states[i] is None:
+                    p = self.layer_shapes_basic[i]
+                    self.key_states[i] = torch.zeros(p, dtype=self.dtype, device=dev)
+                    self.value_states[i] = torch.zeros(p, dtype=self.dtype, device=dev)
+
+    def _gdn_tensors(self):
+        out = []
+        for lst in (self.gdn_conv_states, self.gdn_ssm_states,
+                    self.gdn_conv_backup, self.gdn_ssm_backup):
+            out += [t for t in lst if t is not None]
+        return out
+
+    def footprint(self) -> int:
+        fp = 0
+        for k, v in zip(self.key_states, self.value_states):
+            if k is not None:
+                fp += k.numel() * k.element_size()
+            if v is not None:
+                fp += v.numel() * v.element_size()
+        for t in self._gdn_tensors():
+            fp += t.numel() * t.element_size()
+        return fp
+
+    def all_tensors(self):
+        out = []
+        for k, v, ks, vs in zip(self.key_states, self.value_states, self.key_scales, self.value_scales):
+            if k is not None: out.append(k)
+            if v is not None: out.append(v)
+            if ks is not None: out.append(ks)
+            if vs is not None: out.append(vs)
+        out += self._gdn_tensors()
+        return out
+
+    def clone(self):
+        c = ExLlamaV2Cache_Hybrid(
+            self.model, self.batch_size, self.max_seq_len,
+            copy_from=self, lazy=False, fixed_device=self.fixed_device,
+            gdn_v_range=self.gdn_v_range,
+        )
+        c.current_seq_len = self.current_seq_len
+        return c
+
+    @torch.inference_mode
+    def copy_states(self, target, from_column, from_columns, to_column, to_columns,
+                    from_row=0, from_rows=-1, to_row=0, to_rows=-1):
+        if from_rows < 0: from_rows = self.batch_size
+        if to_rows < 0: to_rows = target.batch_size
+        # Recurrent state cannot be truncated to a prefix: only full-width copies
+        # (clones) are valid. The hybrid prompt-cache protocol resets instead.
+        if self.gdn_conv_states and self.gdn_conv_states[0] is not None:
+            assert from_column == 0 and to_column == 0 and \
+                from_columns == self.max_seq_len and to_columns == target.max_seq_len, \
+                "Hybrid cache: recurrent state only supports full-width copies"
+        for k, v, tk, tv in zip(self.key_states, self.value_states, target.key_states, target.value_states):
+            if k is None:
+                continue
+            source_view = k[from_row:from_row + from_rows, from_column:from_column + from_columns]
+            target_view = tk[to_row:to_row + to_rows, to_column:to_column + to_columns]
+            target_view.copy_(source_view)
+            source_view = v[from_row:from_row + from_rows, from_column:from_column + from_columns]
+            target_view = tv[to_row:to_row + to_rows, to_column:to_column + to_columns]
+            target_view.copy_(source_view)
+        if isinstance(target, ExLlamaV2Cache_Hybrid):
+            for i in range(self.num_hidden_layers):
+                if self.gdn_conv_states[i] is None:
+                    continue
+                target.gdn_conv_states[i].copy_(self.gdn_conv_states[i])
+                target.gdn_ssm_states[i].copy_(self.gdn_ssm_states[i])
+                target.gdn_conv_backup[i].copy_(self.gdn_conv_backup[i])
+                target.gdn_ssm_backup[i].copy_(self.gdn_ssm_backup[i])
+            target.gdn_backup_pos = self.gdn_backup_pos
+
+    def reset(self):
+        super().reset()
+        self.gdn_backup_pos = -1
+        self.gdn_staging = False
+        self.gdn_stage_start = -1
+        self.gdn_stage_len = 0
+        self.gdn_stage = {}
+        for t in self._gdn_tensors():
+            t.zero_()
+
+    def update_cache_tensors(self):
+        # Autosplit builds the cache lazily; materialise KV + GDN state on first use.
+        if self.gdn_conv_states and self.gdn_conv_states[0] is None:
+            self._allocate_hybrid()
+        for i in range(self.num_hidden_layers):
+            if self.key_states[i] is None:
+                continue
+            dev = self.model.devices[i]
+            self.key_states[i] = self.key_states[i].to(dev)
+            self.value_states[i] = self.value_states[i].to(dev)
+        for lst in (self.gdn_conv_states, self.gdn_ssm_states,
+                    self.gdn_conv_backup, self.gdn_ssm_backup):
+            for i, t in enumerate(lst):
+                if t is not None:
+                    lst[i] = t.to(self.model.devices[i])
+
+    def roll_left(self):
+        raise NotImplementedError("Hybrid cache has no sliding window; roll_left is invalid")
+
+
 class ExLlamaV2Cache_8bit(ExLlamaV2CacheBase):
     """
     8-bit cache. Keys and values are compressed to FP8 (e5m2) format by truncation.
@@ -1054,6 +1307,8 @@ def tp_narrow_cache_to_rank(cache: ExLlamaV2CacheBase, tp_context, rank: int):
     if hasattr(cache, "_allocate_rings"):
         cache._allocate_rings()
         cache._allocate_full_attention()
+    if hasattr(cache, "_allocate_hybrid"):
+        cache._allocate_hybrid()
     return cache
 
 
@@ -1201,7 +1456,10 @@ def tp_rank_cache(
 
     cfg = model.config
     if base is None:
-        base = ExLlamaV2Cache_SWA if getattr(cfg, "sliding_window", 0) else ExLlamaV2Cache
+        if getattr(cfg, "hybrid_linear_attn", False):
+            base = ExLlamaV2Cache_Hybrid
+        else:
+            base = ExLlamaV2Cache_SWA if getattr(cfg, "sliding_window", 0) else ExLlamaV2Cache
 
     per_layer_geo = bool(getattr(cfg.arch.lm, "tp_per_layer_geometry", False))
 
@@ -1213,6 +1471,15 @@ def tp_rank_cache(
         lazy = True,
         fixed_device = rank,
     )
+    if getattr(cfg, "hybrid_linear_attn", False):
+        # Rank-local GDN state: only this rank's value-head shard.
+        from exllamav2.tensor_p import BROADCAST_GDN_V
+        va = vb = 0
+        for d, a, b in model.tp_context.get_split(BROADCAST_GDN_V):
+            if d == rank:
+                va, vb = a, b
+                break
+        kwargs["gdn_v_range"] = (va, vb)
     if not per_layer_geo and base is not ExLlamaV2Cache_SWA:
         # Uniform geometry: pass the narrowed head count directly. The SWA cache takes
         # no num_key_value_heads (it derives per-layer geometry itself) -- mirrors
@@ -1250,6 +1517,10 @@ class ExLlamaV2Cache_TP(ExLlamaV2CacheBase):
 
         assert model.tp_context is not None, \
             "Cannot create TP cache unless model is loaded with load_tp()"
+
+        # Hybrid backbones need the GDN-state cache as the per-device base.
+        if base is ExLlamaV2Cache and getattr(model.config, "hybrid_linear_attn", False):
+            base = ExLlamaV2Cache_Hybrid
 
         # `num_key_value_heads` is only passed when the model has a single attention geometry.
         # For a per-layer-geometry model (Gemma-4: 16 kv heads on sliding layers, 4 on full

@@ -734,6 +734,29 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
 
         self.sequence_ids = in_tokens.clone()
         self.cache.current_seq_len = 0
+
+        # Built-in MTP (Qwen3.5): the drafter owns a one-layer KV cache that must be
+        # draft-extended over the prompt using the target's per-position post-norm
+        # states. preprocess_only stops before the final norm, so run a full forward
+        # (last_id_only) with return_row_states to export them. newplan.md P6.
+        if self.mtp_drafter is not None and hasattr(self.mtp_drafter, "prefill"):
+            _, row_states = self.model.forward(
+                self.sequence_ids[:, :-1],
+                self.cache,
+                last_id_only = True,
+                return_row_states = True,
+                loras = self.active_loras,
+                input_mask = self.input_mask,
+                position_offsets = self.position_offsets,
+                abort_event = self.abort_event,
+                indexed_embeddings = self.indexed_embeddings)
+            if self.abort_event and self.abort_event.is_set():
+                self._truncate_seq_to_cache()
+                return
+            self.mtp_drafter.prefill(self.sequence_ids[:, :-1], row_states)
+            self.first_token = True
+            return
+
         self.model.forward(self.sequence_ids[:, :-1],
                            self.cache,
                            preprocess_only = True,
@@ -1060,6 +1083,10 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
         # base_state is (1, 1, backbone); keep it 3-D -- draft_window/_step expect (1,1,H).
         self.mtp_state = (base_tok, base_state[:, -1:, :].clone(), self.cache.current_seq_len - 1)
         self.mtp_base_logits = dev_logits.float().cpu()
+        # Built-in MTP: keep the drafter's own KV consistent with the re-established
+        # base position (its bonus entry is recreated by the next draft step).
+        if hasattr(self.mtp_drafter, "rewind"):
+            self.mtp_drafter.rewind(self.cache.current_seq_len - 1)
 
     def _gen_single_token_mtp(self, gen_settings, prefix_token = None):
         """
@@ -1133,12 +1160,27 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
             # the captured step; otherwise forward_chunk stays eager.
             _gv = (self.input_mask is None and self.position_offsets is None
                    and not self.active_loras)
-            vlogits = self.model.forward(
-                draft.cpu(), self.cache,
-                loras = self.active_loras,
-                input_mask = self.input_mask,
-                position_offsets = self.position_offsets,
-                graph_verify = _gv)                                            # (1, W, vocab)
+            # Built-in MTP (Qwen3.5): export per-position post-norm states for the
+            # drafter's commit, and stage the GDN recurrent state so the accepted
+            # prefix can be restored after verification. newplan.md P6.
+            _builtin = hasattr(self.mtp_drafter, "commit")
+            _vstates = None
+            if _builtin:
+                if hasattr(self.cache, "gdn_staging"):
+                    self.cache.gdn_staging = True
+                vlogits, _vstates = self.model.forward(
+                    draft.cpu(), self.cache,
+                    loras = self.active_loras,
+                    input_mask = self.input_mask,
+                    position_offsets = self.position_offsets,
+                    return_row_states = True)
+            else:
+                vlogits = self.model.forward(
+                    draft.cpu(), self.cache,
+                    loras = self.active_loras,
+                    input_mask = self.input_mask,
+                    position_offsets = self.position_offsets,
+                    graph_verify = _gv)                                        # (1, W, vocab)
             vlogits = vlogits.float().cpu()
 
             # 4. acceptance. BUG 106: under sampling (no filters / hooks / healing) use
@@ -1170,6 +1212,16 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
 
             # 5. rewind past the unaccepted tail; the new base is the bonus token
             #    (target's own pick at position pos+m_acc, i.e. the last pending row).
+            if _builtin:
+                # Restore the GDN recurrent state to the accepted prefix and advance
+                # the drafter's own KV over the accepted drafts (the bonus entry is
+                # created by the next round's first draft step).
+                if hasattr(self.cache, "gdn_staging"):
+                    self.model.gdn_rewind_to(self.cache, pos + m_acc)
+                self.mtp_drafter.rewind(pos + m_acc)
+                if m_acc > 0:
+                    acc_ids = torch.tensor([draft_flat[:m_acc]], dtype = torch.long)
+                    self.mtp_drafter.commit(acc_ids, _vstates[:, :m_acc], pos)
             self.cache.current_seq_len = pos + m_acc
             base_tok = torch.tensor([[bonus_id]], dtype = torch.long)
             dev_logits, base_state = self.model.forward(
@@ -1224,6 +1276,13 @@ class ExLlamaV2StreamingGenerator(ExLlamaV2BaseGenerator):
             # conditioned on the wrong prefix. Rewind to this position, commit the
             # sampled token, and start a fresh round next call. This keeps the output
             # distribution exactly target-autoregressive under any sampler settings.
+            if hasattr(self.mtp_drafter, "commit"):
+                # Built-in MTP (experimental): the GDN recurrent state cannot be
+                # rewound across an arbitrary sampled deviation without re-staging.
+                # Restrict to greedy decoding rather than silently corrupt state.
+                raise RuntimeError(
+                    "Built-in MTP (Qwen3.5, experimental) supports greedy decoding only; "
+                    "disable sampling/filters/token-healing or use draft_mode none.")
             self.mtp_resync_count += 1
             self.cache.current_seq_len = self.mtp_pending_pos - 1
             self.mtp_pending_logits = None

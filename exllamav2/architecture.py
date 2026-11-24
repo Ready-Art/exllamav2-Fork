@@ -216,6 +216,20 @@ class ExLlamaV2ArchParams:
             # Per-layer scalar multiplier applied to the block output (Gemma-4 `layer_scalar`).
             layer_scalar = False
 
+            # Hybrid linear-attention backbone (Qwen3.5 / Qwen3.8). `layer_types` entries
+            # are "linear_attention" (gated delta net) or "full_attention"; linear layers
+            # carry no K/V cache, only conv + recurrent state (see gdn.py / cache.py).
+            hybrid_linear_attn = False
+            linear_layer_keys: list[str] = field(default_factory = lambda: [])
+
+            # Full-attention output gate (Qwen3.5): q_proj is 2x wide, the second half of
+            # each head's output is a sigmoid gate applied to the attention output before
+            # o_proj. transformers/models/qwen3_5/modeling_qwen3_5.py Qwen3_5Attention.
+            attn_output_gate = False
+
+            # MTP drafter built into the checkpoint (mtp.* tensors), no assistant model.
+            builtin_mtp = False
+
             # Proportional RoPE for the global-attention layers (Gemma-4).
             rope_partial_rotary_factor = no_default
 
@@ -318,6 +332,9 @@ class ExLlamaV2ArchParams:
         self.lm_prefix = ""
         self.vt_prefix = ""
         self.mmp_prefix = ""
+        # Built-in MTP drafter tensors (Qwen3.5 `mtp.*`), copied through the converter
+        # unquantized and loaded by mtp_qwen35.py. Empty for every other architecture.
+        self.mtp_prefix = ""
         self.lm = Params()
         self.mmp = Params()
         self.vt = Params()
@@ -798,6 +815,73 @@ class ExLlamaV2ArchParams:
             # vt_prefix is ever instantiated (PLAN.md §2.9).
             self.vt_prefix = "vision_tower."
             self.mmp_prefix = "multi_modal_projector."
+
+        # Qwen3.5 / Qwen3.8 (Qwen/Qwen3.8-27B). newplan.md P6.
+        #
+        # Hybrid backbone: 3 gated-delta-net (linear attention) layers then 1 output-gated
+        # full-attention layer, repeating (64 layers, 16 full). Text-only port of the VLM
+        # checkpoint: the model.visual.* tower is skipped, same policy as Gemma-4. The MTP
+        # drafter is built into the weights (mtp.*), not a separate assistant checkpoint.
+        #
+        # Norms are zero-centered (1 + w); q/k carry per-head RMSNorm; full attention rotates
+        # only the first head_dim * partial_rotary_factor dims (64 of 256), NEOX, theta 1e7.
+        # Attention output gate: sigmoid. Delta-net gated norm: silu (output_gate_type swish).
+        #
+        # TP/MP for the hybrid backbone is a follow-up; single-GPU / autosplit first.
+
+        if arch_string in ("Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM"):
+            arch_recognized = True
+            self.lm.hybrid_linear_attn = True
+            self.lm.attn_output_gate = True
+            self.lm.builtin_mtp = True
+
+            self.lm.layer_keys += \
+                layer_keys_llama_norms + \
+                layer_keys_llama_attn + \
+                [["self_attn.q_norm"], ["self_attn.k_norm"]] + \
+                layer_keys_llama_mlp
+            self.lm.linear_layer_keys += \
+                layer_keys_llama_norms + \
+                [["linear_attn.in_proj_qkv"],
+                 ["linear_attn.in_proj_z"],
+                 ["linear_attn.in_proj_b"],
+                 ["linear_attn.in_proj_a"],
+                 ["linear_attn.out_proj"],
+                 ["linear_attn.conv1d"],
+                 ["linear_attn.A_log"],
+                 ["linear_attn.dt_bias"],
+                 ["linear_attn.norm"]] + \
+                layer_keys_llama_mlp
+            self.lm.expect_keys += \
+                expect_keys_gemma4 + [["lm_head"]]
+
+            if arch_string == "Qwen3_5ForConditionalGeneration":
+                self.lm_prefix = "model.language_model."
+            else:
+                self.lm_prefix = "model."
+            self.lm.layers_root = "layers"
+            self.lm.embed_key = "embed_tokens"
+            self.lm.norm_key = "norm"
+
+            self.lm.norm = "rmsnorm"
+            self.lm.headnorm = "rmsnorm"
+            self.lm.norm_constant_bias = 1
+            self.lm.headnorm_constant_bias = 1
+            self.lm.default_use_qk_norm = True
+            self.lm.default_rms_norm_eps = 1e-06
+            self.lm.default_rope_theta = 1e7
+            self.lm.mlp_act_func = "silu"
+            self.lm.mlp_gate = True
+            self.lm.rope_style = RopeStyle.NEOX
+
+            # The checkpoint stores an untied head at top-level `lm_head.weight`, outside
+            # lm_prefix. google_keymap's anchored `$lm_head.weight` entry remaps it to
+            # `model.language_model.lm_head.weight`, which is the module key the loader
+            # builds (lm_prefix + "lm_head"). Same mechanism as Gemma-4 untied finetunes.
+            self.keymap = google_keymap
+            self.compile_fix_keymap = google_keymap
+
+            self.mtp_prefix = "mtp."
 
         # StarCoder2
 

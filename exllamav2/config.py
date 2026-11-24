@@ -240,6 +240,12 @@ class ExLlamaV2Config:
         assert 0 <= layer_idx < len(layer_types), \
             f"layer_idx {layer_idx} out of range for {len(layer_types)} layer_types"
 
+        # Hybrid linear-attention layers carry no K/V cache at all (gated delta net).
+        # Report zero kv heads so cache sizing / TP splits skip them; the GDN module
+        # owns their recurrent state instead. newplan.md P6.
+        if getattr(self, "hybrid_linear_attn", False) and layer_types[layer_idx] == "linear_attention":
+            return (self.head_dim, self.num_attention_heads, 0, False)
+
         is_full = layer_types[layer_idx] == "full_attention"
 
         if is_full:
@@ -454,6 +460,29 @@ class ExLlamaV2Config:
         self.v_norm = getattr(self.arch.lm, "v_norm", False)
         self.layer_scalar = getattr(self.arch.lm, "layer_scalar", False)
 
+        # Hybrid linear-attention geometry (Qwen3.5 / Qwen3.8). newplan.md P6.
+        # Gated delta net: nk key heads (also query), nv value heads (nv % nk == 0),
+        # depthwise causal conv over the concatenated q/k/v channels, fp32 recurrent
+        # state per value head. None for every other architecture.
+        self.hybrid_linear_attn = bool(getattr(self.arch.lm, "hybrid_linear_attn", False))
+        self.linear_num_key_heads = read(read_config, int, "linear_num_key_heads", None, opt_subkey = "text_config")
+        self.linear_num_value_heads = read(read_config, int, "linear_num_value_heads", None, opt_subkey = "text_config")
+        self.linear_key_head_dim = read(read_config, int, "linear_key_head_dim", None, opt_subkey = "text_config")
+        self.linear_value_head_dim = read(read_config, int, "linear_value_head_dim", None, opt_subkey = "text_config")
+        self.linear_conv_kernel_dim = read(read_config, int, "linear_conv_kernel_dim", None, opt_subkey = "text_config")
+        self.mtp_num_hidden_layers = read(read_config, int, "mtp_num_hidden_layers", 0, opt_subkey = "text_config")
+        # Gated-norm activation inside the delta net ("swish" == silu). The full-attention
+        # output gate is sigmoid regardless (HF/vLLM/exl3 all agree).
+        self.output_gate_type = read(read_config, str, "output_gate_type", "silu", opt_subkey = "text_config")
+        if self.hybrid_linear_attn:
+            assert self.linear_num_key_heads and self.linear_num_value_heads \
+                and self.linear_key_head_dim and self.linear_value_head_dim \
+                and self.linear_conv_kernel_dim, \
+                "Hybrid architecture missing linear-attention geometry in config"
+            assert self.linear_num_value_heads % self.linear_num_key_heads == 0, \
+                "linear_num_value_heads must be divisible by linear_num_key_heads"
+            assert self.layer_types is not None, "Hybrid architecture requires layer_types"
+
         # Proportional RoPE parameters for the global-attention layers. PLAN.md §2.3.
         self.rope_partial_rotary_factor_global = read(
             read_config,
@@ -568,7 +597,7 @@ class ExLlamaV2Config:
         self.rotary_embedding_base = read(
             read_config,
             float,
-            ["rope_theta", "attn_config->rope_theta"],
+            ["rope_theta", "attn_config->rope_theta", "rope_parameters->rope_theta"],
             self.arch.lm.default_rope_theta,
             opt_subkey = "text_config",
         )
@@ -597,17 +626,30 @@ class ExLlamaV2Config:
             assert len(self.layer_types) == self.num_hidden_layers, \
                 f"text_config->layer_types has {len(self.layer_types)} entries but " \
                 f"num_hidden_layers is {self.num_hidden_layers}"
-            for _li, _lt in enumerate(self.layer_types):
-                if self.sliding_window_pattern > 1:
-                    _computed = "sliding_attention" if (_li + 1) % self.sliding_window_pattern != 0 \
-                        else "full_attention"
-                else:
-                    _computed = "sliding_attention" if _li % 2 == 0 else "full_attention"
-                assert _computed == _lt, \
-                    f"layer_types mismatch at layer {_li}: config says {_lt!r}, " \
-                    f"sliding_window_pattern={self.sliding_window_pattern} computes {_computed!r}"
+            if self.arch.lm.hybrid_linear_attn:
+                # Qwen3.5: "linear_attention" / "full_attention", no SWA pattern to check.
+                for _li, _lt in enumerate(self.layer_types):
+                    assert _lt in ("linear_attention", "full_attention"), \
+                        f"layer_types[{_li}] = {_lt!r} not supported by the hybrid backbone"
+            else:
+                for _li, _lt in enumerate(self.layer_types):
+                    if self.sliding_window_pattern > 1:
+                        _computed = "sliding_attention" if (_li + 1) % self.sliding_window_pattern != 0 \
+                            else "full_attention"
+                    else:
+                        _computed = "sliding_attention" if _li % 2 == 0 else "full_attention"
+                    assert _computed == _lt, \
+                        f"layer_types mismatch at layer {_li}: config says {_lt!r}, " \
+                        f"sliding_window_pattern={self.sliding_window_pattern} computes {_computed!r}"
 
-        self.partial_rotary_factor = read(read_config, float, "partial_rotary_factor", 1.0)
+        # Qwen3.5 nests partial_rotary_factor under text_config (and rope_parameters);
+        # the opt_subkey lookup is a no-op for architectures that keep it top-level.
+        self.partial_rotary_factor = read(
+            read_config, float,
+            ["partial_rotary_factor", "rope_parameters->partial_rotary_factor"],
+            1.0,
+            opt_subkey = "text_config",
+        )
 
         rs = read(read_config, dict, ["rope_scaling", "text_config->rope_scaling"], None)
         if rs:
@@ -694,10 +736,19 @@ class ExLlamaV2Config:
             # ends in `model.language_model.`. PLAN.md §2.1.
             layers_root = getattr(archparams, "layers_root", "model.layers")
             for layer_idx in range(self.num_hidden_layers):
+                # Hybrid backbone (Qwen3.5): linear-attention layers carry the delta-net
+                # key set, full-attention layers the usual q/k/v/o set. newplan.md P6.
+                if self.hybrid_linear_attn and archparams is self.arch.lm:
+                    if self.layer_types[layer_idx] == "linear_attention":
+                        layer_keys = archparams.linear_layer_keys
+                    else:
+                        layer_keys = archparams.layer_keys
+                else:
+                    layer_keys = per_layer_keys
                 # Gemma-4 full-attention layers are k-eq-v: they carry no v_proj at all,
                 # so requiring one here would fail on the very first full layer. PLAN.md §2.5.
                 skip_v_proj = not self.layer_has_v_proj(layer_idx)
-                for ks in per_layer_keys:
+                for ks in layer_keys:
                     if skip_v_proj and any("v_proj" in k for k in ks):
                         continue
                     prefixes = [f"{layers_root}.{layer_idx}.{k}" for k in ks]
@@ -737,7 +788,8 @@ class ExLlamaV2Config:
         # `vlm/` is not to be extended. Force text-only so the loader skips every
         # vision_tower.* / multi_modal_projector.* tensor instead of erroring on an unknown type.
         self.vision_disabled = False
-        if self.arch.arch_string in ("Gemma4ForConditionalGeneration", "Gemma4ForCausalLM"):
+        if self.arch.arch_string in ("Gemma4ForConditionalGeneration", "Gemma4ForCausalLM",
+                                     "Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM"):
             if self.vision_model_type is not None:
                 self.vision_disabled = True
                 self.vision_model_type = None

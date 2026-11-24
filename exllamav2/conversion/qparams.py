@@ -335,6 +335,14 @@ qparams_mlp = \
     ]
 ]
 
+# Gated delta net (Qwen3.5): five quantized projections per layer — in_proj_q/k/v/z
+# and out_proj. in_proj_b/a stay fp16. Same bitrate ladder as attention; z tracks v,
+# out_proj tracks o. newplan.md P6.
+qparams_gdn = \
+[
+    [qp[0], qp[1], qp[2], qp[2], qp[3]] for qp in qparams_attn
+]
+
 qparams_headoptions = \
 {
     2: QParams(32, [4, 2], [0.3, 0.7], 4),

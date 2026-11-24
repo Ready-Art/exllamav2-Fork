@@ -198,6 +198,12 @@ class ExLlamaV2Attention(ExLlamaV2Module):
             # Unweighted RMSNorm applied to V (PLAN.md §2.4)
             self.has_v_norm = bool(getattr(cfg, "v_norm", False))
 
+        # Qwen3.5 output gate (newplan.md P6): q_proj is 2x wide, each head's output is
+        # [q(hd), gate(hd)] interleaved, and the attention output is multiplied by
+        # sigmoid(gate) before o_proj. HF modeling_qwen3_5.py Qwen3_5Attention.
+        self.attn_output_gate = bool(getattr(ap, "attn_output_gate", False)) and not ap.is_vision
+        self.q_gate_width = 2 if self.attn_output_gate else 1
+
         hidden_size = self.hidden_size
 
         if self.has_norm and (km["norm_1"] or km["norm_1_post"]):
@@ -218,7 +224,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
         f_d = f_c + self.num_key_value_heads * self.head_dim
         f_key = (key + km["fused_qkv"]) if km["fused_qkv"] else None
 
-        self.q_proj = ExLlamaV2Linear(model, key + km["attn_q"], hidden_size, self.num_attention_heads * self.head_dim, ap.attention_bias_qkv, f_key = f_key, f_beg = f_a, f_end = f_b, altpack_qkv = ap.fused_qkv_altpack)
+        self.q_proj = ExLlamaV2Linear(model, key + km["attn_q"], hidden_size, self.num_attention_heads * self.head_dim * self.q_gate_width, ap.attention_bias_qkv, f_key = f_key, f_beg = f_a, f_end = f_b, altpack_qkv = ap.fused_qkv_altpack)
         self.k_proj = ExLlamaV2Linear(model, key + km["attn_k"], hidden_size, self.num_key_value_heads * self.head_dim, ap.attention_bias_qkv, f_key = f_key, f_beg = f_b, f_end = f_c, altpack_qkv = ap.fused_qkv_altpack)
         if self.use_k_as_v:
             # No v_proj tensor exists in the checkpoint for these layers (PLAN.md §2.5)
@@ -326,6 +332,12 @@ class ExLlamaV2Attention(ExLlamaV2Module):
         # are quantized and would otherwise silently drop it. The non-fused branch of
         # forward_paged applies v_norm correctly (attn.py:846), so decline the handle here.
         if self.v_norm is not None and self.q_proj.is_quant():
+            self.q_handle = None
+            return
+
+        # The fused kernel has no output-gate support (Qwen3.5). Decline the handle so
+        # forward() routes to forward_torch / forward_tp_old, which apply sigmoid(gate).
+        if self.attn_output_gate:
             self.q_handle = None
             return
 
@@ -561,6 +573,12 @@ class ExLlamaV2Attention(ExLlamaV2Module):
         loras: list[ExLlamaV2Lora] | None = None,
         **kwargs
     ) -> torch.Tensor:
+
+        # Qwen3.5 output-gated attention is served by forward_torch / forward_tp_old
+        # (regular cache). The paged path has no gate support yet; hybrid models use
+        # the streaming generator, which never builds PagedParams. newplan.md P6.
+        assert not self.attn_output_gate, \
+            "Output-gated attention (Qwen3.5) does not support the paged cache path"
 
         if self.is_tp:
             return self.forward_paged_tp(
@@ -2028,7 +2046,9 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                     ext_c.exl25_transform(_rows.contiguous(), _tf_out, _awq_ref, _qh)
                     _pn_in = _tf_out
                     _pre_tf = True
-        q = self.q_proj.forward_tp(_pn_in, loras = loras, output_split = True, dim = self.head_dim, pre_transformed = _pre_tf)
+        # Qwen3.5 output gate: q_proj is 2x wide ([q|gate] per head), so the column
+        # split unit is 2*head_dim. The gate half is peeled off below before q_norm/rope.
+        q = self.q_proj.forward_tp(_pn_in, loras = loras, output_split = True, dim = self.head_dim * self.q_gate_width, pre_transformed = _pre_tf)
         k = self.k_proj.forward_tp(_pn_in, loras = loras, output_split = True, dim = self.head_dim, pre_transformed = _pre_tf)
         # BUG 90a (TP): on a k-eq-v layer V is K, but the two must be INDEPENDENT
         # storages from this point on: the per-head-norm block applies v_norm to v and
@@ -2040,6 +2060,18 @@ class ExLlamaV2Attention(ExLlamaV2Module):
         # on all 10 full layers x 4 devices). Clone each device's raw k output into a new
         # list so v and k diverge cleanly.
         v = [x.clone() for x in k] if self.use_k_as_v else self.v_proj.forward_tp(_pn_in, loras = loras, output_split = True, dim = self.head_dim, pre_transformed = _pre_tf)
+
+        # Peel the interleaved output gate off each device's q shard: [q(hd), gate(hd)]
+        # per head. q_norm/rope below then see only the query half. newplan.md P6.
+        gates = None
+        if self.attn_output_gate:
+            gates = []
+            for idx in range(len(q)):
+                rows_ = q[idx].shape[0]
+                nq_l = q[idx].shape[1] // (2 * self.head_dim)
+                qg = q[idx].view(rows_, nq_l, 2 * self.head_dim)
+                q[idx] = qg[:, :, :self.head_dim].reshape(rows_, nq_l * self.head_dim)
+                gates.append(qg[:, :, self.head_dim:].contiguous())
 
         if os.environ.get("EXL2_TP_DUMP"):
             _d = os.environ["EXL2_TP_DUMP"]
@@ -2624,6 +2656,11 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                         cfg
                     )
 
+            # Qwen3.5 output gate: sigmoid(gate) * attention output, per device shard.
+            if self.attn_output_gate:
+                ao = attn_output.view(batch_size * q_len, (b - a) * self.num_key_value_groups, self.head_dim)
+                attn_output = ao * torch.sigmoid(gates[idx])
+
             attn_output = attn_output.view(batch_size * q_len, (b - a) * self.head_dim * self.num_key_value_groups)
             attn_outputs.append(attn_output)
 
@@ -2836,6 +2873,14 @@ class ExLlamaV2Attention(ExLlamaV2Module):
         # attention_k_eq_v: V is K, there is no v_proj (PLAN.md §2.5)
         value_states = key_states if self.use_k_as_v else self.v_proj.forward(post_norm, loras = loras)
 
+        # Qwen3.5 output gate: q_proj carries [q(hd), gate(hd)] per head. Split before
+        # the head view so q_norm/rope see only the query half. newplan.md P6.
+        attn_gate = None
+        if self.attn_output_gate:
+            qg = query_states.view(batch_size, q_len, num_attention_heads, 2 * head_dim)
+            query_states = qg[..., :head_dim].contiguous()
+            attn_gate = qg[..., head_dim:].contiguous()
+
         # Shape for attention
 
         query_states = query_states.view(batch_size, q_len, num_attention_heads, head_dim)
@@ -2965,6 +3010,12 @@ class ExLlamaV2Attention(ExLlamaV2Module):
             torch.save({"attn_out": attn_output.detach().float().cpu()},
                        os.environ["EXL2_TP_DUMP"] + "_single_attn_out.pt")
             print("[DUMP] single attn_out saved", flush=True)
+
+        # Qwen3.5 output gate: sigmoid(gate) * attention output, before o_proj.
+        if self.attn_output_gate:
+            ao = attn_output.reshape(batch_size, q_len, num_attention_heads, head_dim)
+            ao = ao * torch.sigmoid(attn_gate)
+            attn_output = ao.reshape(batch_size, q_len, num_attention_heads * head_dim)
 
         # Output projection
 
@@ -3215,7 +3266,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
         if self.post_layernorm is not None:
             self.post_layernorm.tp_split(BROADCAST_KV)
 
-        self.q_proj.tp_split(BROADCAST_Q, dim = self.head_dim)
+        self.q_proj.tp_split(BROADCAST_Q, dim = self.head_dim * self.q_gate_width)
         self.k_proj.tp_split(BROADCAST_KV, dim = self.head_dim)
         if self.v_proj is not None:
             self.v_proj.tp_split(BROADCAST_KV, dim = self.head_dim)
@@ -3402,7 +3453,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                 if _n.bias is not None:
                     _n.bias.data = _n.bias.data.to(rank, non_blocking = False)
 
-        self.q_proj.tp_load_rank(rank, BROADCAST_Q, dim = self.head_dim)
+        self.q_proj.tp_load_rank(rank, BROADCAST_Q, dim = self.head_dim * self.q_gate_width)
         self.k_proj.tp_load_rank(rank, BROADCAST_KV, dim = self.head_dim)
         if self.v_proj is not None:
             self.v_proj.tp_load_rank(rank, BROADCAST_KV, dim = self.head_dim)
@@ -3517,7 +3568,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
             for i, s in enumerate(res):
                 scratch[i] = max(scratch[i], s)
 
-        amax(self.q_proj.scratch_space_tp(BROADCAST_Q, self.head_dim))
+        amax(self.q_proj.scratch_space_tp(BROADCAST_Q, self.head_dim * self.q_gate_width))
         amax(self.k_proj.scratch_space_tp(BROADCAST_KV, self.head_dim))
         if self.v_proj is not None:
             amax(self.v_proj.scratch_space_tp(BROADCAST_KV, self.head_dim))

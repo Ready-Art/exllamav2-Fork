@@ -38,6 +38,13 @@ def fuse_agnr_enabled(kv_len: int) -> bool:
     return kv_len >= thr
 BROADCAST_RS = 3
 BROADCAST_Q = 4
+# Hybrid linear-attention (Qwen3.5 gated delta net) splits, in head units.
+# GDN_K: key/query heads (nk). GDN_V: value heads (nv). The value split is
+# derived from the key split times the GQA group so every rank's value-head
+# block maps to a whole number of key heads (the delta rule is per-head
+# independent, so ranks never exchange recurrent state).
+BROADCAST_GDN_K = 5
+BROADCAST_GDN_V = 6
 
 # Decode-time replicated-residual flow (EXL2_TP_DECODE_REPLICATED): forwards with
 # q_len <= this threshold keep the residual FULL-width on every rank instead of the
@@ -858,6 +865,10 @@ class TPContext:
         kv_elements = 0
         for _li in range(cfg.num_hidden_layers):
             _hd, _, _kvh, _full = cfg.get_layer_attn_geometry(_li)
+            # Hybrid linear-attention layers carry no K/V (kvh == 0); their recurrent
+            # state is tiny (per-head, context-independent) and reserved below instead.
+            if _kvh == 0:
+                continue
             # Multi-batch: every cache row holds its own ring, so the SWA reservation
             # scales with max_batch too (full layers scale via expect_cache_tokens).
             _tokens = expect_cache_tokens if (_full or not _ring) \
@@ -874,6 +885,36 @@ class TPContext:
                 continue
             wfp = module.weight_footprint()
             gpu_split = [max(0, gs - int(wfp * r / 1024**2)) for gs, r in zip(gpu_split, attn_ratio)]
+
+        # Hybrid (Qwen3.5): GDN splits. Value heads derive from key heads times the
+        # GQA group so each rank's value block maps to whole key heads. Subtract GDN
+        # weight + recurrent-state footprint by the value-head ratio before the
+        # MLP/vocab splits are derived.
+        self.gdn_k_split = None
+        self.gdn_k_split_devs = None
+        self.gdn_v_split = None
+        self.gdn_v_split_devs = None
+        if getattr(cfg, "hybrid_linear_attn", False):
+            _group = cfg.linear_num_value_heads // cfg.linear_num_key_heads
+            gdn_k_split = integer_split(cfg.linear_num_key_heads, gpu_split)
+            gdn_v_split = [s * _group for s in gdn_k_split]
+            gdn_ratio = [s / cfg.linear_num_value_heads for s in gdn_v_split]
+            ExLlamaV2GatedDeltaNet_ = sys.modules["exllamav2.gdn"].ExLlamaV2GatedDeltaNet
+            for module in self.model.modules:
+                if not isinstance(module, ExLlamaV2GatedDeltaNet_):
+                    continue
+                wfp = module.weight_footprint()
+                gpu_split = [max(0, gs - int(wfp * r / 1024**2)) for gs, r in zip(gpu_split, gdn_ratio)]
+            # Recurrent state: fp32 (nv, dk, dv) + fp16 conv (conv_dim, K-1), x2 for
+            # the rewind backup, per batch row. Context-independent.
+            _nk, _nv = cfg.linear_num_key_heads, cfg.linear_num_value_heads
+            _dk, _dv = cfg.linear_key_head_dim, cfg.linear_value_head_dim
+            _conv_dim = 2 * _nk * _dk + _nv * _dv
+            _state_bytes = self.max_batch * (
+                4 * _nv * _dk * _dv + 2 * _conv_dim * (cfg.linear_conv_kernel_dim - 1)) * 2
+            _n_linear = sum(1 for _t in cfg.layer_types if _t == "linear_attention")
+            _state_bytes *= _n_linear
+            gpu_split = [max(0, gs - int(_state_bytes * r / 1024**2)) for gs, r in zip(gpu_split, gdn_ratio)]
 
         # MLP split
 
@@ -901,6 +942,9 @@ class TPContext:
         self.vc_split, self.vc_split_devs = set_split(vc_split)
         self.rs_split, self.rs_split_devs = set_split(rs_split)
         self.q_split, self.q_split_devs = set_split(q_split)
+        if getattr(cfg, "hybrid_linear_attn", False):
+            self.gdn_k_split, self.gdn_k_split_devs = set_split(gdn_k_split)
+            self.gdn_v_split, self.gdn_v_split_devs = set_split(gdn_v_split)
 
         # One split set per distinct attention geometry.
         #
@@ -916,9 +960,23 @@ class TPContext:
         # active one swapped per layer by `set_geometry()`. No C++ change is required.
         self.geometry_splits = {}
         self.geometry_keys = []
+        _hybrid = getattr(cfg, "hybrid_linear_attn", False)
+        _full_geo_key = None
         for _li in range(cfg.num_hidden_layers):
             _hd, _qh, _kvh, _full = cfg.get_layer_attn_geometry(_li)
-            self.geometry_keys.append((_hd, _qh, _kvh, _full))
+            if _hybrid and _kvh == 0:
+                # Linear-attention layers have no attention geometry; route them to
+                # the full-attention geometry so set_geometry() selects the shared
+                # RS/ID/VC splits (GDN uses its own GDN_K/GDN_V splits).
+                if _full_geo_key is None:
+                    for _lj in range(cfg.num_hidden_layers):
+                        _g = cfg.get_layer_attn_geometry(_lj)
+                        if _g[2] > 0:
+                            _full_geo_key = _g
+                            break
+                self.geometry_keys.append(_full_geo_key)
+            else:
+                self.geometry_keys.append((_hd, _qh, _kvh, _full))
         for _key in dict.fromkeys(self.geometry_keys):
             _hd, _qh, _kvh, _full = _key
             _kv = integer_split(_kvh, gpu_split)
@@ -1219,7 +1277,13 @@ class TPContext:
 
     def get_split(self, broadcast_type: int):
 
-        if self.geometry_key_active is not None:
+        # GDN splits are global (not per-geometry): the delta-net head layout is
+        # uniform across all linear layers.
+        if broadcast_type == BROADCAST_GDN_K:
+            full = self.gdn_k_split
+        elif broadcast_type == BROADCAST_GDN_V:
+            full = self.gdn_v_split
+        elif self.geometry_key_active is not None:
             sp = self.geometry_splits[self.geometry_key_active]
             if broadcast_type == BROADCAST_KV: full = sp["kv"][0]
             elif broadcast_type == BROADCAST_Q: full = sp["q"][0]
@@ -1256,6 +1320,8 @@ class TPContext:
         the whole picture: an all-gather has to know how wide every rank's contribution is, and
         the C++ contexts are built from the full geometry. BUG 71.
         """
+        if broadcast_type == BROADCAST_GDN_K: return self.gdn_k_split
+        if broadcast_type == BROADCAST_GDN_V: return self.gdn_v_split
         if self.geometry_key_active is not None:
             sp = self.geometry_splits[self.geometry_key_active]
             if broadcast_type == BROADCAST_KV: return sp["kv"][0]
@@ -1273,6 +1339,8 @@ class TPContext:
 
     def get_devs(self, broadcast_type: int):
 
+        if broadcast_type == BROADCAST_GDN_K: return self.gdn_k_split_devs
+        if broadcast_type == BROADCAST_GDN_V: return self.gdn_v_split_devs
         return [
             self.kv_split_devs,
             self.id_split_devs,

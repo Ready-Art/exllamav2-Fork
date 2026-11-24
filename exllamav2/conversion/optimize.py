@@ -36,7 +36,18 @@ def optimize(job, save_fn, model):
     # bias_layers = 2
     # bias_iter = 0
 
-    key = cfg.arch.lm_prefix + layers_root + ".0"
+    # Hybrid backbone (Qwen3.5): layer 0 is a linear-attention (gated delta net) layer
+    # with no self_attn keys. Reference shapes come from the first FULL-attention layer;
+    # per-layer numel below is read from the actual modules, so the fallbacks here are
+    # display-only. newplan.md P6.
+    _hybrid = getattr(cfg, "hybrid_linear_attn", False)
+    _ref_layer = 0
+    if _hybrid:
+        for _li in range(cfg.num_hidden_layers):
+            if cfg.layer_types[_li] == "full_attention":
+                _ref_layer = _li
+                break
+    key = cfg.arch.lm_prefix + layers_root + "." + str(_ref_layer)
     key_q = key + km["attn_q"]
     key_k = key + km["attn_k"]
     key_v = key + km["attn_v"]
@@ -76,6 +87,12 @@ def optimize(job, save_fn, model):
     numel_attn = numel_q + numel_k + numel_v + numel_o
     numel_mlp = numel_g + numel_u + numel_d
 
+    def _attn_mode(layer_i):
+        # Measurement / strategy key suffix for a layer's token mixer.
+        if _hybrid and cfg.layer_types[layer_i] == "linear_attention":
+            return "gdn"
+        return "self_attn"
+
     # Combined size of hidden layers
 
     num_layers = cfg.num_hidden_layers
@@ -103,7 +120,7 @@ def optimize(job, save_fn, model):
             m1 = measurement[cfg.arch.lm_prefix + layers_root + "." + str(i) + ".parallel_decoder"]["attn"]
             m2 = measurement[cfg.arch.lm_prefix + layers_root + "." + str(i) + ".parallel_decoder"]["mlp"]
         else:
-            m1 = measurement[cfg.arch.lm_prefix + layers_root + "." + str(i) + ".self_attn"]
+            m1 = measurement[cfg.arch.lm_prefix + layers_root + "." + str(i) + "." + _attn_mode(i)]
             m2 = measurement[cfg.arch.lm_prefix + layers_root + "." + str(i) + "." + mlp_mode]
         for m in [m1, m2]:
             slot = []
@@ -185,7 +202,7 @@ def optimize(job, save_fn, model):
     job["strategy"] = {}
     for layer_ in range(num_layers):
 
-        k1 = cfg.arch.lm_prefix + layers_root + "." + str(layer_) + ".self_attn"
+        k1 = cfg.arch.lm_prefix + layers_root + "." + str(layer_) + "." + _attn_mode(layer_)
         k2 = cfg.arch.lm_prefix + layers_root + "." + str(layer_) + "." + mlp_mode
         p1 = params[layer_ * 2][solution_idx[layer_ * 2]]
         p2 = params[layer_ * 2 + 1][solution_idx[layer_ * 2 + 1]]

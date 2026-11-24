@@ -27,8 +27,10 @@ Licensed under the same MIT license as upstream; all original credit to
 > finished, tuned product.
 
 - **Model compatibility:** built and tested end-to-end on
-  **[Gemma-4-31B-IT](https://huggingface.co/ReadyArt/Gemma-4-31B-IT-EXL2-6.0BPW-HB16)** only. Other
-  EXL2 models *should* work; other architectures are untested here — verify correctness yourself.
+  **[Gemma-4-31B-IT](https://huggingface.co/ReadyArt/Gemma-4-31B-IT-EXL2-6.0BPW-HB16)** only.
+  **[Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)** (hybrid gated-delta-net backbone) is
+  implemented but **experimental and not yet rig-validated**. Other EXL2 models *should* work;
+  other architectures are untested here — verify correctness yourself.
 - **Hardware:** built and tested on **SM86 (Ampere — RTX 3090)** only. The kernel build targets
   `TORCH_CUDA_ARCH_LIST="8.6"`. Other architectures may work but are untested.
 - **Primary path:** the majority of development and optimization goes into
@@ -108,6 +110,7 @@ MTP drafter (939 MB): [google/gemma-4-31B-it-assistant](https://huggingface.co/g
 | **MTP speculative decoding** | A Gemma-4 *assistant* drafter proposes a window of tokens; the target verifies them in one forward. Works with TP and MP, greedy and sampled. |
 | **EXL2.5 quantization format** | Per-tensor opt-in upgrades: uniform-bit fast-path GEMM (Ampere-optimized, 16-row cap), Hadamard incoherence + AWQ channel protection for lower quant error at the same bpw. Plain EXL2 models run unchanged. See [EXL2.5](#exl25-quantization-format). |
 | **Gemma-4-31B-IT support** | Text-only. Two attention geometries (head_dim 256 sliding / 512 full), `k_eq_v` layers, proportional RoPE, per-layer norms. |
+| **Qwen3.8-27B support (experimental)** | Text-only hybrid backbone: gated delta net (linear attention) + output-gated full attention, built-in MTP drafter, TP/MP. Not yet rig-validated. See [Experimental features](#experimental-features). |
 | **Sliding-window + TP KV cache** | Ring buffers for sliding layers make long context fit (≈22.5 GB instead of ≈236 GB at 256k for Gemma-4-31B). |
 | **TP CUDA graphs** | Whole-step decode/verify graphs remove per-op launch latency on the tensor-parallel path. |
 | **FlashInfer attention** | head_dim 512 on every path on sm86 — paged decode (incl. CUDA-graph mode), single-token decode, prefill. |
@@ -360,6 +363,44 @@ A/B, speed A/B vs legacy, CUDA-graph capture/replay), `mtp/exl25_moe_test.py` (f
 All three are opt-in on the **MP + MTP** path and validated on the test rig; the default
 (batch size 1, no offload, MTP drafting) is the verified single-job path. Configuration details
 live in the [TabbyAPI fork docs](https://github.com/Ready-Art/tabbyAPI-Fork/blob/ReadyArt/docs/11.-ReadyArt-ExLlamaV2-Fork.md).
+
+### Qwen3.8-27B / Qwen3.5 hybrid backbone (EXPERIMENTAL — not yet rig-validated)
+
+Support for **[Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)** (architecture
+`Qwen3_5ForConditionalGeneration`, text-only). This is a **hybrid linear-attention backbone**,
+structurally different from Gemma-4:
+
+- **64 layers**: 3× *gated delta net* (linear attention) then 1× output-gated full attention,
+  repeating (16 full-attention layers). The delta-net layers carry **no K/V cache** — a depthwise
+  short-conv state (last 3 raw inputs/channel) plus a fp32 recurrent state per value head
+  (`ExLlamaV2GatedDeltaNet`, `exllamav2/gdn.py`). The delta-rule scan is pure torch (chunked
+  prefill + per-token decode), ported from the HF Qwen3.5/Qwen3-Next reference and cross-checked
+  bit-exact against it; **no Triton, no trellis**. A CUDA C++ decode kernel is the follow-up
+  perf lever.
+- **Full-attention layers**: output-gated q (`q_proj` 2× wide, sigmoid gate), per-head q/k RMSNorm
+  (zero-centered `1+w`), partial NEOX RoPE (64 of 256 dims, theta 1e7).
+- **Hybrid cache** (`ExLlamaV2Cache_Hybrid`): FP16 K/V on full layers + conv/recurrent state on
+  linear layers, with a one-deep backup for single-token rewinds (token healing) and verify
+  staging for speculative rejection.
+- **TP/MP**: the delta net shards by value-head groups (the recurrence is per-head independent, so
+  ranks never exchange recurrent state); q/k shard by key heads, `out_proj` is row-parallel. Both
+  the single-process (`sp`) and multiprocess (`mp`) backends are wired; CUDA graphs are disabled
+  for hybrid (eager delta-net ops). KV-head count must be ≥ world size on the full layers (4 KV
+  heads → up to 4 GPUs).
+- **Built-in MTP** (`exllamav2/mtp_qwen35.py`, experimental): the drafter is a single decoder layer
+  shipped inside the checkpoint (`mtp.*`), borrowing the target's embedding/head. Enable with
+  `draft_model.draft_mode: mtp` and **no** `draft_model_name`. **Greedy decoding only**,
+  single-GPU/autosplit only for now (MP fan-out of the verify staging is a follow-up). The
+  converter copies `mtp.*` through unquantized (fp16).
+- **Converter**: `convert_exl2.py` handles the delta-net projections (`in_proj_q/k/v/z`, `out_proj`
+  quantized; `in_proj_b/a` fp16), the raw conv/`A_log`/`dt_bias`/norm tensors, and the `mtp.*`
+  passthrough. EXL2.5 (uniform bits, no trellis) is the intended quant format. Vision tower
+  (`model.visual.*`) is skipped, same policy as Gemma-4.
+
+**Status:** implemented and syntax/parity-checked (delta-rule math bit-exact vs HF; architecture
+recognition tested), but **not yet run on the GPU rig** — treat output as unverified until a
+short-context coherence test passes. Quantize with `convert_exl2.py` (e.g. EXL2.5 uniform 4-bit,
+fp16 head) and load through the TabbyAPI fork.
 
 ### Multi-batch (MP + MTP)
 

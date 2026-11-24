@@ -3,6 +3,7 @@ from exllamav2.model import \
     ExLlamaV2Embedding,
     ExLlamaV2PosEmbedding,
     ExLlamaV2Attention,
+    ExLlamaV2GatedDeltaNet,
     ExLlamaV2MLP,
     ExLlamaV2MoEMLP,
     ExLlamaV2ParallelDecoder,
@@ -83,6 +84,10 @@ def compile_model(job, save_fn, model):
         extra_tensors += [k for k in cfg.tensor_file_map.keys() if k.startswith(cfg.arch.mmp_prefix)]
     if cfg.arch.vt_prefix:
         extra_tensors += [k for k in cfg.tensor_file_map.keys() if k.startswith(cfg.arch.vt_prefix)]
+    # Built-in MTP drafter tensors (Qwen3.5 mtp.*): copied through unquantized (fp16)
+    # for the built-in drafter (mtp_qwen35.py). newplan.md P6.
+    if getattr(cfg.arch, "mtp_prefix", ""):
+        extra_tensors += [k for k in cfg.tensor_file_map.keys() if k.startswith(cfg.arch.mtp_prefix)]
     extra_tensors_size = 0
 
     while index < len(model.modules) or len(extra_tensors):
@@ -118,6 +123,27 @@ def compile_model(job, save_fn, model):
                 # Unweighted v_norm has no tensor; get_f_module returns None for it.
                 d = get_f_module(job, module.v_norm)
                 if d: out_dict.update(d); current_size += _dsize(d)
+
+            if isinstance(module, ExLlamaV2GatedDeltaNet):
+
+                # Qwen3.5 gated delta net (newplan.md P6). q/k/v/z/out quantized;
+                # b/a fp16; conv1d/A_log/dt_bias/norm copied in checkpoint layout.
+                d = get_f_module(job, module.pre_layernorm)
+                if d: out_dict.update(d); current_size += _dsize(d)
+                for proj in (module.in_proj_q, module.in_proj_k, module.in_proj_v,
+                             module.in_proj_z, module.out_proj):
+                    d = get_q_module(job, proj); out_dict.update(d); current_size += _dsize(d)
+                for proj in (module.in_proj_b, module.in_proj_a):
+                    d = get_f_module(job, proj)
+                    if d: out_dict.update(d); current_size += _dsize(d)
+                lk = module.key + ".linear_attn"
+                raw = {
+                    lk + ".conv1d.weight": module.conv1d_weight.view(module.conv_dim, 1, module.conv_kernel).half(),
+                    lk + ".A_log": module.A_log.half(),
+                    lk + ".dt_bias": module.dt_bias.half(),
+                    lk + ".norm.weight": module.norm_weight.half(),
+                }
+                out_dict.update(raw); current_size += _dsize(raw)
 
             if isinstance(module, ExLlamaV2MLP):
 

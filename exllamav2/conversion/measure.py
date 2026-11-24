@@ -3,6 +3,7 @@ from exllamav2.model import \
     ExLlamaV2Embedding,
     ExLlamaV2PosEmbedding,
     ExLlamaV2Attention,
+    ExLlamaV2GatedDeltaNet,
     ExLlamaV2MLP,
     ExLlamaV2MoEMLP,
     ExLlamaV2Linear,
@@ -14,7 +15,7 @@ from exllamav2.model import \
 from exllamav2.layer_scalar import ExLlamaV2LayerScalar
 from safetensors import safe_open
 from safetensors.torch import save_file
-from exllamav2.conversion.qparams import QParams, qparams_headoptions, qparams_attn, qparams_mlp, get_qparams_reduced
+from exllamav2.conversion.qparams import QParams, qparams_headoptions, qparams_attn, qparams_mlp, qparams_gdn, get_qparams_reduced
 from exllamav2.conversion.adaptivegptq import AdaptiveGPTQ
 import torch
 from torch import nn
@@ -223,6 +224,71 @@ def measure_attn(module, hidden_states, target_states, quantizers, cache, attn_p
         os._exit(1)
 
     for x in ["k_proj", "v_proj", "o_proj"] + (["q_proj"] if not keep_q else []):
+        if x in quantizers:
+            del quantizers[x]
+
+    return results
+
+
+def measure_gdn(module, hidden_states, target_states, quantizers, cache, attn_params):
+    """
+    Measure the gated-delta-net projections (Qwen3.5, newplan.md P6). q/k/v/z share
+    the post-norm Hessian; out_proj is measured against the gated-norm output.
+    """
+
+    qjobs, qmaps = get_qparams_reduced(qparams_gdn)
+    results = []
+
+    quantizers["in_proj_q"].prepare()
+    quantizers["in_proj_k"].reuse_h(quantizers["in_proj_q"])
+    quantizers["in_proj_v"].reuse_h(quantizers["in_proj_q"])
+    quantizers["in_proj_z"].reuse_h(quantizers["in_proj_q"])
+    quantizers["out_proj"].prepare()
+
+    options_q, bits_q = test_quant(module.in_proj_q, quantizers["in_proj_q"], qjobs[0])
+    options_k, bits_k = test_quant(module.in_proj_k, quantizers["in_proj_k"], qjobs[1])
+    options_v, bits_v = test_quant(module.in_proj_v, quantizers["in_proj_v"], qjobs[2])
+    options_z, bits_z = test_quant(module.in_proj_z, quantizers["in_proj_z"], qjobs[3])
+    options_o, bits_o = test_quant(module.out_proj, quantizers["out_proj"], qjobs[4])
+
+    total_numel = module.in_proj_q.numel() + module.in_proj_k.numel() + \
+        module.in_proj_v.numel() + module.in_proj_z.numel() + module.out_proj.numel()
+
+    max_accuracy = 0.0
+    (q_, k_, v_, z_, o_) = (-1, -1, -1, -1, -1)
+    for (q, k, v, z, o) in qmaps:
+
+        if q != q_: module.in_proj_q.linear.weight = nn.Parameter(options_q[q].weight.cuda())
+        if k != k_: module.in_proj_k.linear.weight = nn.Parameter(options_k[k].weight.cuda())
+        if v != v_: module.in_proj_v.linear.weight = nn.Parameter(options_v[v].weight.cuda())
+        if z != z_: module.in_proj_z.linear.weight = nn.Parameter(options_z[z].weight.cuda())
+        if o != o_: module.out_proj.linear.weight = nn.Parameter(options_o[o].weight.cuda())
+        (q_, k_, v_, z_, o_) = (q, k, v, z, o)
+
+        total_bits = bits_q[q] + bits_k[k] + bits_v[v] + bits_z[z] + bits_o[o]
+        total_bpw = total_bits / total_numel
+
+        accuracy = test_error(module, hidden_states, target_states, cache, attn_params)
+        print(f" -- {total_bpw:1.4f} bpw  accuracy: {accuracy:1.8f}")
+
+        max_accuracy = max(accuracy, max_accuracy)
+
+        torch.cuda.empty_cache()
+
+        r = { "accuracy": accuracy,
+              "total_bits": total_bits,
+              "in_proj_q": qjobs[0][q].get_dict(),
+              "in_proj_k": qjobs[1][k].get_dict(),
+              "in_proj_v": qjobs[2][v].get_dict(),
+              "in_proj_z": qjobs[3][z].get_dict(),
+              "out_proj": qjobs[4][o].get_dict() }
+        results.append(r)
+
+    if max_accuracy < 0.1:
+        print(" ## Measurement/inference error (1)")
+        os._exit(1)
+
+    for x in ["in_proj_k", "in_proj_v", "in_proj_z", "out_proj", "in_proj_q"]:
         if x in quantizers:
             del quantizers[x]
 
@@ -537,6 +603,15 @@ def measure_quant(job, save_fn, model, hidden_state_offload_layers):
                 quantizers["v_proj"] = AdaptiveGPTQ(module.v_proj.linear)
             quantizers["o_proj"] = AdaptiveGPTQ(module.o_proj.linear)
 
+        elif isinstance(module, ExLlamaV2GatedDeltaNet):
+            # Qwen3.5 gated delta net (newplan.md P6). in_proj_b/a stay fp16 (gate logits).
+            mode = "gdn"
+            quantizers["in_proj_q"] = AdaptiveGPTQ(module.in_proj_q.linear)
+            quantizers["in_proj_k"] = AdaptiveGPTQ(module.in_proj_k.linear)
+            quantizers["in_proj_v"] = AdaptiveGPTQ(module.in_proj_v.linear)
+            quantizers["in_proj_z"] = AdaptiveGPTQ(module.in_proj_z.linear)
+            quantizers["out_proj"] = AdaptiveGPTQ(module.out_proj.linear)
+
         elif isinstance(module, ExLlamaV2MLP):
             mode = "mlp"
             has_gate = module.model.config.arch.lm.mlp_gate
@@ -659,6 +734,11 @@ def measure_quant(job, save_fn, model, hidden_state_offload_layers):
                     qz["o_proj"].add_batch(outputs["attn_output"])
                     ts.append(outputs["hidden_states"].to(target_device))
 
+                if mode == "gdn":
+                    qz["in_proj_q"].add_batch(outputs["post_norm"])  # Reuse H for k/v/z
+                    qz["out_proj"].add_batch(outputs["pre_out"])
+                    ts.append(outputs["hidden_states"].to(target_device))
+
                 if mode == "mlp":
                     qz["up_proj"].add_batch(outputs["post_norm"])  # Reuse H for gate_proj
                     qz["down_proj"].add_batch(outputs["pre_down"])
@@ -773,6 +853,9 @@ def measure_quant(job, save_fn, model, hidden_state_offload_layers):
 
         if mode == "self_attn":
             m = measure_attn(module, hidden_states, target_states, quantizers, cache, attn_params)
+
+        if mode == "gdn":
+            m = measure_gdn(module, hidden_states, target_states, quantizers, cache, attn_params)
 
         if mode == "mlp":
             m = measure_mlp(module, hidden_states, target_states, quantizers, cache, attn_params)
