@@ -406,24 +406,86 @@ structurally different from Gemma-4:
   linear layers, with a one-deep backup for single-token rewinds (token healing) and verify
   staging for speculative rejection.
 - **TP/MP**: the delta net shards by value-head groups (the recurrence is per-head independent, so
-  ranks never exchange recurrent state); q/k shard by key heads, `out_proj` is row-parallel. Both
-  the single-process (`sp`) and multiprocess (`mp`) backends are wired; CUDA graphs are disabled
-  for hybrid (eager delta-net ops). KV-head count must be ≥ world size on the full layers (4 KV
-  heads → up to 4 GPUs).
-- **Built-in MTP** (`exllamav2/mtp_qwen35.py`, experimental): the drafter is a single decoder layer
-  shipped inside the checkpoint (`mtp.*`), borrowing the target's embedding/head. Enable with
-  `draft_model.draft_mode: mtp` and **no** `draft_model_name`. **Greedy decoding only**,
-  single-GPU/autosplit only for now (MP fan-out of the verify staging is a follow-up). The
-  converter copies `mtp.*` through unquantized (fp16).
+  ranks never exchange recurrent state); q/k shard by key heads, `out_proj` is row-parallel. The
+  multiprocess (`mp`) backend runs with a replicated residual (`tp_no_seqpar`); layers whose KV-head
+  count is below the world size replicate on every rank. CUDA graphs are disabled for hybrid
+  (eager delta-net ops). Single-process (`sp`) TP is not wired for the hybrid backbone.
+- **Built-in MTP on MP** (`exllamav2/mtp_qwen35.py` + `mtp_builtin_mp.py`): the drafter is a single
+  decoder layer shipped inside the checkpoint (`mtp.*`). Enable with `draft_model.draft_mode: mtp`
+  and **no** `draft_model_name`. On MP it runs on the master rank behind `BuiltinMTPMPAdapter`;
+  the target's GDN verify state is staged on every rank and restored exactly by the distributed
+  rewind. Greedy draft chain (sampled acceptance resamples from verified target logits);
+  single-sequence (`max_batch_size 1`). The converter copies `mtp.*` through unquantized (fp16).
 - **Converter**: `convert_exl2.py` handles the delta-net projections (`in_proj_q/k/v/z`, `out_proj`
   quantized; `in_proj_b/a` fp16), the raw conv/`A_log`/`dt_bias`/norm tensors, and the `mtp.*`
   passthrough. EXL2.5 (uniform bits, no trellis) is the intended quant format. Vision tower
   (`model.visual.*`) is skipped, same policy as Gemma-4.
 
-**Status:** implemented and syntax/parity-checked (delta-rule math bit-exact vs HF; architecture
-recognition tested), but **not yet run on the GPU rig** — treat output as unverified until a
-short-context coherence test passes. Quantize with `convert_exl2.py` (e.g. EXL2.5 uniform 4-bit,
-fp16 head) and load through the TabbyAPI fork.
+**Status:** delta-rule math bit-exact vs HF; built-in MTP-on-MP exercised end-to-end on a synthetic
+checkpoint (24-token greedy equivalence vs plain decode, exact match). **Real-checkpoint rig
+validation still pending** — quantize with `convert_exl2.py` (e.g. EXL2.5 uniform 4-bit, fp16 head)
+and run a short-context coherence test before trusting output.
+
+### Qwen3.8-Flash-Next (EXPERIMENTAL — synthetic-parity verified)
+
+Support for **[Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)**
+(architecture `Qwen4ExpForConditionalGeneration`, text-only; `exllamav2/qwen4_exp.py`). 125B total /
+~6B active + a 51B hashed n-gram table + a 4B built-in MTP module:
+
+- **Hyper-connections**: the residual stream is 4× hidden. Each block is wrapped by a mix
+  (grouped `(1+w)` RMSNorm → `silu(down/hc)` → `sigmoid(up)` per-dim stream weights → weighted
+  mean) and an inject (`hyper + block_out × 2·sigmoid(inject/hc)`). A global mixer replaces the
+  final model norm; the head is untied (top-level `lm_head`, remapped by the Google keymap).
+- **GDN hybrid**: same gated delta net as Qwen3.8-27B, but the gated-norm activation is **sigmoid**
+  (`output_gate_type`). 36 linear + 12 full-attention layers.
+- **QSA indexed attention**: the full layers score 4-token key blocks with a small MQA indexer
+  (raw un-roped keys cached; pooled block keys normed + roped at block start; per-head relu
+  scores), keep the top-512 blocks (2048 tokens) plus the always-visible incomplete tail, and
+  gather+attend beyond the budget. Within the budget the dense path is exact.
+- **MoE**: 512 routed experts (top-10, renormalised softmax) + one sigmoid-gated shared expert on
+  every layer, stored as fused 3D tensors (`gate_up_proj [E,2I,H]`, `down_proj [E,H,I]`) and
+  sliced per expert through the ordinary EXL2/EXL2.5 quantizer.
+- **PLE n-grams** (layer index 1): hashed n-gram embeddings from the engram machinery
+  (`ngram_embedding.py`, disk/RAM/hybrid host storage — never VRAM), key/value projections,
+  signed-sqrt gate, one dilated depthwise conv. Convert the table with
+  `python -m exllamav2.conversion.convert_ngram` (streams to disk; the 320M-row table does not
+  fit RAM). On MP the lookup runs replicated on every rank from the same host table.
+- **MP**: seqpar off; attention/HC/PLE replicate (2 KV heads); GDN shards by value heads; MoE
+  follows `EXL2_MOE_OFFLOAD` / `EXL2_MOE_TP_SHARD`. Built-in MTP works on MP (below).
+
+**Verified:** single-GPU vs HF fp32 reference cos 0.99996 (40-token + decode, and 300-token
+prefill through the sparse indexer); MP2 teacher-forced cos 0.99993; converter end-to-end on a
+synthetic checkpoint. Real-checkpoint validation pending.
+
+### Gemma-4-26B-A4B-it (EXPERIMENTAL — synthetic-parity verified)
+
+Support for **[google/gemma-4-26B-A4B-it](https://huggingface.co/google/gemma-4-26B-A4B-it)**
+(`Gemma4ForConditionalGeneration` with `enable_moe_block`; `exllamav2/gemma4_moe.py`). Same
+attention as Gemma-4-31B (SWA hd256 / full hd512 `k_eq_v`, proportional RoPE), plus a **parallel
+per-layer MoE block**: dense MLP branch (`pre_ffn → mlp → post_ffn_1`) and a routed branch
+(router = unweighted-RMSNorm × `scale` × H^-0.5 → proj → softmax → top-8 → renorm ×
+`per_expert_scale`; 128 experts, gelu-tanh, `pre_ffn_2 → experts → post_ffn_2`), summed →
+`post_ffn` → residual → `layer_scalar`. Fused-3D expert tensors quantize normally.
+
+**MP:** the 2-KV-head full layers replicate on every rank (sliding layers shard normally); the
+MoE block replicates by default, `EXL2_MOE_TP_SHARD` / `EXL2_MOE_OFFLOAD` supported. CUDA graphs
+are disabled for the MoE block (data-dependent torch routing); a fused router kernel is the
+follow-up perf lever.
+
+**Verified:** block math vs an fp32 torch reference cos 1.000000 on every layer; MP2 greedy
+token equivalence 100%. Real-checkpoint validation pending.
+
+### Built-in MTP on MP (Qwen3.8 family)
+
+Checkpoints that ship an `mtp.*` module (Qwen3.8-27B, Qwen3.8-Flash-Next) draft on the MP path
+without a separate drafter model: `draft_model.draft_mode: mtp`, empty `draft_model_name`.
+`BuiltinMTPMPAdapter` exposes the drafter to `MTPMPDriver` (own draft KV on the master rank;
+`prefill_target` / `commit_accepted` / `commit_bonus` hooks). The target's GDN/PLE recurrent
+state is staged during the verify window on every rank and restored exactly by the distributed
+rewind, so rejected drafts never corrupt the backbone. The drafters load private full
+embedding/head tables when the master's are vocab-sharded. Single-sequence; prompt-cache RAM
+offload is disabled for built-in MTP. Verified: Flash-Next 24-token greedy equivalence on MP2
+(exact match vs plain decode).
 
 ### Multi-batch (MP + MTP)
 

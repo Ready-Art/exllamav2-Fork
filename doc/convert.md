@@ -281,8 +281,24 @@ python convert.py -i <hf_model> -o <work> -cf <out> -b 6.0 -hb 16 -x25u 6 -x25h 
 
 Engram (hashed n-gram embedding) tables use a separate scalar-row converter:
 `python -m exllamav2.conversion.convert_ngram -i <model_dir> -o <out> -k <table_key>
---bits 8 --ngram-size N --heads-per-ngram H --ple-embed-dim D --eos <id>`
-(4 or 8 bits per row; no trellis; RAM or disk-streaming lookup at inference).
+--bits 8 --ngram-size N --heads-per-ngram H --ple-embed-dim D --head-dim HD --vocab V --eos <id>`
+(4 or 8 bits per row; no trellis; RAM or disk-streaming lookup at inference). The converter
+reads the checkpoint's `shard_N.weight` tables and hash params (`ngram_heads_offsets`,
+`ngram_heads_vocab_sizes`, `layer_multipliers`), tolerates padded shards, and **streams** the
+packed rows to `ngram-rows-*.safetensors` (Flash-Next's 320M-row table is ~51 GB at 8 bit —
+far too big to hold in RAM). Example for Qwen3.8-Flash-Next:
+
+```sh
+python -m exllamav2.conversion.convert_ngram -i <hf_model> -o <out> \
+  -k model.language_model.layers.1.ple.ple_embedding.ngram_embedding \
+  --bits 8 --ngram-size 3 --heads-per-ngram 8 --ple-embed-dim 2560 --head-dim 160 --vocab 248320
+```
+
+The new hybrid/MoE backbones (Qwen3.8-27B, Qwen3.8-Flash-Next, Gemma-4-26B-A4B) convert with
+the ordinary `convert.py` pipeline: delta-net projections and fused-3D MoE experts quantize
+normally; gate logits (`in_proj_b/a`), hyper-connection weights, the QSA indexer, PLE
+projections and `mtp.*` pass through as fp16. During calibration the engram module can read
+the original bf16 shards directly (no pre-conversion needed).
 
 **Important notes for EXL2.5 jobs:**
 

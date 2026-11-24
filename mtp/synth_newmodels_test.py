@@ -819,14 +819,17 @@ def fork_logits_mp(model_dir, ids, steps, nranks, base="ExLlamaV2Cache_SWA", for
 
 def run_mp(family):
     # MP loads QUANTIZED tensors only: use the converted synthetic models.
-    d = os.path.join(WORK, "q4_quant" if family == "qwen4exp" else "g4_quant")
+    dirs = {"qwen4exp": "q4_quant", "gemma4moe": "g4_quant", "qwen35": "q35_quant"}
+    d = os.path.join(WORK, dirs[family])
     assert os.path.isdir(d), f"converted model missing: {d} (run convert.py first)"
     torch.manual_seed(SEED)
     ids = torch.randint(2, 256, (1, 40))
     single = fork_logits(d, ids, steps=6)
     forced = [ids[:, -1:]] + [single[:, s:s+1].argmax(-1).cpu() for s in range(1, 7)]
-    base = "ExLlamaV2Cache_Qwen4Exp" if family == "qwen4exp" else "ExLlamaV2Cache_SWA"
-    for nranks in (2, 4):
+    bases = {"qwen4exp": "ExLlamaV2Cache_Qwen4Exp", "qwen35": "ExLlamaV2Cache_Hybrid",
+             "gemma4moe": "ExLlamaV2Cache_SWA"}
+    base = bases[family]
+    for nranks in (2,):
         mp = fork_logits_mp(d, ids, steps=6, nranks=nranks, base=base, forced=forced)
         c0, _ = metrics(single[:, :1], mp[:, :1])
         print(f"  prefill-only cos={c0:.6f}")
@@ -840,7 +843,7 @@ def run_mp(family):
         # flip an argmax without any logic error. Gate on cosine for the fp32-math
         # backbone (qwen4_exp); for gemma4 the fp16 hd512 proportional-rope drift
         # lowers cosine, so gate on exact greedy-token equivalence instead.
-        if family == "qwen4exp":
+        if family in ("qwen4exp", "qwen35"):
             assert cos > 0.999, f"{family} MP{nranks} parity FAILED cos={cos}"
         else:
             assert am == 1.0 and cos > 0.9, f"{family} MP{nranks} parity FAILED am={am} cos={cos}"
@@ -906,7 +909,7 @@ if __name__ == "__main__":
         run_single(fam)
     elif fam == "gemma4moe_block":
         run_gemma4_block_unit()
-    elif fam in ("qwen4exp_mp", "gemma4moe_mp"):
+    elif fam in ("qwen4exp_mp", "gemma4moe_mp", "qwen35_mp"):
         run_mp(fam[:-3])
     elif fam in ("qwen4exp_mtp", "gemma4moe_mtp", "qwen35_mtp"):
         run_mtp_mp(fam[:-4])

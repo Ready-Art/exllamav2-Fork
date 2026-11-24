@@ -415,7 +415,8 @@ class Qwen4ExpMTPDrafter:
         tok = base_tok.to(self.device)
         h = base_state.to(self.device)
         drafts = []
-        p = pos - 1
+        # Mode-B contract: base_tok is the uncommitted bonus at `pos` (fresh KV row).
+        p = pos
         for _ in range(num_tokens):
             logits, h = self._step(tok, h, p)
             tok = logits.argmax(dim=-1)

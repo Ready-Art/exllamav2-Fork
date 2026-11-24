@@ -853,6 +853,9 @@ class ExLlamaV2ArchParams:
             self.lm.attn_output_gate = True
             self.lm.builtin_mtp = True
             self.lm.supports_tp = True
+            # Replicated residual (no seqpar): the hybrid GDN/attention mix uses
+            # the full-width rank-local flow, same design as Qwen4-Exp.
+            self.lm.tp_no_seqpar = True
 
             self.lm.layer_keys += \
                 layer_keys_llama_norms + \

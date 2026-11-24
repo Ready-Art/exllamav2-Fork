@@ -64,7 +64,7 @@ class Qwen35MTPDrafter:
         self.nkv = self.cfg.num_key_value_heads
         self.hd = self.cfg.head_dim
         self.nkg = self.nq // self.nkv
-        self.eps = self.cfg.rms_norm_eps
+        self.eps = self.cfg.norm_eps
         self.rope_dim = int(self.hd * self.cfg.partial_rotary_factor)
         self.max_seq_len = max_seq_len or self.cfg.max_seq_len
 
@@ -304,9 +304,10 @@ class Qwen35MTPDrafter:
         tok = base_tok.to(self.device)
         h = self._target_hidden(base_state.to(self.device))
         drafts = []
-        # The first draft token occupies `pos`; its MTP input is the base token at
-        # pos-1. Each step processes its input at p and predicts the token at p+1.
-        p = pos - 1
+        # Mode-B contract (MTPMPDriver): base_tok is the UNCOMMITTED bonus at `pos`;
+        # process it at pos (its KV row is fresh, beyond kv_len) and predict pos+1.
+        # Each step processes its input at p and predicts the token at p+1.
+        p = pos
         for _ in range(num_tokens):
             logits, h = self._step(tok, h, p)
             tok = logits.argmax(dim=-1)

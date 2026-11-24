@@ -681,7 +681,9 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
                 post_norm = self.pre_layernorm.forward(full) if self.has_norm else full
         else:
             x = ctx.broadcast(0, x, BROADCAST_RS)
-            residual = x
+            # Rank-local broadcast returns a one-element list; the residual add
+            # wants the tensor (single-process keeps the per-device list).
+            residual = x[0] if isinstance(x, list) and rank_local else x
             if not self.has_norm:
                 post_norm = x
             else:

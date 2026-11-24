@@ -336,7 +336,10 @@ class ExLlamaV2MLP(ExLlamaV2Module):
             # which is the same order as the non-TP path, and was verified to reproduce the
             # non-TP fused kernel to cos 1.0000093. Models without a post-FF norm keep the
             # fused kernel.
-            if self.post_layernorm is not None:
+            # The fused tp_mlp_forward_ kernel is single-process only (per-device
+            # handle lists + pinned broadcast buffers); rank-local MP workers must
+            # take the collective-based forward_tp_old path.
+            if self.post_layernorm is not None or self.model.tp_context.rank is not None:
                 return self.forward_tp_old(
                     hidden_states,
                     cache,
