@@ -224,6 +224,21 @@ on every layer. Gemma-4's full-attention layers have only **4** KV heads, so a f
 hold zero full-layer heads — there is no KV-head replication, so **5 GPUs is not supported for
 Gemma-4**. A model with ≥ `world_size` KV heads on every layer can use 5+.
 
+### VRAM stability under multi-turn prompt-cache load
+
+Collective destination buffers are cached for reuse, and the cache key includes the **row
+count**. That is required for CUDA graphs (a captured graph bakes buffer addresses), but a
+prompt-cache continuation prefill has a *different* tail length on every turn, so caching
+those shapes pinned a new ~0.5 GB entry per turn on every rank until the master OOMed
+mid-prefill. Large **eager** shapes (`rows > 32` outside graph mode) therefore use fresh
+uncached buffers that the caching allocator recycles — the same rule the per-module GEMM/norm
+outputs already follow. Graph mode and decode/verify-sized rows keep the stable-address
+cache. Prefill is bandwidth-bound, so it loses nothing from the reuse (measured ~1.6%, noise).
+
+If VRAM still climbs on a long session, `EXL2_VRAM_WATCH=1` + `EXL2_VRAM_CENSUS=1` (tabbyAPI)
+prints a live-tensor census with per-category deltas, and `EXL2_VRAM_REFS=1` names the object
+holding each growing category.
+
 ---
 
 ## EXL2.5 quantization format

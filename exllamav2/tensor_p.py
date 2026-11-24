@@ -1591,22 +1591,37 @@ class TPContext:
         dev = local.device
         if not local.is_contiguous():
             local = local.contiguous()
+        # BUG 122: ``rows`` is part of the key and entries are NEVER evicted, so every
+        # distinct prefill row count pinned a permanent ~0.5 GB entry (2 assembled buffers
+        # + 2*world part buffers at chunk 4096). Prompt-cache continuation prefills have a
+        # different tail length every turn, so the cache grew without bound until the
+        # master OOMed mid-prefill (debug1000.txt: dev0 22.3 GB allocated while prefilling
+        # only 797 tokens). Same class as BUG 120, in the allgather path that never got the
+        # eager_large_ok treatment: large EAGER shapes take fresh uncached buffers, consumed
+        # within the layer and recycled by the caching allocator. Graph mode and
+        # decode/verify-sized rows (<= 32) keep the row-keyed stable-address cache whose
+        # addresses the captured graphs bake. Fresh buffers also remove the aliasing
+        # hazard entirely (nothing is reused), and prefill gains nothing from the reuse
+        # anyway (measured 1.6% = noise, see above).
+        _eager_large = rows > 32 and not self.graph_mode
         if len(set(widths)) == 1 and widths[0] == local.shape[1]:
             w = widths[0]
             key = (tag, broadcast_type, rows, w, dtype, dev)
-            ent = self._ag_cache.get(key)
+            ent = None if _eager_large else self._ag_cache.get(key)
             if ent is None:
+                _nbuf = 1 if _eager_large else 2
                 bufs = [torch.empty((rows, world * w), dtype = dtype, device = dev)
-                        for _ in range(2)]
+                        for _ in range(_nbuf)]
                 # BUG 101: all_gather outputs MUST be contiguous. Column slices of the
                 # assembled buffer are strided views, which torch rejects ("Tensors must
                 # be contiguous"), so gather into standalone per-rank tensors and assemble
                 # with device-local slice copies afterwards. The copies run at HBM speed
                 # (~1 TB/s) vs the PCIe collective (~6 GB/s), so they add negligible cost.
                 parts = [[torch.empty((rows, w), dtype = dtype, device = dev)
-                          for _ in range(world)] for _ in range(2)]
+                          for _ in range(world)] for _ in range(_nbuf)]
                 ent = [bufs, parts, 0]
-                self._ag_cache[key] = ent
+                if not _eager_large:
+                    self._ag_cache[key] = ent
             bufs, parts, i = ent
             out = bufs[i]
             ent[2] = 1 - i
@@ -1625,11 +1640,12 @@ class TPContext:
         # pad to the max width, gather, then trim each rank back to its real width.
         max_w = max(widths)
         key = (tag, broadcast_type, rows, max_w, dtype, dev)
-        ent = self._ag_cache.get(key)
+        ent = None if _eager_large else self._ag_cache.get(key)
         if ent is None:
             padded = torch.empty((rows, max_w), dtype = dtype, device = dev)
             parts = [torch.empty_like(padded) for _ in range(world)]
-            self._ag_cache[key] = (padded, parts)
+            if not _eager_large:
+                self._ag_cache[key] = (padded, parts)
         else:
             padded, parts = ent
         padded.zero_()
@@ -1697,11 +1713,15 @@ class TPContext:
         bufs = getattr(self, "_agnr_cache", None)
         if bufs is None:
             bufs = self._agnr_cache = {}
-        out = bufs.get(key)
+        # BUG 122 (same class as _ag_cache): row-keyed and never evicted, so large eager
+        # prefill shapes must not enter it -- fresh buffer per call, recycled after use.
+        _eager_large = rows > 32 and not self.graph_mode
+        out = None if _eager_large else bufs.get(key)
         if out is None:
             with torch.inference_mode(False):
                 out = torch.empty((rows, hidden), dtype=torch.half, device=shard.device)
-            bufs[key] = out
+            if not _eager_large:
+                bufs[key] = out
         return p2p.ag_norm_res(shard, (tag, BROADCAST_RS, widths[0], torch.half),
                                (rows, hidden), weight, residual, out, eps)
 
