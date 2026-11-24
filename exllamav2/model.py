@@ -64,7 +64,13 @@ from exllamav2.ext import exllamav2_ext as ext_c, none_tensor
 # writes out of bounds, so the step recaptures at the current length. Large enough that
 # normal generation (a few hundred tokens per job) never recaptures, small enough to stay
 # well inside the kernel's valid range; jumps across it happen at job boundaries / resets.
-TP_GRAPH_KV_ENVELOPE = 2048
+# 2026-11-24 (USER-CONFIRMED FIX): long-prompt (EXL2.5 + hd512 + INT8) output degenerated
+# in the window LEADING UP TO the 2048 recapture (~round 650) -> the FI graph-mode kernel's
+# valid range is narrower than 2048 in that regime. Tightening the default to 256 so the
+# graph recaptures before it drifts out of range eliminated the degeneration (user-verified
+# on a 70k prompt). Env-tunable (EXL2_TP_GRAPH_KV_ENVELOPE) to trade recapture frequency vs
+# safety without a rebuild; graphs stay enabled (recapture, not disable).
+TP_GRAPH_KV_ENVELOPE = int(os.environ.get("EXL2_TP_GRAPH_KV_ENVELOPE", "256"))
 
 
 def _torch_device(idx):
