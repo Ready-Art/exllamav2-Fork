@@ -3191,10 +3191,19 @@ class ExLlamaV2Attention(ExLlamaV2Module):
             bufs[(dev, batch_size, hr, splits)] = b
         po, pl = b
         o = torch.empty(batch_size, q_len, nq, hd, device = dev, dtype = torch.half)
-        ext_c.int8_attn_fast(q.view(batch_size, q_len, nq, hd).contiguous(),
-                             ki, vi, ks, vs, o, po, pl, kv_len_dev,
-                             batch_size, q_len, nq, nkv, splits, self.scaling, hd,
-                             row_map if row_map is not None else none_tensor)
+        _rm = row_map if row_map is not None else none_tensor
+        _qc = q.view(batch_size, q_len, nq, hd).contiguous()
+        # HMMA tensor-core kernel for hd512 verify windows whose per-kv-head query
+        # count NQ=(nq/nkv)*q_len is 16 or 32 (Gemma-4 W=1/W=3); else the warp kernel.
+        # EXL2_INT8_HMMA=0 forces the warp kernel (kill switch / A-B).
+        _nq_rt = (nq // nkv) * q_len if nkv > 0 and nq % nkv == 0 else 0
+        if (hd == 512 and _nq_rt in (16, 32)
+                and os.environ.get("EXL2_INT8_HMMA", "1") != "0"):
+            ext_c.int8_attn_hmma(_qc, ki, vi, ks, vs, o, po, pl, kv_len_dev,
+                                 batch_size, q_len, nq, nkv, splits, self.scaling, hd, _rm)
+        else:
+            ext_c.int8_attn_fast(_qc, ki, vi, ks, vs, o, po, pl, kv_len_dev,
+                                 batch_size, q_len, nq, nkv, splits, self.scaling, hd, _rm)
         return o.view(batch_size, q_len, nq * hd)
 
     def _attn_verify_split(self, q, k_cache, v_cache, q_len, dev):

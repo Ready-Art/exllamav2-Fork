@@ -439,9 +439,13 @@ conversation's attendable depth.
 ### INT8 KV cache — PRIMARY storage (opt-in, default fp16)
 
 Ampere has no FP8, so K/V are quantized to symmetric per-(token, head) **INT8 with fp16
-scales** and read by a custom **multi-warp split-KV attention kernel** (4 warps/CTA + 4-key
-unroll — the occupancy fix for the old warp-per-CTA family; GQA, hd256/512, graph-safe)
-serving **both decode and MTP verify**. INT8 is the **only** full-depth KV storage on the
+scales** and read by custom split-KV attention kernels (GQA, graph-safe, per-row kv_lens +
+row_map): **decode** uses a multi-warp CUDA-core kernel (`int8_attn_fast`), and **MTP
+verify** uses an **HMMA tensor-core kernel** (`int8_attn_hmma`, `nvcuda::wmma` m16n16k16,
+flash-attention tiled with HD split across warps + online softmax) for hd512 windows whose
+per-kv-head query count is 16/32 (Gemma-4 W=1/W=3); other verify geometries fall back to the
+warp kernel. `EXL2_INT8_HMMA=0` forces the warp kernel everywhere (kill switch / A-B).
+INT8 is the **only** full-depth KV storage on the
 full-attention layers: **no fp16 shadow alongside**, so KV VRAM is **halved (~−50%)** and
 the decode/verify KV read is halved with it. fp16 full-depth buffers exist only as
 **transient prefill staging** (prefill kernels read fp16): allocated per prefill, each chunk
