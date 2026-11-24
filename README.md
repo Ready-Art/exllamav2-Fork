@@ -485,7 +485,9 @@ state is staged during the verify window on every rank and restored exactly by t
 rewind, so rejected drafts never corrupt the backbone. The drafters load private full
 embedding/head tables when the master's are vocab-sharded. Single-sequence; prompt-cache RAM
 offload is disabled for built-in MTP. Verified: Flash-Next 24-token greedy equivalence on MP2
-(exact match vs plain decode).
+(exact match vs plain decode, real draft acceptance). Qwen3.8-27B: the MP mechanism and output
+stream are verified, but its P6 drafter's acceptance is still under debug (correct output, no
+speculation speedup yet) — see `mtp/synth_newmodels_test.py qwen35_mtp`.
 
 ### Multi-batch (MP + MTP)
 

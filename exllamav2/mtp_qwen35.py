@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -243,7 +244,7 @@ class Qwen35MTPDrafter:
 
     def _target_hidden(self, h: torch.Tensor) -> torch.Tensor:
         # The driver pipes fp32 states; the drafter is fp16.
-        if self.target_norm_w is not None:
+        if self.target_norm_w is not None and os.environ.get("EXL2_MTP_TARGET_NORM", "1") != "0":
             return _rms_norm(h, self.target_norm_w, self.eps).half()
         return h.half()
 
