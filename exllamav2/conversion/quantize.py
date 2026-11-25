@@ -69,6 +69,16 @@ def _configure_exl25(lq: AdaptiveGPTQ, job: dict):
         raise ValueError("exl25: hadamard requires uniform_bits (the fast lane carries the rotation)")
     if ub and ub not in (2, 3, 4, 5, 6, 8):
         raise ValueError(f"exl25: unsupported uniform_bits {ub}")
+    # The K-side Hadamard block needs the input (K) dim divisible by the block.
+    # Some MoE down_proj intermediate sizes are not (e.g. Gemma-4-26B I=704,
+    # 704 % 128 = 64) -- had_rotate_hessian would assert. Skip the rotation for
+    # just those tensors: they still quantize on the uniform-bit fast lane (and
+    # keep AWQ), merely without the Hadamard quality boost. Per-tensor q_hadamard
+    # tag is absent -> the kernel runs the plain uniform path for them.
+    if had and lq.rows % had != 0:
+        print(f" !! EXL2.5: hadamard skipped for {lq.layer.key} "
+              f"(K={lq.rows} not divisible by {had}); uniform {ub}-bit fast lane kept", flush=True)
+        had = 0
     lq.exl25_had = had
     lq.exl25_awq = bool(ex.get("awq"))
     lq.exl25_uniform_bits = ub
