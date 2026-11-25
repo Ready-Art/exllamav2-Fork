@@ -103,9 +103,13 @@ class Qwen35MTPDrafter:
                 st = STFile.open(fn, keymap=self.cfg.arch.keymap)
                 self._full_head = st.get_tensor(key, device=self.device).half()
 
-        # Own K/V cache for the single MTP attention layer.
-        self.k_cache = torch.zeros((1, self.max_seq_len, self.nkv, self.hd), dtype=torch.half, device=self.device)
-        self.v_cache = torch.zeros((1, self.max_seq_len, self.nkv, self.hd), dtype=torch.half, device=self.device)
+        # Own K/V cache for the single MTP attention layer. Allocated OUTSIDE
+        # InferenceMode (mtp_drafter convention): __init__ runs under the loader's
+        # mode, but the job thread mutates these in place -- inference tensors
+        # forbid that outside the mode.
+        with torch.inference_mode(False):
+            self.k_cache = torch.zeros((1, self.max_seq_len, self.nkv, self.hd), dtype=torch.half, device=self.device)
+            self.v_cache = torch.zeros((1, self.max_seq_len, self.nkv, self.hd), dtype=torch.half, device=self.device)
         self.kv_len = 0
 
         # RoPE tables: same geometry as the target's full-attention layers.

@@ -95,10 +95,13 @@ class Qwen4ExpMTPDrafter:
                 st = STFile.open(fn, keymap=self.cfg.arch.keymap)
                 self._full_head = st.get_tensor(key, device=self.device).half()
 
-        # Own KV for the single MTP attention layer + raw indexer keys.
-        self.k_cache = torch.zeros((1, self.max_seq_len, self.nkv, self.hd), dtype=torch.half, device=self.device)
-        self.v_cache = torch.zeros((1, self.max_seq_len, self.nkv, self.hd), dtype=torch.half, device=self.device)
-        self.idx_cache = torch.zeros((1, self.max_seq_len, self.index_head_dim), dtype=torch.half, device=self.device)
+        # Own KV for the single MTP attention layer + raw indexer keys. Allocated
+        # OUTSIDE InferenceMode (mtp_drafter convention): the job thread mutates
+        # these in place, which inference tensors forbid outside the mode.
+        with torch.inference_mode(False):
+            self.k_cache = torch.zeros((1, self.max_seq_len, self.nkv, self.hd), dtype=torch.half, device=self.device)
+            self.v_cache = torch.zeros((1, self.max_seq_len, self.nkv, self.hd), dtype=torch.half, device=self.device)
+            self.idx_cache = torch.zeros((1, self.max_seq_len, self.index_head_dim), dtype=torch.half, device=self.device)
         self.kv_len = 0
 
         self._build_rope()

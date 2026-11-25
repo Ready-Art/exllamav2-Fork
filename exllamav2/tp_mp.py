@@ -209,8 +209,13 @@ def mp_worker(conn, device, world_size, rank, init_method, uuid_hex, model_dir, 
                 conn.send(("ok", None))
             elif cmd == "reset-cache":
                 # MTP validation: zero current_seq_len + window_beg on this rank.
-                ctx["cache"].current_seq_len = 0
-                ctx["cache"].window_beg = 0
+                # Hybrid: reset() also zeroes the GDN/PLE recurrent state -- without
+                # it the next prefill would start from the previous job's state.
+                _c = ctx["cache"]
+                if hasattr(_c, "gdn_staging"):
+                    _c.reset()
+                _c.current_seq_len = 0
+                _c.window_beg = 0
                 conn.send(("ok", None))
             elif cmd == "kv-slice":
                 # MTP: return this rank's K/V rows [start:end] of one layer (the parent
@@ -527,7 +532,10 @@ def _clone_swa_ring(cache):
     inference_mode at load); these helpers run OUTSIDE model.forward's
     @torch.inference_mode() scope (prompt-cache decision block), where inplace
     ops on inference tensors raise. Nesting the mode is reentrant-safe."""
-    ring = cache.kv_state_size
+    # Hybrid (GDN) caches have no SWA ring -- nothing to snapshot.
+    ring = getattr(cache, "kv_state_size", None)
+    if ring is None:
+        return {}
     with torch.inference_mode():
         out = {}
         for l in range(len(cache.key_states)):
@@ -1516,6 +1524,11 @@ class TPProcessGroup:
     def restore_prompt_ring(self, seq):
         """Rewind every rank to the snapshot position and copy the saved rings back.
         Returns False if no snapshot exists for exactly this position."""
+        # Hybrid GDN/PLE recurrent state is destructive and is NOT covered by the
+        # ring snapshot: a boundary rewind would leave it ahead of seq_len. Refuse
+        # so the caller falls back to full reset + re-prefill (hybrid contract).
+        if hasattr(self.cache, "gdn_conv_states"):
+            return False
         if self._ring_backup_local is None or self._ring_backup_seq != seq:
             return False
         for device, w in sorted(self.workers.items()):
@@ -1538,6 +1551,9 @@ class TPProcessGroup:
         for device, w in sorted(self.workers.items()):
             w.send("reset-cache", None)
             w.recv()
+        # Hybrid: zero the GDN/PLE recurrent state too (workers did the same).
+        if hasattr(self.cache, "gdn_staging"):
+            self.cache.reset()
         self.cache.current_seq_len = 0
         self.cache.window_beg = 0
         if getattr(self.cache, "int8_primary", False):
@@ -2380,6 +2396,9 @@ class TPProcessGroup:
     def restore_prompt_ring_row(self, row, seq):
         """Restore slot ``row`` to its snapshot position (exact ring copy-back).
         Returns False if no snapshot exists for exactly this position."""
+        # Hybrid: see restore_prompt_ring -- recurrent state is not snapshotted.
+        if hasattr(self.cache, "gdn_conv_states"):
+            return False
         backups = getattr(self, "_ring_backup_rows", None)
         if backups is None or row not in backups or self._ring_backup_rows_seq[row] != seq:
             return False
