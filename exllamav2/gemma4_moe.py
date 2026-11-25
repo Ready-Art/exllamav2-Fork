@@ -239,7 +239,7 @@ class ExLlamaV2Gemma4MoEBlock(ExLlamaV2Module):
         return topw.to(x.dtype), topi
 
     def _experts(self, h2: torch.Tensor, topi: torch.Tensor, topw: torch.Tensor,
-                 shard_ctx = None, result = None):
+                 shard_ctx = None, result = None, fp32_act = False):
         x = h2.view(-1, self.hidden_size)
         if shard_ctx is not None:
             dev, a, b = shard_ctx.get_split(BROADCAST_RS)[0]
@@ -262,6 +262,18 @@ class ExLlamaV2Gemma4MoEBlock(ExLlamaV2Module):
                 u = self.w3[e].forward_tp([cur], output_split=True, skip_broadcast=True)[0]
                 act = F.gelu(g, approximate="tanh") * u
                 d = self.w2[e].forward_tp([act], output_split=True, skip_broadcast=True)[0]
+            elif fp32_act:
+                # Measurement (intermediates) path: the gelu(gate)*up product and the
+                # down projection overflow fp16 (max 65504) on real checkpoints even
+                # though the bf16 source and the normed residual are finite. Compute the
+                # expert in fp32 so pre_down carries the TRUE activation for the Hessian
+                # (no inf/clamp distortion); the down output is cast back to fp16 for the
+                # residual stream. Runtime/TP keep the fp16 path below unchanged.
+                cur32 = cur.float()
+                g = F.linear(cur32, self.w1[e].linear.weight.float())
+                u = F.linear(cur32, self.w3[e].linear.weight.float())
+                act = F.gelu(g, approximate="tanh") * u
+                d = F.linear(act, self.w2[e].linear.weight.float())
             else:
                 g = self.w1[e].forward(cur)
                 u = self.w3[e].forward(cur)
@@ -281,7 +293,7 @@ class ExLlamaV2Gemma4MoEBlock(ExLlamaV2Module):
         topw, topi = self._route(residual)
         h2 = self.pre_ffn_2.forward(residual)
         result = {"post_norm": h2} if intermediates else None
-        moe_out = self._experts(h2, topi, topw, result = result)
+        moe_out = self._experts(h2, topi, topw, result = result, fp32_act = intermediates)
         moe_out = self.post_ffn_2.forward(moe_out.view(B, T, H))
         out = self.post_ffn.forward(dense_out + moe_out)
         out = out + residual
