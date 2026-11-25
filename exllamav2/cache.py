@@ -1717,7 +1717,12 @@ class _RowCacheView(ExLlamaV2CacheBase):
         ks, vs = self._rc.get_kv_state(layer_idx, batch_size, offset, width,
                                        page_size, cache_seqlens, block_table)
         r = self._row
-        return [k[r:r + 1] for k in ks], [v[r:r + 1] for v in vs]
+        # INT8-primary full layers (hd256/512) keep NO fp16 buffer -- key_states is
+        # None and the INT8 tensors are the storage (get_kv_i8). The eager row-view
+        # heal/admit forward must tolerate None exactly like the normal rank path;
+        # the attention INT8 branch reads get_kv_i8, never these None slots.
+        return [None if k is None else k[r:r + 1] for k in ks], \
+               [None if v is None else v[r:r + 1] for v in vs]
 
     def shift_ring(self, layer_idx, shift_tokens):
         self._rc.shift_ring_row(layer_idx, self._row, shift_tokens)
