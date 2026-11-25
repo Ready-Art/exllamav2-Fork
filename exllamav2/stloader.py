@@ -182,7 +182,9 @@ class STFile:
         A safetensors tensor is row-major contiguous, so a row range of a 2-D tensor (or an
         element range of a 1-D tensor) is one contiguous byte range in the file. This is what
         makes rank-local loading possible: a worker reads only the shard it owns instead of
-        materialising the full tensor and slicing it.
+        materialising the full tensor and slicing it. For N-D tensors (N >= 2) the row axis is
+        the FLATTENED leading dims: fused 3-D expert tensors [E, R, C] have E*R rows of C
+        elements, so one expert's row range is still a single byte range.
 
         :param key:
             Tensor name
@@ -200,7 +202,8 @@ class STFile:
             Force output datatype
 
         :return:
-            torch.Tensor of shape (end - start, ...) for 2-D, or (end - start,) for 1-D
+            torch.Tensor of shape (end - start, last_dim) for N-D (N >= 2, leading dims
+            flattened into the row axis), or (end - start,) for 1-D
         """
         h = self.header[key]
         dtype, esize = convert_dtype(h["dtype"])
@@ -210,7 +213,7 @@ class STFile:
         if len(shape) == 0:
             raise ValueError("get_tensor_slice: scalar tensor " + key)
 
-        rows = shape[0]
+        rows = shape[0] if len(shape) == 1 else int(np.prod(shape[:-1]))
         if start < 0 or end > rows or start > end:
             raise ValueError(
                 "get_tensor_slice: range [%d,%d) out of bounds for %s with %d rows"
@@ -221,7 +224,7 @@ class STFile:
         if row_bytes * rows != (_end - beg):
             raise ValueError("get_tensor_slice: non-uniform row size for " + key)
 
-        out_shape = (end - start,) + tuple(shape[1:])
+        out_shape = (end - start,) + ((shape[-1],) if len(shape) > 1 else ())
         tensor = torch.zeros(out_shape, dtype = dtype, device = device)
         torch.cuda.synchronize()
         assert tensor.is_contiguous, "Non-contiguous tensor"

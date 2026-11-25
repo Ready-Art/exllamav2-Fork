@@ -169,27 +169,34 @@ class ExLlamaV2Module:
             if not filename: continue
 
             stfile = STFile.open(filename, keymap = cfg.arch.keymap)
-            tensor = stfile.get_tensor(key, device = "cpu", out_dtype = torch.half)
-
-            if cfg.arch.orig_weights_transposed and len(tensor.shape) == 2:
-                tensor = tensor.T
 
             # Fused 3D expert tensors (Qwen4-Exp / Gemma-4 MoE: gate_up_proj
             # [E, 2I, H], down_proj [E, H, I]) slice along the FLATTENED row axis.
-            if len(tensor.shape) == 3:
-                tensor = tensor.reshape(-1, tensor.shape[-1])
+            # Read ONLY the expert's rows: materialising the full [E, ...] tensor
+            # per expert is O(E^2) I/O (512 experts x 3.4 GB reads never finishes).
+            shape = stfile.header[key]["shape"]
+            if len(shape) == 3 and not altpack_qkv and not cfg.arch.orig_weights_transposed:
+                tensor = stfile.get_tensor_slice(key, device = "cpu", start = f_beg, end = f_end, out_dtype = torch.half)
+            else:
+                tensor = stfile.get_tensor(key, device = "cpu", out_dtype = torch.half)
 
-            if altpack_qkv:
-                ts = tensor.shape
-                h, gs, d = cfg.num_key_value_heads, cfg.num_key_value_groups + 2, cfg.head_dim
-                tensor = tensor.view(h, gs, d, -1).transpose(0, 1).reshape(ts)
+                if cfg.arch.orig_weights_transposed and len(tensor.shape) == 2:
+                    tensor = tensor.T
 
-            tensor = tensor[f_beg:f_end]
+                if len(tensor.shape) == 3:
+                    tensor = tensor.reshape(-1, tensor.shape[-1])
 
-            if altpack_qkv:
-                ts = tensor.shape
-                h, gs, d = cfg.num_key_value_heads, (f_end - f_beg) // cfg.num_key_value_heads // cfg.head_dim, cfg.head_dim
-                tensor = tensor.view(gs, h, d, -1).transpose(0, 1).reshape(ts)
+                if altpack_qkv:
+                    ts = tensor.shape
+                    h, gs, d = cfg.num_key_value_heads, cfg.num_key_value_groups + 2, cfg.head_dim
+                    tensor = tensor.view(h, gs, d, -1).transpose(0, 1).reshape(ts)
+
+                tensor = tensor[f_beg:f_end]
+
+                if altpack_qkv:
+                    ts = tensor.shape
+                    h, gs, d = cfg.num_key_value_heads, (f_end - f_beg) // cfg.num_key_value_heads // cfg.head_dim, cfg.head_dim
+                    tensor = tensor.view(gs, h, d, -1).transpose(0, 1).reshape(ts)
 
             if not key.endswith(".bias"):
                 if in_feat != out_feat and \
