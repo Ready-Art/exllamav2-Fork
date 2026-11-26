@@ -585,7 +585,9 @@ class TPContext:
                 sm_scale = scale,
                 q_data_type = torch.half,
                 kv_data_type = k_cache_dev.dtype,
-                disable_split_kv = os.environ.get("EXL2_FI_SPLITKV", "1") == "0",
+                # Graph-mode split-KV schedule drifts with kv -> long-ctx degeneration;
+                # single-pass is kv-safe (same as fi_decode_plan / fi_decode_rows_plan).
+                disable_split_kv = os.environ.get("EXL2_FI_SPLITKV", "0") == "0",
             )
         finally:
             torch.cuda.set_stream(prev_stream)
