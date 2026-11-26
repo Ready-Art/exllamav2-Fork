@@ -699,7 +699,11 @@ class TPContext:
         EXL2_FI_GUARD=0 disables; only active at kv_len > 20000 (the corruption
         regime) so short-context runs carry no per-plan sync cost.
         """
-        if kv_len <= 20000 or os.environ.get("EXL2_FI_GUARD", "1") == "0":
+        # 2026-11-26: removed the kv_len > 20000 gate. The degeneration drifts at kv ~13k
+        # (below the old threshold), so the guard never validated/repaired there. Run at
+        # ALL kv lengths: the per-plan/replay synchronize also orders the TP streams,
+        # masking the ordering race that sprays FI metadata within the envelope window.
+        if os.environ.get("EXL2_FI_GUARD", "1") == "0":
             return
         from exllamav2 import attn_backend
         # Truthful readbacks: the TP streams are non-blocking, so drain the device
