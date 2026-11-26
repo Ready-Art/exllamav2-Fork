@@ -2630,12 +2630,24 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                             else:
                                 k_cache[idx][:batch_size, cache_a:cache_b, :, :].copy_(k[idx][:, _drop:, :, :])
                                 v_cache[idx][:batch_size, cache_a:cache_b, :, :].copy_(v[idx][:, _drop:, :, :])
+                        # Per-batch-row staging check: a decode/verify round for NON-
+                        # prefilling rows must read the INT8 primary even while ANOTHER
+                        # row is prefilling. The old global i8_staging_active() routed
+                        # this whole batch to the fp16 staging path whenever ANY row was
+                        # prefilling -- but these rows' staging slices are stale/zero
+                        # (their real KV is INT8 primary) -> wrong attention -> repetition
+                        # loop. Only rows actually being prefilled need fp16 staging.
+                        if _bsl is not None:
+                            _stage_active = any(cache.i8_staging_active(_r)
+                                                for _r in attn_params.batch_row_map[:batch_size])
+                        else:
+                            _stage_active = cache.i8_staging_active()
                         if (_i8pair_e is not None and not _swa_win
-                                and (q_len == 1 or not cache.i8_staging_active())):
+                                and (q_len == 1 or not _stage_active)):
                             # INT8 PRIMARY eager attention: decode (q_len=1) and
-                            # verify (q_len>1, no fp16 staging) read the INT8 cache
-                            # directly. Prefill chunks (staging active) fall through
-                            # to the fp16 paths below -- staging holds their K/V.
+                            # verify (q_len>1, no fp16 staging for THESE rows) read the
+                            # INT8 cache directly. Prefill chunks (staging active for
+                            # their rows) fall through to the fp16 paths below.
                             _rmap_e = torch.tensor(attn_params.batch_row_map,
                                                    dtype = torch.int32, device = dev) \
                                 if _bsl is not None else None
