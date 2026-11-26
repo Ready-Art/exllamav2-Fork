@@ -71,14 +71,16 @@ from exllamav2.ext import exllamav2_ext as ext_c, none_tensor
 # graph recaptures before it drifts out of range eliminated the degeneration (user-verified
 # on a 70k prompt). Env-tunable (EXL2_TP_GRAPH_KV_ENVELOPE) to trade recapture frequency vs
 # safety without a rebuild; graphs stay enabled (recapture, not disable).
-# 2026-11-26: default 512 (user-directed). The degeneration previously blamed on a wide
-# envelope (512/384 "looping", degen.txt/degen2.txt) was ROOT-CAUSED to the GLOBAL INT8
-# staging check in attn.py routing decode/verify rounds to stale fp16 staging while another
-# row prefilled -- NOT the envelope width. Fixed in attn.py (per-batch-row staging check,
-# exl2 1422c18). With that fixed, 512 halves recapture frequency vs 256 and is safe. The
-# per-replay path re-plans FI at the current kv + refreshes past_len/ring_pos/row_map, so a
-# captured graph stays valid across the envelope. Env-tunable (EXL2_TP_GRAPH_KV_ENVELOPE).
-TP_GRAPH_KV_ENVELOPE = int(os.environ.get("EXL2_TP_GRAPH_KV_ENVELOPE", "512"))
+# 2026-11-26: default 256 -- the EMPIRICALLY SAFE CEILING for the FI graph-mode kernel in
+# the EXL2.5 + hd512 + INT8 regime. Repeated user tests: 256 coherent; 384 AND 512 both
+# degenerate/loop (degen.txt/degen2.txt/server.log: acc/round + draft_agree climb toward
+# W+1 / 1.0). The per-batch-row INT8 staging fix (1422c18) removed the interleaved-prefill
+# fast loop, but a wide envelope STILL drifts: the captured FI graph-mode launch goes
+# invalid as kv moves away from capture, writing wrong KV that accumulates across recapture
+# windows. 256 recaptures before that drift degenerates output. Do NOT widen past 256
+# without re-verifying long-generation coherence; the recapture cost at 256 is tiny next to
+# degenerate output. Env-tunable (EXL2_TP_GRAPH_KV_ENVELOPE) for experiments only.
+TP_GRAPH_KV_ENVELOPE = int(os.environ.get("EXL2_TP_GRAPH_KV_ENVELOPE", "256"))
 
 
 def _torch_device(idx):
