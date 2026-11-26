@@ -450,12 +450,12 @@ class TPContext:
                 sm_scale = scale,
                 q_data_type = torch.half,
                 kv_data_type = k_cache_dev.dtype,
-                # BUG 103: split-KV stays ENABLED (full parallel reduction). Graph safety
-                # comes from use_cuda_graph=True above (fixed buffers), not from disabling
-                # split-KV -- disabling it cost long-context decode speed unnecessarily.
-                # BUG 117 A/B knob: EXL2_FI_SPLITKV=0 disables it (default unchanged) to
-                # test whether the long-context split-KV schedule is the OOB writer.
-                disable_split_kv = os.environ.get("EXL2_FI_SPLITKV", "1") == "0",
+                # Graph-mode split-KV schedule is baked at capture and drifts as kv grows
+                # within the envelope window -> wrong attention -> long-ctx degeneration
+                # (GPU-verified 2026-11-26: EXL2_FI_SPLITKV=0 coherent @12k+2k, envelope 512;
+                # split-KV on loops). Single-pass decode is kv-independent (no baked split
+                # schedule). EXL2_FI_SPLITKV=1 re-enables split-KV for experiments.
+                disable_split_kv = os.environ.get("EXL2_FI_SPLITKV", "0") == "0",
             )
         finally:
             torch.cuda.set_stream(prev_stream)
@@ -679,7 +679,9 @@ class TPContext:
                 sm_scale = scale,
                 q_data_type = torch.half,
                 kv_data_type = k_cache_dev.dtype,
-                disable_split_kv = os.environ.get("EXL2_FI_SPLITKV", "1") == "0",
+                # Same as fi_decode_plan: graph-mode split-KV schedule drifts with kv ->
+                # degeneration; single-pass is kv-safe. EXL2_FI_SPLITKV=1 re-enables.
+                disable_split_kv = os.environ.get("EXL2_FI_SPLITKV", "0") == "0",
             )
         finally:
             torch.cuda.set_stream(prev_stream)
