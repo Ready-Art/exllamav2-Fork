@@ -1152,7 +1152,7 @@ class TPProcessGroup:
                 target = mp_worker,
                 args = (child_conn, device, self._world_size, rank, self._init_method,
                         uuid_hex, self.model_dir, self.gpu_split, self.max_seq_len,
-                        self.cache_tokens * self.max_batch, self.cache_base_name,
+                        self.max_seq_len * self.max_batch, self.cache_base_name,
                         self.max_batch, self.max_input_len),
                 daemon = True,
             )
@@ -1179,8 +1179,12 @@ class TPProcessGroup:
         _cache_base = getattr(_cache_mod, self.cache_base_name, None) or ExLlamaV2Cache_SWA
 
         model = ExLlamaV2(cfg)
+        # VRAM reservation must match the actual cache (tp_rank_cache allocates
+        # max_seq_len per row x max_batch). cache_tokens is the paged cache_size, which
+        # ALREADY spans all batch rows -- multiplying it by max_batch again double-counts
+        # batch and zeroes the split (ZeroDivisionError in integer_split).
         model.load_tp_rank(self.master_device, self.gpu_split,
-                           expect_cache_tokens = self.cache_tokens * self.max_batch,
+                           expect_cache_tokens = self.max_seq_len * self.max_batch,
                            expect_cache_base = _cache_base,
                            load_head = True,
                            max_batch = self.max_batch)
