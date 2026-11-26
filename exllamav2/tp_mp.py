@@ -589,9 +589,8 @@ def _pack_row_offload(ctx, row, pos, wb):
     meta = (pos, wb, [(layer, rows, kvh, hd), ...]) lets the restore unpack the
     ORIGINAL shapes even when restoring a truncated prefix p < pos.
 
-    Grow-only pinned staging (one allocation amortized across offloads), async
-    copies + a single sync -- the kv-pack pattern. The caller clones the returned
-    view into storage before the staging is reused."""
+    Transient pinned staging (freed once the caller clones the returned view),
+    async copies + a single sync -- the kv-pack pattern."""
     cache = ctx["cache"]
     ring = cache.kv_state_size
     n = max(0, min(pos - wb, ring))
@@ -619,10 +618,13 @@ def _pack_row_offload(ctx, row, pos, wb):
         kh, hd = kc.shape[2], kc.shape[3]
         blocks.append((l, rows, kh, hd, "h"))
         total += 4 * rows * kh * hd
-    stag = ctx.get("offload_staging")
-    if stag is None or stag.numel() < total:
-        stag = ctx["offload_staging"] = torch.empty(max(total, 1), dtype = torch.uint8,
-                                                    pin_memory = True)
+    # Transient pinned staging, freed once the caller clones the returned view.
+    # NOT cached grow-only: a persistent page-locked buffer sized to the largest
+    # context ever offloaded holds GBs/rank of unswappable host RAM for the whole
+    # server life and pressures the OOM killer (a worker died mid-offload ->
+    # EOFError -> BrokenPipe FATAL cascade). Re-page-locking per offload is cheap
+    # between rounds.
+    stag = torch.empty(max(total, 1), dtype = torch.uint8, pin_memory = True)
     o = 0
     for (l, rows, kh, hd, kind) in blocks:
         if kind == "i8":
