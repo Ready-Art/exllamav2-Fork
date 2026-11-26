@@ -1551,7 +1551,12 @@ class ExLlamaV2:
             # SWA layers keep K/V in a ring: row i's valid length is ring-relative
             # (seq_len - window_beg + i + 1), clamped to the ring depth. Full layers use
             # the absolute causal prefix seq_len + i + 1.
-            window_left = m.sliding_window if m.sliding_window else -1
+            # FlashInfer window_left is INCLUSIVE: a sliding window of SW keys needs
+            # window_left = SW - 1 (matches the eager SWA path attn.py and the torch
+            # mask). Using SW attended one extra stale key -> graphed verify logits
+            # diverged from solo eager (xcheck maxlogitdiff ~87) -> biased temp>0
+            # sampling -> degeneration.
+            window_left = (m.sliding_window - 1) if m.sliding_window else -1
             if m.sliding_window:
                 bases = [p - wb for p, wb in zip(seq_lens, window_begs)]
                 ring_depth = getattr(cache, "kv_state_size", None)

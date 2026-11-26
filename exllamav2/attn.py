@@ -722,7 +722,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 
         # Sliding window / softcap are passed to the backend directly. FlashInfer supports both
         # natively (unlike flash-attn, where they are gated behind version checks).
-        window_left = self.sliding_window if self.sliding_window else -1
+        window_left = (self.sliding_window - 1) if self.sliding_window else -1
         softcap = cfg.attn_logit_softcapping or None
 
         # Backend selection. FlashInfer >= 0.7.4 serves head_dim 512 (Gemma-4 global
@@ -931,7 +931,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
         # Valid length is cache_pos + q_len, which is <= ring_size.
         valid_len = (cache_pos + q_len).to(torch.int32)
 
-        window_left = self.sliding_window if self.sliding_window else -1
+        window_left = (self.sliding_window - 1) if self.sliding_window else -1
         softcap = cfg.attn_logit_softcapping or None
 
         fi_ok = (
@@ -1301,7 +1301,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                     block_table = attn_params.block_index_tp[idx],
                     page_size = page_size,
                     sm_scale = self.scaling,
-                    window_left = self.sliding_window if self.sliding_window else -1,
+                    window_left = (self.sliding_window - 1) if self.sliding_window else -1,
                     logits_soft_cap = cfg.attn_logit_softcapping or None,
                 )
             else:
@@ -1554,7 +1554,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
         The function name is kept so ``forward`` needs no change (PLAN.md §3.5 step 5).
         """
 
-        window_left = self.sliding_window if self.sliding_window else -1
+        window_left = (self.sliding_window - 1) if self.sliding_window else -1
         softcap = cfg.attn_logit_softcapping or None
 
         fi_ok = (
@@ -2360,7 +2360,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                             dev, q[idx].shape[2],
                             _i8pair[0].shape[2] if _i8pair is not None else k_cache[idx].shape[2],
                             self.head_dim, self.scaling,
-                            self.sliding_window if self.sliding_window else -1
+                            (self.sliding_window - 1) if self.sliding_window else -1
                         )
                         _ctx = self.model.tp_context
                         if (_i8pair is not None and q_len == 1
