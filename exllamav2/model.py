@@ -71,16 +71,15 @@ from exllamav2.ext import exllamav2_ext as ext_c, none_tensor
 # graph recaptures before it drifts out of range eliminated the degeneration (user-verified
 # on a 70k prompt). Env-tunable (EXL2_TP_GRAPH_KV_ENVELOPE) to trade recapture frequency vs
 # safety without a rebuild; graphs stay enabled (recapture, not disable).
-# 2026-11-26: a raise 256 -> 512 (to halve recapture frequency) RE-INTRODUCED the
-# degeneration (user: "text is degenerate and looping"; oh.txt continuous verify-graph
-# recapture). 512 is wider than the FI graph-mode kernel's valid kv range in this regime,
-# so it drifts out of range and degenerates BEFORE the recapture fires. 256 is the
-# user-confirmed safe value (8872cc8). The per-replay path re-plans FI at the current kv
-# and refreshes past_len/ring_pos/row_map, so the kv-drift degeneration root cause is
-# subtler than stale metadata (unpinned). BLIND EXPERIMENT (user-authorized): default 384
-# -- between safe 256 and broken 512 -- to cut recapture ~33% vs 256. If long-prompt output
-# degenerates/loops, set EXL2_TP_GRAPH_KV_ENVELOPE=256 (no rebuild) to restore the safe value.
-TP_GRAPH_KV_ENVELOPE = int(os.environ.get("EXL2_TP_GRAPH_KV_ENVELOPE", "384"))
+# 2026-11-26: 256 is the CONFIRMED SAFE CEILING. Both 512 (6b5c5e7) and a blind 384
+# experiment (38e009a) RE-INTRODUCED degeneration/looping (degen.txt: acc/round climbs
+# 1.38 -> 2.79, draft_agree -> 0.95 = the drafter nailing a repetition loop). Any envelope
+# wider than ~256 lets the captured FI graph-mode launch drift outside its valid kv range
+# and degenerate BEFORE the recapture fires. The per-replay path re-plans FI at the current
+# kv + refreshes past_len/ring_pos/row_map, so the root cause is subtler than stale metadata
+# (unpinned); until it is fixed, DO NOT widen past 256 to cut recapture frequency -- the
+# recapture cost at 256 is tiny next to degenerate output. Env-tunable for experiments only.
+TP_GRAPH_KV_ENVELOPE = int(os.environ.get("EXL2_TP_GRAPH_KV_ENVELOPE", "256"))
 
 
 def _torch_device(idx):
