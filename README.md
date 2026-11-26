@@ -203,6 +203,14 @@ logits = pg.forward(input_ids, 0, n_prompt, 1, True)   # prefill
 pg.close()
 ```
 
+> **MP requires an fp16 lm_head (HB16).** The multiprocess head is vocab-parallel:
+> each rank shards contiguous fp16 head rows and the logits shards are allgathered
+> in `forward`. A quantized head (`-hb 8`/`-hb 6`, an `...-HB8` checkpoint) cannot be
+> vocab-sharded (EXL2's `q_perm` output-channel ordering means contiguous row slices
+> are not vocab slices), and the replicated fallback `EXL2_TP_VOCAB_HEAD=0` fails to
+> load (dequantization scratch undersized). **Quantize with `-hb 16` for the MP
+> backend.** HB16 is also required for EXL2.5 Hadamard (see below).
+
 **MTP speculative decoding** — through the streaming generator (SP) or the MP driver:
 
 ```python
