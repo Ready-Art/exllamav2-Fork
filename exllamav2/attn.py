@@ -3187,11 +3187,15 @@ class ExLlamaV2Attention(ExLlamaV2Module):
             ctx._int8_dec_bufs = bufs
         b = bufs.get((dev, batch_size, nq, splits))
         if b is None:
+            # The OUTPUT o must be PERSISTENT too (stable address): a fresh torch.empty
+            # per call is freed after capture and its address recycled by later eager
+            # allocs, so the graph's baked write sprays over live tensors on replay
+            # (BUG-121 pattern) -> accumulating KV/logit corruption -> degeneration.
             b = (torch.empty(batch_size, splits, nq, hd, device = dev, dtype = torch.float32),
-                 torch.empty(batch_size, splits, nq, 2, device = dev, dtype = torch.float32))
+                 torch.empty(batch_size, splits, nq, 2, device = dev, dtype = torch.float32),
+                 torch.empty(batch_size, nq, hd, device = dev, dtype = torch.half))
             bufs[(dev, batch_size, nq, splits)] = b
-        po, pl = b
-        o = torch.empty(batch_size, nq, hd, device = dev, dtype = torch.half)
+        po, pl, o = b
         ext_c.int8_attn_fast(q.view(batch_size, nq, hd).contiguous(), ki, vi, ks, vs,
                              o, po, pl, kv_len_dev, batch_size, 1, nq, nkv, splits,
                              self.scaling, hd,
@@ -3220,11 +3224,14 @@ class ExLlamaV2Attention(ExLlamaV2Module):
             ctx._int8_ver_bufs = bufs
         b = bufs.get((dev, batch_size, hr, splits))
         if b is None:
+            # Persistent OUTPUT o (stable address) -- same BUG-121 contract as decode:
+            # a fresh per-call o is freed after capture and its address recycled, so the
+            # baked graph write corrupts live tensors on replay -> degeneration.
             b = (torch.empty(batch_size, splits, hr, hd, device = dev, dtype = torch.float32),
-                 torch.empty(batch_size, splits, hr, 2, device = dev, dtype = torch.float32))
+                 torch.empty(batch_size, splits, hr, 2, device = dev, dtype = torch.float32),
+                 torch.empty(batch_size, q_len, nq, hd, device = dev, dtype = torch.half))
             bufs[(dev, batch_size, hr, splits)] = b
-        po, pl = b
-        o = torch.empty(batch_size, q_len, nq, hd, device = dev, dtype = torch.half)
+        po, pl, o = b
         _rm = row_map if row_map is not None else none_tensor
         _qc = q.view(batch_size, q_len, nq, hd).contiguous()
         # hd512 verify windows whose per-kv-head query count NQ=(nq/nkv)*q_len is 16
