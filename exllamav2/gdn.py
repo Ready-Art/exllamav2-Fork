@@ -521,6 +521,7 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
         bssm.copy_(ssm)
         cache.gdn_backup_pos[self.layer_idx] = past_len
 
+    @torch.inference_mode()
     def rewind_state(self, cache, pos: int):
         """
         Restore this layer's recurrent state to the prefix ending at `pos` using
@@ -540,10 +541,15 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
         if n > 0:
             co = stage["qkv"][:, :n]
             Bn = co.shape[0]
-            qc, kc, vc = co.split([self.kd, self.kd, self.vd], dim=-1)
-            qh = _l2norm(qc.view(Bn, n, self.nk, self.dk).float()).repeat_interleave(self.group, dim=2)
-            kh = _l2norm(kc.view(Bn, n, self.nk, self.dk).float()).repeat_interleave(self.group, dim=2)
-            vh = vc.view(Bn, n, self.nv, self.dv).float()
+            # TP rank-local staging stores local head geometry; non-TP uses full.
+            kd_l = stage.get("kd_l", self.kd)
+            vd_l = stage.get("vd_l", self.vd)
+            nk_l = stage.get("nk_l", self.nk)
+            nv_l = stage.get("nv_l", self.nv)
+            qc, kc, vc = co.split([kd_l, kd_l, vd_l], dim=-1)
+            qh = _l2norm(qc.view(Bn, n, nk_l, self.dk).float()).repeat_interleave(self.group, dim=2)
+            kh = _l2norm(kc.view(Bn, n, nk_l, self.dk).float()).repeat_interleave(self.group, dim=2)
+            vh = vc.view(Bn, n, nv_l, self.dv).float()
             _recurrent_scan(qh, kh, vh, stage["g"][:, :n], stage["beta"][:, :n], ssm)
         cache.gdn_backup_pos[self.layer_idx] = -1
 
@@ -796,8 +802,25 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
             if not rank_local:
                 cw = self._raw_conv_slice(dev, ka, nk_l, va, nv_l)
             tp_split = False
+            tp_staging = False
             if cache is None:
                 conv_out, _ = self._conv_prefill_with(qkv, None, cw)
+            elif getattr(dev_cache, "gdn_staging", False) and T > 1:
+                # MTP verify staging (rank-local): record base state + conv history
+                # + per-token scan inputs so gdn_rewind_to can restore the accepted
+                # prefix. Without this the MP verify leaves the recurrent state
+                # advanced past the accepted tokens whenever acceptance is partial.
+                tp_staging = True
+                stage = dev_cache.gdn_stage.setdefault(self.layer_idx, {})
+                stage["base_conv"] = conv_state.clone()
+                stage["base_ssm"] = ssm.clone()
+                xh = torch.cat([conv_state, qkv.transpose(1, 2)], dim=-1)
+                stage["hist"] = xh.clone()
+                C, K = conv_state.shape[1], self.conv_kernel
+                conv_out = F.conv1d(xh, cw.view(C, 1, K), groups=C).transpose(1, 2)
+                conv_state.copy_(xh[..., -(K - 1):])
+                dev_cache.gdn_stage_start = pl
+                dev_cache.gdn_stage_len = T
             elif T == 1:
                 if bconv_s is not None:
                     bconv_s.copy_(conv_state)
@@ -840,6 +863,12 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
             # b/a run on the flattened (rows, H) residual; the scan wants (B, T, nv).
             beta = beta.view(B, T, nv_l)
             g = g.view(B, T, nv_l)
+            if tp_staging:
+                stage["qkv"] = conv_out.detach().clone()
+                stage["beta"] = beta.detach().clone()
+                stage["g"] = g.detach().clone()
+                stage["kd_l"], stage["vd_l"] = kd_l, vd_l
+                stage["nk_l"], stage["nv_l"] = nk_l, nv_l
             if tp_split:
                 # Fix the SSM backup to the state after T-1 tokens (the early stash
                 # captured the pre-scan state); see the non-TP forward for rationale.

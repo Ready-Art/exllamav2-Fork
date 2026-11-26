@@ -2249,6 +2249,9 @@ class ExLlamaV2:
             use_graphs
             and self.tp_context is not None
             and cache is not None
+            # Hybrid GDN/PLE caches run EAGER: the recurrent-state staging clones
+            # (MTP verify) and per-layer state advances are not CUDA-graph-safe.
+            and not hasattr(cache, "gdn_conv_states")
             and (seq_len == 1 or graph_verify)
             and not preprocess_only
             and (not extract_state_indices or graph_state or graph_aux)
