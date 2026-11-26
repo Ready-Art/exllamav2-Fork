@@ -72,6 +72,7 @@ class SparseHead:
         self.misses = 0
         self.disabled = False
         self.window_count = 0
+        self._observed_at_rebuild = 0
         self.rebuild()
 
     # ------------------------------------------------------------------ stats
@@ -120,13 +121,24 @@ class SparseHead:
         (callers must invalidate captured draft graphs then)."""
         if self.columns <= 0 or self.observed < _MIN_OBSERVED:
             return False
+        # Throttle re-selection: a rebuild invalidates every captured draft graph, so
+        # doing it at EVERY job boundary (each reply re-observes the whole prompt and
+        # nudges the rank-`columns` tie boundary) churned the graphs and ratcheted VRAM
+        # up to an OOM. Only re-select once enough NEW tokens accumulated to shift the
+        # frequency ranking meaningfully; between rebuilds the subset (and the graphs
+        # baked from it) stay valid.
+        if self._ids_cpu is not None and \
+                (self.observed - self._observed_at_rebuild) < max(_MIN_OBSERVED, self.columns // 4):
+            return False
         c = self.counts.clone()
         c[self.vocab_size:] = 0            # head padding rows are never real tokens
         c[0] = 0                           # pad id
         top = torch.topk(c, min(self.columns, c.shape[0])).indices.sort().values
         if self._ids_cpu is not None and torch.equal(top, self._ids_cpu):
+            self._observed_at_rebuild = self.observed
             return False
         self._ids_cpu = top
+        self._observed_at_rebuild = self.observed
         with torch.inference_mode(False):
             self.subset = self.full[top.to(self.full.device)].contiguous()
             self.ids = top.to(self.device)
