@@ -28,14 +28,14 @@ Licensed under the same MIT license as upstream; all original credit to
 
 - **Model compatibility:** built and tested end-to-end on
   **[Gemma-4-31B-IT](https://huggingface.co/ReadyArt/Gemma-4-31B-IT-EXL2-6.0BPW-HB16)** only.
-  **[Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)** (hybrid gated-delta-net backbone),
-  **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** (hybrid GDN + QSA
-  indexed attention + 512-expert MoE + hyper-connections + PLE n-grams + built-in MTP) and
-  **[Gemma-4-26B-A4B-it](https://huggingface.co/google/gemma-4-26B-A4B-it)** (Gemma-4 with a
-  parallel 128-expert MoE block) are implemented and **synthetic-parity verified** (HF reference
-  logits / block math / MP fork-vs-fork), but **not yet validated on real quantized checkpoints
-  on the rig** — treat them as experimental. Other EXL2 models *should* work; other architectures
-  are untested here — verify correctness yourself.
+  **[Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)** (hybrid gated-delta-net backbone)
+  is a **work in progress and still not usable**: base decoding has been made coherent on a
+  real quantized checkpoint, but the hybrid backbone runs eager (no CUDA graphs / fused decode
+  kernel yet), built-in MTP and multi-batch do not work, and generation tok/s is far below
+  target. **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** and
+  **[Gemma-4-26B-A4B-it](https://huggingface.co/google/gemma-4-26B-A4B-it)** are **not yet
+  implemented** (planned for a future release). Other EXL2 models *should* work; other
+  architectures are untested here — verify correctness yourself.
 - **Hardware:** built and tested on **SM86 (Ampere — RTX 3090)** only. The kernel build targets
   `TORCH_CUDA_ARCH_LIST="8.6"`. Other architectures may work but are untested.
 - **Primary path:** the majority of development and optimization goes into
@@ -115,9 +115,9 @@ MTP drafter (939 MB): [google/gemma-4-31B-it-assistant](https://huggingface.co/g
 | **MTP speculative decoding** | A Gemma-4 *assistant* drafter proposes a window of tokens; the target verifies them in one forward. Works with TP and MP, greedy and sampled. |
 | **EXL2.5 quantization format** | Per-tensor opt-in upgrades: uniform-bit fast-path GEMM (Ampere-optimized, 16-row cap), Hadamard incoherence + AWQ channel protection for lower quant error at the same bpw. Plain EXL2 models run unchanged. See [EXL2.5](#exl25-quantization-format). |
 | **Gemma-4-31B-IT support** | Text-only. Two attention geometries (head_dim 256 sliding / 512 full), `k_eq_v` layers, proportional RoPE, per-layer norms. |
-| **Qwen3.8-27B support (experimental)** | Text-only hybrid backbone: gated delta net (linear attention) + output-gated full attention, TP/MP. Base decoding verified coherent on the real checkpoint (FP16 + INT8 KV). **Built-in MTP and multi-batch do not work yet** — disable drafting, use batch 1; a future update will fix them. See [Experimental features](#experimental-features). |
-| **Qwen3.8-Flash-Next support (experimental)** | Text-only `qwen4_exp`: 4-stream hyper-connections, gated delta net + QSA indexed sparse attention (top-512 blocks), 512-expert MoE + sigmoid shared expert, PLE hashed n-gram embeddings (engram disk/RAM/hybrid storage), built-in MTP. MP: GDN shards by value heads, attention/PLE/HC replicated, MoE replicate/shard/offload. Synthetic-parity verified; real-checkpoint validation pending. |
-| **Gemma-4-26B-A4B support (experimental)** | Gemma-4 attention (SWA hd256 / full hd512 `k_eq_v`) plus a parallel per-layer MoE block: 128 experts top-8 with scale/per-expert-scale router, dense MLP branch, fused-3D expert quantization. MP: low-KV-head layers replicate, MoE replicate/shard/offload. Synthetic block-math parity cos 1.0; real-checkpoint validation pending. |
+| **Qwen3.8-27B support (work in progress — not yet usable)** | Text-only hybrid backbone: gated delta net (linear attention) + output-gated full attention, TP/MP. Base decoding made coherent on the real checkpoint (FP16 + INT8 KV), but **not usable yet**: eager hybrid decode (no graphs/fused kernel), built-in MTP and multi-batch broken, gen tok/s far below target. See [Experimental features](#experimental-features). |
+| **Qwen3.8-Flash-Next support (not yet implemented)** | Planned: text-only `qwen4_exp` — 4-stream hyper-connections, gated delta net + QSA indexed sparse attention, 512-expert MoE + sigmoid shared expert, PLE hashed n-gram embeddings, built-in MTP. **Not yet implemented in this release.** |
+| **Gemma-4-26B-A4B support (not yet implemented)** | Planned: Gemma-4 attention (SWA hd256 / full hd512 `k_eq_v`) plus a parallel per-layer MoE block (128 experts top-8, dense MLP branch). **Not yet implemented in this release.** |
 | **Built-in MTP on MP** | The built-in drafters (Qwen3.5/3.8 and Flash-Next) run on the MP path through `BuiltinMTPMPAdapter`: own draft KV on the master rank, target GDN/PLE verify state staged and restored by the distributed rewind. Greedy chain; sampled acceptance resamples from verified target logits. Single-sequence (`max_batch_size 1`). **Currently does not produce correct output on the real Qwen3.8-27B checkpoint (long-generation state corruption) — disable drafting; fix planned.** |
 | **Sliding-window + TP KV cache** | Ring buffers for sliding layers make long context fit (≈22.5 GB instead of ≈236 GB at 256k for Gemma-4-31B). |
 | **TP CUDA graphs** | Whole-step decode/verify graphs remove per-op launch latency on the tensor-parallel path. |
@@ -387,7 +387,7 @@ All three are opt-in on the **MP + MTP** path and validated on the test rig; the
 (batch size 1, no offload, MTP drafting) is the verified single-job path. Configuration details
 live in the [TabbyAPI fork docs](https://github.com/Ready-Art/tabbyAPI-Fork/blob/ReadyArt/docs/11.-ReadyArt-ExLlamaV2-Fork.md).
 
-### Qwen3.8-27B / Qwen3.5 hybrid backbone (EXPERIMENTAL — base decode verified; MTP + multi-batch pending)
+### Qwen3.8-27B / Qwen3.5 hybrid backbone (WORK IN PROGRESS — not yet usable)
 
 Support for **[Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)** (architecture
 `Qwen3_5ForConditionalGeneration`, text-only). This is a **hybrid linear-attention backbone**,
@@ -421,20 +421,25 @@ structurally different from Gemma-4:
   passthrough. EXL2.5 (uniform bits, no trellis) is the intended quant format. Vision tower
   (`model.visual.*`) is skipped, same policy as Gemma-4.
 
-**Status:** delta-rule math bit-exact vs HF. **Real-checkpoint base decoding is verified
-coherent** (single-GPU/autosplit and TP/MP, FP16 and INT8 KV; per-position logit parity cos
-≈0.999 vs HF, 120-token free-run coherent). Two features **do not work yet** and will be
-updated in a future release:
+**Status: work in progress — not yet usable.** Delta-rule math is bit-exact vs HF, and
+real-checkpoint base decoding has been made coherent (single-GPU/autosplit and TP/MP, FP16 and
+INT8 KV; per-position logit parity cos ≈0.999 vs HF). But the model is **not usable for
+generation yet**:
 
-- **Built-in MTP** — the MP verify/rewind path is wired and was exact on a synthetic checkpoint,
-  but on the real checkpoint it corrupts the recurrent state over long generations and
-  degenerates. **Disable drafting (`draft_mode: disabled`) for correct output.**
-- **Multi-batch decoding (batch size > 1)** — not implemented for the hybrid backbone / built-in
-  MTP. Use `max_batch_size: 1`.
+- **Generation speed is far below target.** The hybrid backbone runs eager — no CUDA graphs and
+  no fused delta-net decode kernel yet — so gen tok/s is low.
+- **Built-in MTP does not work** — the MP verify/rewind corrupts the recurrent state over long
+  generations and degenerates. Disable drafting (`draft_mode: disabled`) for correct output.
+- **Multi-batch decoding (batch size > 1) does not work** for the hybrid backbone / built-in MTP.
+  Use `max_batch_size: 1`.
 
-Quantize with `convert_exl2.py` (e.g. EXL2.5 uniform bits, fp16 head).
+These are planned for a future update. Quantize with `convert_exl2.py` (e.g. EXL2.5 uniform
+bits, fp16 head).
 
-### Qwen3.8-Flash-Next (EXPERIMENTAL — synthetic-parity verified)
+### Qwen3.8-Flash-Next (NOT YET IMPLEMENTED — planned)
+
+> **Not yet implemented in this release.** Qwen3.8-Flash-Next support is planned for a future
+> update; the architecture below describes the intended design.
 
 Support for **[Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)**
 (architecture `Qwen4ExpForConditionalGeneration`, text-only; `exllamav2/qwen4_exp.py`). 125B total /
@@ -465,7 +470,10 @@ Support for **[Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flas
 prefill through the sparse indexer); MP2 teacher-forced cos 0.99993; converter end-to-end on a
 synthetic checkpoint. Real-checkpoint validation pending.
 
-### Gemma-4-26B-A4B-it (EXPERIMENTAL — synthetic-parity verified)
+### Gemma-4-26B-A4B-it (NOT YET IMPLEMENTED — planned)
+
+> **Not yet implemented in this release.** Gemma-4-26B-A4B-it support is planned for a future
+> update; the architecture below describes the intended design.
 
 Support for **[google/gemma-4-26B-A4B-it](https://huggingface.co/google/gemma-4-26B-A4B-it)**
 (`Gemma4ForConditionalGeneration` with `enable_moe_block`; `exllamav2/gemma4_moe.py`). Same
