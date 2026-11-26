@@ -462,6 +462,21 @@ class TPContext:
             torch.cuda.set_device(prev_dev)
         return True
 
+    def _fi_persistent_out(self, q, shape):
+        """Persistent (stable-address) output buffer for a graphed FI wrapper.run().
+        run() without out= allocates a FRESH tensor each call; under CUDA graphs the
+        kernel write to that address is baked at capture, the fresh tensor is freed
+        afterward, and its address is recycled by later eager allocs -> graph replays
+        spray over live tensors (BUG-121 pattern) -> corrupt attention output ->
+        degeneration. Passing a persistent out= keeps the baked address alive forever."""
+        key = (q.device.index, shape)
+        bufs = self.__dict__.setdefault("_fi_out_bufs", {})
+        out = bufs.get(key)
+        if out is None:
+            out = torch.empty(shape, device=q.device, dtype=torch.half)
+            bufs[key] = out
+        return out
+
     def fi_decode_run(self, key, q: torch.Tensor, k_cache_dev: torch.Tensor, v_cache_dev: torch.Tensor):
         """
         Capturable hd>256 decode attention against the per-step plan. ``(B, 1, H, D)`` query,
@@ -477,7 +492,8 @@ class TPContext:
         v_pages = v_cache_dev.view(-1, page, nkv, hd)
         # run() expects 3-D q (batch, num_qo_heads, head_dim); a 2-D (H, D) tensor is
         # misread as q_len_per_req=H by the non-tensor-core decode kernel.
-        out = entry["wrapper"].run(q.view(B, q.shape[2], hd), (k_pages, v_pages))
+        out = self._fi_persistent_out(q, (B, q.shape[2], hd))
+        entry["wrapper"].run(q.view(B, q.shape[2], hd), (k_pages, v_pages), out=out)
         return out.view(B, 1, q.shape[2] * hd)
 
     def fi_prefill_plan(self, key, kv_lens, k_cache_dev: torch.Tensor,
@@ -589,7 +605,8 @@ class TPContext:
         B, q_len = q.shape[0], q.shape[1]
         k_pages = k_cache_dev.view(-1, page, nkv, hd)
         v_pages = v_cache_dev.view(-1, page, nkv, hd)
-        out = entry["wrapper"].run(q.view(B * q_len, q.shape[2], hd), (k_pages, v_pages))
+        out = self._fi_persistent_out(q, (B * q_len, q.shape[2], hd))
+        entry["wrapper"].run(q.view(B * q_len, q.shape[2], hd), (k_pages, v_pages), out=out)
         return out.view(B, q_len, q.shape[2] * hd)
 
     def fi_decode_rows_plan(self, key, kv_lens, rows, k_cache_dev: torch.Tensor) -> bool:
@@ -679,7 +696,8 @@ class TPContext:
         B, q_len = q.shape[0], q.shape[1]
         k_pages = k_cache_dev.view(-1, page, nkv, hd)
         v_pages = v_cache_dev.view(-1, page, nkv, hd)
-        out = entry["wrapper"].run(q.view(B * q_len, q.shape[2], hd), (k_pages, v_pages))
+        out = self._fi_persistent_out(q, (B * q_len, q.shape[2], hd))
+        entry["wrapper"].run(q.view(B * q_len, q.shape[2], hd), (k_pages, v_pages), out=out)
         return out.view(B, q_len, q.shape[2] * hd)
 
     def _fi_guard(self, phase: str, kv_len: int, q_len: int):
