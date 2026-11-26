@@ -724,6 +724,11 @@ class MTPMPBatchDriver:
             "base_logits": logits,
             "base_tok": last_tok,
         }
+        if os.environ.get("EXL2_BATCH_THINK_DBG", "0") == "1":
+            _sl = self.pg.cache.seq_lens[r]
+            _bt = tokenizer.decode([bonus], decode_special_tokens=True) if tokenizer else "?"
+            print(f"[think-dbg] row {r} n_prompt={n_prompt} seq_len={_sl} "
+                  f"first_bonus={bonus} {_bt!r} heal={self.heal}", flush=True)
 
     def finish_row(self, r: int):
         self.rows.pop(r, None)
