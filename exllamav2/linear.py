@@ -1231,8 +1231,11 @@ class ExLlamaV2Linear(ExLlamaV2Module):
 
         if isinstance(w, dict):
             raise NotImplementedError(
-                self.key + ": EXL2_TP_VOCAB_HEAD requires an unquantized (fp16) lm_head; "
-                "set EXL2_TP_VOCAB_HEAD=0 for quantized heads")
+                self.key + ": the MP backend requires an unquantized (fp16) lm_head — "
+                "quantize with -hb 16 (HB16). Quantized heads (HB8/HB6) are not supported "
+                "on MP: the vocab-parallel head shards fp16 rows, and the replicated "
+                "fallback (EXL2_TP_VOCAB_HEAD=0) also fails to load (dequant scratch "
+                "undersized). Use an HB16 checkpoint.")
         has_bias = isinstance(w, tuple)
         if has_bias:
             ww, wb = w
