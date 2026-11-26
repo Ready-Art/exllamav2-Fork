@@ -74,10 +74,13 @@ from exllamav2.ext import exllamav2_ext as ext_c, none_tensor
 # 2026-11-26: a raise 256 -> 512 (to halve recapture frequency) RE-INTRODUCED the
 # degeneration (user: "text is degenerate and looping"; oh.txt continuous verify-graph
 # recapture). 512 is wider than the FI graph-mode kernel's valid kv range in this regime,
-# so it drifts out of range and degenerates BEFORE the recapture fires. Restored 256 --
-# the user-confirmed safe value. Do NOT widen past 256 without re-verifying long-prompt
-# coherence; the recapture cost at 256 is tiny next to degenerate output.
-TP_GRAPH_KV_ENVELOPE = int(os.environ.get("EXL2_TP_GRAPH_KV_ENVELOPE", "256"))
+# so it drifts out of range and degenerates BEFORE the recapture fires. 256 is the
+# user-confirmed safe value (8872cc8). The per-replay path re-plans FI at the current kv
+# and refreshes past_len/ring_pos/row_map, so the kv-drift degeneration root cause is
+# subtler than stale metadata (unpinned). BLIND EXPERIMENT (user-authorized): default 384
+# -- between safe 256 and broken 512 -- to cut recapture ~33% vs 256. If long-prompt output
+# degenerates/loops, set EXL2_TP_GRAPH_KV_ENVELOPE=256 (no rebuild) to restore the safe value.
+TP_GRAPH_KV_ENVELOPE = int(os.environ.get("EXL2_TP_GRAPH_KV_ENVELOPE", "384"))
 
 
 def _torch_device(idx):
