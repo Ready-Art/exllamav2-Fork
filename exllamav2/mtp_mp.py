@@ -880,8 +880,15 @@ class MTPMPBatchDriver:
             _vb = vlogits[0]
             _diff = (vl_solo - _vb).abs().max().item()
             _am = int((vl_solo.argmax(dim=-1) == _vb.argmax(dim=-1)).sum())
+            # Real-vocab diff (exclude padding rows vs:V, which can differ harmlessly
+            # and dominate the full-vocab max) + top-5 logit diff (the sampling-relevant
+            # magnitudes). Distinguishes a real graph compute error from padding noise.
+            _vs = tokenizer.get_vocab_size()
+            _rv = (vl_solo[:, :_vs] - _vb[:, :vs]).abs().max().item() if _vs < _vb.shape[-1] else _diff
+            _t5 = (vl_solo.topk(5, dim=-1).values - _vb.topk(5, dim=-1).values).abs().max().item()
             print(f"[xcheck-verify] row {r0} solo-vs-batch argmax {_am}/{W + 1} "
-                  f"maxlogitdiff={_diff:.4f} solo={vl_solo.argmax(dim=-1).tolist()} "
+                  f"maxlogitdiff={_diff:.4f} realvocab={_rv:.4f} top5={_t5:.4f} "
+                  f"solo={vl_solo.argmax(dim=-1).tolist()} "
                   f"batch={_vb.argmax(dim=-1).tolist()}", flush=True)
             # Force a FULL re-pull of row 0's shadow and diff against the incremental
             # gather's content: nonzero diff = the incremental multi-row gather left
