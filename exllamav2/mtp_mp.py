@@ -842,12 +842,14 @@ class MTPMPBatchDriver:
         # gathered K/V, scalar RoPE position) and compare against the batch draft and
         # the target argmax. scalar==batch!=target -> verify logits wrong at B>1;
         # scalar==target!=batch -> batch draft compute wrong; all differ -> gather.
-        if (os.environ.get("EXL2_BATCH_DRAFT_XCHECK", "0") == "1"
-                and self.mtp_rounds % 25 == 0
-                and not (pg._mtp_kv or {}).get("i8p")):
+        _xc_on = (os.environ.get("EXL2_BATCH_DRAFT_XCHECK", "0") == "1"
+                  and self.mtp_rounds % 25 == 0)
+        _i8p = bool((pg._mtp_kv or {}).get("i8p"))
+        r0 = rows[0]
+        # Scalar draft comparison needs the full-depth fp16 shadow (skip under INT8).
+        if _xc_on and not _i8p:
             d_ = self.drafter
             st_ = pg._mtp_kv
-            r0 = rows[0]
             ring_ = st_["ks"].shape[1]
             sv = (d_.kv_full, d_.kv_full_len, d_.kv_swa, d_.kv_swa_len,
                   d_.kv_swa_window_beg)
@@ -864,10 +866,14 @@ class MTPMPBatchDriver:
             finally:
                 (d_.kv_full, d_.kv_full_len, d_.kv_swa, d_.kv_swa_len,
                  d_.kv_swa_window_beg) = sv
+        if _xc_on:
             # Solo EAGER verify of row 0 on the same vids/position (the verified B=1
             # path) vs the batched graphed verify: argmax agreement + max logit diff
             # separates fp16 near-tie flips (small diff) from a plumbing bug (large).
             # The KV rewrite is idempotent; restore the row position afterwards.
+            # INT8-CAPABLE: compares logits, no fp16 shadow needed -- this is the
+            # discriminator for the INT8-primary degeneration (solo!=batch => the
+            # batched graphed verify writes wrong logits; solo==batch => KV/gather).
             vl_solo = pg.forward_row(r0, vids[0:1], last_id_only=False)
             pg.mtp_set_seq_len_row(r0, pos[0])
             vl_solo = vl_solo.float().cpu()[0]
@@ -879,9 +885,9 @@ class MTPMPBatchDriver:
                   f"batch={_vb.argmax(dim=-1).tolist()}", flush=True)
             # Force a FULL re-pull of row 0's shadow and diff against the incremental
             # gather's content: nonzero diff = the incremental multi-row gather left
-            # stale/wrong K/V (the draft reads the shadow; the target reads the cache).
-            # Skipped under INT8-primary shadows (no full-depth fp16 buffer to diff).
-            if not st_.get("i8p"):
+            # stale/wrong K/V. fp16 shadow only (skip under INT8-primary).
+            if not _i8p:
+                st_ = pg._mtp_kv
                 _seq0 = cache.seq_lens[r0]
                 _wb0 = cache.window_begs[r0]
                 _swa0 = min(_seq0 - _wb0, st_["ks"].shape[1])
