@@ -36,6 +36,9 @@ _SAVE_EVERY = 8192        # observations between persistence writes
 _PROBE_EVERY = 64         # draft windows between miss-rate probes
 _PROBE_MIN = 16           # probes before the gate may disable
 _MISS_RATE_MAX = 0.05     # disable above this probe miss rate
+# Minimum fraction of columns that must turn over before a rebuild swaps the subset
+# (and invalidates captured draft graphs). Debounces per-reply tie-boundary churn.
+_REBUILD_MIN_CHANGE = float(os.environ.get("EXL2_SPARSE_REBUILD_MIN_CHANGE", "0.02"))
 
 
 class SparseHead:
@@ -134,9 +137,23 @@ class SparseHead:
         c[self.vocab_size:] = 0            # head padding rows are never real tokens
         c[0] = 0                           # pad id
         top = torch.topk(c, min(self.columns, c.shape[0])).indices.sort().values
-        if self._ids_cpu is not None and torch.equal(top, self._ids_cpu):
-            self._observed_at_rebuild = self.observed
-            return False
+        if self._ids_cpu is not None:
+            if torch.equal(top, self._ids_cpu):
+                self._observed_at_rebuild = self.observed
+                return False
+            # Hysteresis: only swap the subset when a MATERIAL fraction of columns
+            # turns over. Each reply re-observes the whole prompt and nudges the
+            # rank-`columns` tie boundary by a few tokens; swapping on every tiny
+            # change invalidated all captured draft graphs each job (the VRAM
+            # ratchet). Keep the incumbent until enough columns genuinely change.
+            # We compare against the FIXED incumbent (not the previous candidate), so
+            # small per-reply drift accumulates and trips the threshold within a few
+            # replies -- no indefinite staleness -- and the miss-gate probe still
+            # catches any real coverage loss in the meantime.
+            overlap = torch.isin(top, self._ids_cpu).sum().item()
+            if (1.0 - overlap / top.numel()) < _REBUILD_MIN_CHANGE:
+                self._observed_at_rebuild = self.observed
+                return False
         self._ids_cpu = top
         self._observed_at_rebuild = self.observed
         with torch.inference_mode(False):
