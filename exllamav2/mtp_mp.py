@@ -726,7 +726,8 @@ class MTPMPBatchDriver:
         }
         if os.environ.get("EXL2_BATCH_THINK_DBG", "0") == "1":
             _sl = self.pg.cache.seq_lens[r]
-            _bt = tokenizer.decode([bonus], decode_special_tokens=True) if tokenizer else "?"
+            _bt = tokenizer.decode(torch.tensor([[bonus]], dtype=torch.long),
+                                   decode_special_tokens=True)[0] if tokenizer else "?"
             print(f"[think-dbg] row {r} n_prompt={n_prompt} seq_len={_sl} "
                   f"first_bonus={bonus} {_bt!r} heal={self.heal}", flush=True)
 
