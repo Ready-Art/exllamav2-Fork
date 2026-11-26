@@ -454,9 +454,11 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
         window = torch.cat([conv_state, x.unsqueeze(-1)], dim=-1)   # (B, C, K)
         w = self.conv1d_weight                        # (C, K)
         y = (window * w.unsqueeze(0)).sum(-1)         # (B, C)
-        # shift state left, append new input
-        conv_state[..., :-1].copy_(conv_state[..., 1:])
-        conv_state[..., -1].copy_(x)
+        # Shift state left + append new input. MUST copy from the fresh `window`
+        # tensor: an in-place conv_state[..., :-1].copy_(conv_state[..., 1:])
+        # aliases src/dst and the parallel CUDA copy kernel races (dst[i+1] is
+        # src[i+1]), silently corrupting the conv state on every decode step.
+        conv_state.copy_(window[..., 1:])
         return y.unsqueeze(1)
 
     def _gated_norm(self, o: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
@@ -506,8 +508,8 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
         if past_len == 0:
             conv.zero_()
             ssm.zero_()
-            cache.gdn_backup_pos = -1
-        elif cache.gdn_backup_pos == past_len:
+            cache.gdn_backup_pos[li] = -1
+        elif cache.gdn_backup_pos.get(li, -1) == past_len:
             # Rewound to the snapshot (e.g. token healing popped the last token):
             # restore the pre-step state before re-advancing.
             conv.copy_(bconv)
@@ -517,7 +519,7 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
     def _stash_backup(self, cache, conv, ssm, bconv, bssm, past_len: int):
         bconv.copy_(conv)
         bssm.copy_(ssm)
-        cache.gdn_backup_pos = past_len
+        cache.gdn_backup_pos[self.layer_idx] = past_len
 
     def rewind_state(self, cache, pos: int):
         """
@@ -543,7 +545,7 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
             kh = _l2norm(kc.view(Bn, n, self.nk, self.dk).float()).repeat_interleave(self.group, dim=2)
             vh = vc.view(Bn, n, self.nv, self.dv).float()
             _recurrent_scan(qh, kh, vh, stage["g"][:, :n], stage["beta"][:, :n], ssm)
-        cache.gdn_backup_pos = -1
+        cache.gdn_backup_pos[self.layer_idx] = -1
 
     def forward(
         self,
@@ -585,6 +587,7 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
                 past_len = cache.current_seq_len
             conv, ssm, bconv, bssm = self._local_state(cache, past_len)
             staging = getattr(cache, "gdn_staging", False) and T > 1
+            split_scan = False
             if staging:
                 # MTP verify: record base state + conv history + scan inputs so the
                 # accepted prefix can be restored afterwards (gdn_rewind_to).
@@ -603,11 +606,16 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
                 conv_out = self._conv_decode(qkv, conv)
             else:
                 # Snapshot before the LAST token so a one-token rewind can restore.
+                # The conv backup (new_conv) is the state after T-1 tokens. The SSM
+                # backup must ALSO be the state after T-1 tokens -- but the scan has
+                # not run yet, so `ssm` here is still the pre-scan state. The split
+                # scan below scans the prefix first, then fixes bssm to that state.
                 conv_out, new_conv = self._conv_prefill(qkv[:, :-1], conv)
                 self._stash_backup(cache, new_conv, ssm, bconv, bssm, past_len + T - 1)
                 last, new_conv = self._conv_prefill(qkv[:, -1:], new_conv)
                 conv_out = torch.cat([conv_out, last], dim=1)
                 conv.copy_(new_conv)
+                split_scan = True
             state = ssm
 
         conv_out = F.silu(conv_out)
@@ -624,7 +632,20 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
             stage["qkv"] = conv_out.detach().clone()
             stage["beta"] = beta.detach().clone()
             stage["g"] = g.detach().clone()
-        o = self._scan(qh, kh, vh, g, beta, state, chunked=(cache is None or T > 1))
+        if split_scan:
+            # Scan the prefix (chunked) to reach the state after T-1 tokens, fix the
+            # SSM backup to that state (the early stash captured the pre-scan state),
+            # then scan the last token recurrently. Output equals a single chunked
+            # scan over all T tokens (prefix property), but the one-token-rewind
+            # backup now holds the correct recurrent state.
+            o = self._scan(qh[:, :-1], kh[:, :-1], vh[:, :-1], g[:, :-1], beta[:, :-1],
+                           state, chunked=True)
+            bssm.copy_(state)
+            o_last = self._scan(qh[:, -1:], kh[:, -1:], vh[:, -1:], g[:, -1:], beta[:, -1:],
+                                state, chunked=False)
+            o = torch.cat([o, o_last], dim=1)
+        else:
+            o = self._scan(qh, kh, vh, g, beta, state, chunked=(cache is None or T > 1))
         o = self._gated_norm(o.view(B, T, self.nv, self.dv), z.view(B, T, self.nv, self.dv))
         o = o.view(B, T, self.vd).to(hidden_states.dtype)
         out = self.out_proj.forward(o, loras = loras)
@@ -765,8 +786,8 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
                 if pl == 0:
                     conv_state.zero_()
                     ssm.zero_()
-                    dev_cache.gdn_backup_pos = -1
-                elif dev_cache.gdn_backup_pos == pl:
+                    dev_cache.gdn_backup_pos[self.layer_idx] = -1
+                elif dev_cache.gdn_backup_pos.get(self.layer_idx, -1) == pl:
                     conv_state.copy_(bconv_s)
                     ssm.copy_(bssm_s)
 
@@ -774,23 +795,25 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
             cw = self.conv1d_weight
             if not rank_local:
                 cw = self._raw_conv_slice(dev, ka, nk_l, va, nv_l)
+            tp_split = False
             if cache is None:
                 conv_out, _ = self._conv_prefill_with(qkv, None, cw)
             elif T == 1:
                 if bconv_s is not None:
                     bconv_s.copy_(conv_state)
                     bssm_s.copy_(ssm)
-                    dev_cache.gdn_backup_pos = pl
+                    dev_cache.gdn_backup_pos[self.layer_idx] = pl
                 conv_out = self._conv_decode_with(qkv, conv_state, cw)
             else:
                 conv_out, new_conv = self._conv_prefill_with(qkv[:, :-1], conv_state, cw)
                 if bconv_s is not None:
                     bconv_s.copy_(new_conv)
                     bssm_s.copy_(ssm)
-                    dev_cache.gdn_backup_pos = pl + T - 1
+                    dev_cache.gdn_backup_pos[self.layer_idx] = pl + T - 1
                 last, new_conv = self._conv_prefill_with(qkv[:, -1:], new_conv, cw)
                 conv_out = torch.cat([conv_out, last], dim=1)
                 conv_state.copy_(new_conv)
+                tp_split = True
 
             conv_out = F.silu(conv_out)
             kd_l = nk_l * self.dk
@@ -817,7 +840,18 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
             # b/a run on the flattened (rows, H) residual; the scan wants (B, T, nv).
             beta = beta.view(B, T, nv_l)
             g = g.view(B, T, nv_l)
-            o = self._scan(qh, kh, vh, g, beta, ssm, chunked=(cache is None or T > 1))
+            if tp_split:
+                # Fix the SSM backup to the state after T-1 tokens (the early stash
+                # captured the pre-scan state); see the non-TP forward for rationale.
+                o = self._scan(qh[:, :-1], kh[:, :-1], vh[:, :-1], g[:, :-1], beta[:, :-1],
+                               ssm, chunked=True)
+                if bssm_s is not None:
+                    bssm_s.copy_(ssm)
+                o_last = self._scan(qh[:, -1:], kh[:, -1:], vh[:, -1:], g[:, -1:], beta[:, -1:],
+                                    ssm, chunked=False)
+                o = torch.cat([o, o_last], dim=1)
+            else:
+                o = self._scan(qh, kh, vh, g, beta, ssm, chunked=(cache is None or T > 1))
             nw = self.norm_weight if rank_local else self.norm_weight_full
             o = self._gated_norm_with(o.view(B, T, nv_l, self.dv),
                                       z[idx].view(B, T, nv_l, self.dv), nw)
@@ -896,8 +930,8 @@ class ExLlamaV2GatedDeltaNet(ExLlamaV2Module):
         # State holds the last K-1 raw inputs; the conv window is state + x.
         window = torch.cat([conv_state, x.unsqueeze(-1)], dim=-1)
         y = (window * w.unsqueeze(0)).sum(-1)
-        conv_state[..., :-1].copy_(conv_state[..., 1:])
-        conv_state[..., -1].copy_(x)
+        # Non-aliasing shift (see _conv_decode): copy from the fresh window.
+        conv_state.copy_(window[..., 1:])
         return y.unsqueeze(1)
 
     def _gated_norm_with(self, o, z, w):

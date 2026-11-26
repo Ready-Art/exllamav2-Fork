@@ -115,10 +115,10 @@ MTP drafter (939 MB): [google/gemma-4-31B-it-assistant](https://huggingface.co/g
 | **MTP speculative decoding** | A Gemma-4 *assistant* drafter proposes a window of tokens; the target verifies them in one forward. Works with TP and MP, greedy and sampled. |
 | **EXL2.5 quantization format** | Per-tensor opt-in upgrades: uniform-bit fast-path GEMM (Ampere-optimized, 16-row cap), Hadamard incoherence + AWQ channel protection for lower quant error at the same bpw. Plain EXL2 models run unchanged. See [EXL2.5](#exl25-quantization-format). |
 | **Gemma-4-31B-IT support** | Text-only. Two attention geometries (head_dim 256 sliding / 512 full), `k_eq_v` layers, proportional RoPE, per-layer norms. |
-| **Qwen3.8-27B support (experimental)** | Text-only hybrid backbone: gated delta net (linear attention) + output-gated full attention, built-in MTP drafter, TP/MP. Not yet rig-validated. See [Experimental features](#experimental-features). |
+| **Qwen3.8-27B support (experimental)** | Text-only hybrid backbone: gated delta net (linear attention) + output-gated full attention, TP/MP. Base decoding verified coherent on the real checkpoint (FP16 + INT8 KV). **Built-in MTP and multi-batch do not work yet** — disable drafting, use batch 1; a future update will fix them. See [Experimental features](#experimental-features). |
 | **Qwen3.8-Flash-Next support (experimental)** | Text-only `qwen4_exp`: 4-stream hyper-connections, gated delta net + QSA indexed sparse attention (top-512 blocks), 512-expert MoE + sigmoid shared expert, PLE hashed n-gram embeddings (engram disk/RAM/hybrid storage), built-in MTP. MP: GDN shards by value heads, attention/PLE/HC replicated, MoE replicate/shard/offload. Synthetic-parity verified; real-checkpoint validation pending. |
 | **Gemma-4-26B-A4B support (experimental)** | Gemma-4 attention (SWA hd256 / full hd512 `k_eq_v`) plus a parallel per-layer MoE block: 128 experts top-8 with scale/per-expert-scale router, dense MLP branch, fused-3D expert quantization. MP: low-KV-head layers replicate, MoE replicate/shard/offload. Synthetic block-math parity cos 1.0; real-checkpoint validation pending. |
-| **Built-in MTP on MP** | The built-in drafters (Qwen3.5/3.8 and Flash-Next) run on the MP path through `BuiltinMTPMPAdapter`: own draft KV on the master rank, target GDN/PLE verify state staged and restored by the distributed rewind. Greedy chain; sampled acceptance resamples from verified target logits. Single-sequence (`max_batch_size 1`). |
+| **Built-in MTP on MP** | The built-in drafters (Qwen3.5/3.8 and Flash-Next) run on the MP path through `BuiltinMTPMPAdapter`: own draft KV on the master rank, target GDN/PLE verify state staged and restored by the distributed rewind. Greedy chain; sampled acceptance resamples from verified target logits. Single-sequence (`max_batch_size 1`). **Currently does not produce correct output on the real Qwen3.8-27B checkpoint (long-generation state corruption) — disable drafting; fix planned.** |
 | **Sliding-window + TP KV cache** | Ring buffers for sliding layers make long context fit (≈22.5 GB instead of ≈236 GB at 256k for Gemma-4-31B). |
 | **TP CUDA graphs** | Whole-step decode/verify graphs remove per-op launch latency on the tensor-parallel path. |
 | **FlashInfer attention** | head_dim 512 on every path on sm86 — paged decode (incl. CUDA-graph mode), single-token decode, prefill. |
@@ -387,7 +387,7 @@ All three are opt-in on the **MP + MTP** path and validated on the test rig; the
 (batch size 1, no offload, MTP drafting) is the verified single-job path. Configuration details
 live in the [TabbyAPI fork docs](https://github.com/Ready-Art/tabbyAPI-Fork/blob/ReadyArt/docs/11.-ReadyArt-ExLlamaV2-Fork.md).
 
-### Qwen3.8-27B / Qwen3.5 hybrid backbone (EXPERIMENTAL — not yet rig-validated)
+### Qwen3.8-27B / Qwen3.5 hybrid backbone (EXPERIMENTAL — base decode verified; MTP + multi-batch pending)
 
 Support for **[Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)** (architecture
 `Qwen3_5ForConditionalGeneration`, text-only). This is a **hybrid linear-attention backbone**,
@@ -421,10 +421,18 @@ structurally different from Gemma-4:
   passthrough. EXL2.5 (uniform bits, no trellis) is the intended quant format. Vision tower
   (`model.visual.*`) is skipped, same policy as Gemma-4.
 
-**Status:** delta-rule math bit-exact vs HF; built-in MTP-on-MP exercised end-to-end on a synthetic
-checkpoint (24-token greedy equivalence vs plain decode, exact match). **Real-checkpoint rig
-validation still pending** — quantize with `convert_exl2.py` (e.g. EXL2.5 uniform 4-bit, fp16 head)
-and run a short-context coherence test before trusting output.
+**Status:** delta-rule math bit-exact vs HF. **Real-checkpoint base decoding is verified
+coherent** (single-GPU/autosplit and TP/MP, FP16 and INT8 KV; per-position logit parity cos
+≈0.999 vs HF, 120-token free-run coherent). Two features **do not work yet** and will be
+updated in a future release:
+
+- **Built-in MTP** — the MP verify/rewind path is wired and was exact on a synthetic checkpoint,
+  but on the real checkpoint it corrupts the recurrent state over long generations and
+  degenerates. **Disable drafting (`draft_mode: disabled`) for correct output.**
+- **Multi-batch decoding (batch size > 1)** — not implemented for the hybrid backbone / built-in
+  MTP. Use `max_batch_size: 1`.
+
+Quantize with `convert_exl2.py` (e.g. EXL2.5 uniform bits, fp16 head).
 
 ### Qwen3.8-Flash-Next (EXPERIMENTAL — synthetic-parity verified)
 
@@ -485,15 +493,19 @@ state is staged during the verify window on every rank and restored exactly by t
 rewind, so rejected drafts never corrupt the backbone. The drafters load private full
 embedding/head tables when the master's are vocab-sharded. Single-sequence; prompt-cache RAM
 offload is disabled for built-in MTP. Verified: Flash-Next 24-token greedy equivalence on MP2
-(exact match vs plain decode, real draft acceptance). Qwen3.8-27B: the MP mechanism and output
-stream are verified, but its P6 drafter's acceptance is still under debug (correct output, no
-speculation speedup yet) — see `mtp/synth_newmodels_test.py qwen35_mtp`.
+(exact match vs plain decode, real draft acceptance). **Qwen3.8-27B: built-in MTP does not work
+yet on the real checkpoint** — the verify/rewind corrupts the recurrent state over long
+generations and the output degenerates (short outputs are fine). Disable drafting
+(`draft_mode: disabled`) for coherent output; a fix is planned. See
+`mtp/synth_newmodels_test.py qwen35_mtp`.
 
 ### Multi-batch (MP + MTP)
 
 `TPProcessGroup(..., max_batch=N)` + `MTPMPBatchDriver` run several jobs concurrently, one cache
 row (slot) per job. Validated under true concurrent load at **batch 4** (mixed context lengths,
-greedy and sampled). Highlights:
+greedy and sampled) for the assistant-drafter MTP path. **Not yet working for the hybrid
+backbone (Qwen3.8-27B / Flash-Next) or built-in MTP** — those are single-sequence only
+(`max_batch_size: 1`); multi-batch support for them is planned. Highlights:
 
 - Batched graphed verify rounds (`(B, W+1)` rows, one CUDA graph per batch size) with per-row
   acceptance/rewind/sampling; every round runs at the full active batch size (burst-drain

@@ -838,7 +838,10 @@ class ExLlamaV2Cache_Hybrid(ExLlamaV2Cache):
         self.gdn_ssm_states = []
         self.gdn_conv_backup = []
         self.gdn_ssm_backup = []
-        self.gdn_backup_pos = -1
+        # Per-layer backup position (dict layer_idx -> pos). MUST be per-layer:
+        # a cache-wide scalar makes layer N's decode see layer N-1's just-stashed
+        # position and wrongly restore its pre-step backup (state one token behind).
+        self.gdn_backup_pos = {}
         # MTP verify staging (newplan.md P6). When gdn_staging is set, a multi-token
         # forward records its per-token scan inputs + conv history + a base-state
         # snapshot so gdn_rewind_to() can restore the state to any accepted prefix.
@@ -882,7 +885,7 @@ class ExLlamaV2Cache_Hybrid(ExLlamaV2Cache):
         self.gdn_ssm_states = []
         self.gdn_conv_backup = []
         self.gdn_ssm_backup = []
-        self.gdn_backup_pos = -1
+        self.gdn_backup_pos = {}
 
         nk, nv, dk, dv, conv_dim = self._gdn_local_dims()
         K = cfg.linear_conv_kernel_dim
@@ -941,7 +944,7 @@ class ExLlamaV2Cache_Hybrid(ExLlamaV2Cache):
                 self.gdn_ssm_states[i] = copy_from.gdn_ssm_states[i].clone()
                 self.gdn_conv_backup[i] = copy_from.gdn_conv_backup[i].clone()
                 self.gdn_ssm_backup[i] = copy_from.gdn_ssm_backup[i].clone()
-            self.gdn_backup_pos = copy_from.gdn_backup_pos
+            self.gdn_backup_pos = dict(copy_from.gdn_backup_pos)
 
     def _allocate_hybrid(self):
         """Materialise KV (full layers) + GDN state after lazy construction
@@ -1028,11 +1031,11 @@ class ExLlamaV2Cache_Hybrid(ExLlamaV2Cache):
                 target.gdn_ssm_states[i].copy_(self.gdn_ssm_states[i])
                 target.gdn_conv_backup[i].copy_(self.gdn_conv_backup[i])
                 target.gdn_ssm_backup[i].copy_(self.gdn_ssm_backup[i])
-            target.gdn_backup_pos = self.gdn_backup_pos
+            target.gdn_backup_pos = dict(self.gdn_backup_pos)
 
     def reset(self):
         super().reset()
-        self.gdn_backup_pos = -1
+        self.gdn_backup_pos = {}
         self.gdn_staging = False
         self.gdn_stage_start = -1
         self.gdn_stage_len = 0
