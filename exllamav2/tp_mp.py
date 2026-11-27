@@ -345,7 +345,15 @@ def mp_worker(conn, device, world_size, rank, init_method, uuid_hex, model_dir, 
                 row, pos, wb, entry_id = args
                 try:
                     flat, meta = _pack_row_offload(ctx, row, pos, wb)
-                    store = flat.clone()   # pageable storage; staging is reusable
+                    # PAGEABLE storage. A pinned .clone() stays page-locked:
+                    # unswappable, and torch's caching host allocator retains freed
+                    # pinned blocks, so cap eviction never returns RAM to the OS.
+                    # A near-full pinned store + one post-prefill ring snapshot
+                    # OOM-killed this worker (2026-11-26 server.log) -> EOFError ->
+                    # BrokenPipe FATAL cascade. Pageable frees munmap back to the OS.
+                    store = torch.empty(flat.shape, dtype = flat.dtype)
+                    store.copy_(flat)
+                    del flat
                 except Exception:
                     conn.send(("ok", None))
                     continue
@@ -1051,12 +1059,29 @@ class TPWorkerHandle:
         self.device = device
         self.conn = conn
         self.proc = proc
+        self.dead = False
+
+    def _pipe_died(self, op, e):
+        # EOF/BrokenPipe means the worker PROCESS is gone (host OOM-kill, native
+        # crash) -- not a Python exception inside it (that returns ("error", tb)).
+        # Mark the handle so the group can be declared dead and rebuilt instead of
+        # cascading BrokenPipe FATALs on every later request.
+        self.dead = True
+        return RuntimeError(
+            "TP worker %d process died (pipe %s on %s); the TP group must be "
+            "rebuilt (model reload)" % (self.device, type(e).__name__, op))
 
     def send(self, cmd, args = None):
-        self.conn.send((cmd, args))
+        try:
+            self.conn.send((cmd, args))
+        except (EOFError, BrokenPipeError, ConnectionResetError) as e:
+            raise self._pipe_died("send '%s'" % cmd, e) from e
 
     def recv(self):
-        status, payload = self.conn.recv()
+        try:
+            status, payload = self.conn.recv()
+        except (EOFError, BrokenPipeError, ConnectionResetError) as e:
+            raise self._pipe_died("recv", e) from e
         if status == "error":
             raise RuntimeError("TP worker %d failed:\n%s" % (self.device, payload))
         return payload
@@ -2444,7 +2469,11 @@ class TPProcessGroup:
             w.send("offload-row", (row, pos, wb, entry_id))
         try:
             flat, meta = _pack_row_offload(self.master_ctx, row, pos, wb)
-            master_flat = flat.clone()
+            # Pageable, not a pinned clone: eviction must return RAM to the OS
+            # (see the worker offload-row handler).
+            master_flat = torch.empty(flat.shape, dtype = flat.dtype)
+            master_flat.copy_(flat)
+            del flat
         except Exception:
             master_flat = None
         metas = {}
@@ -2655,6 +2684,13 @@ class TPProcessGroup:
             st["fl"] = f
             st["sl"] = f
             st["wb"] = shadow["wb"]
+
+    def workers_alive(self):
+        """False once any worker process has died (OOM-kill, native crash) or its
+        pipe hit EOF. A dead group cannot be revived by a new scheduler -- the
+        owner must rebuild it (full model reload)."""
+        return all(not w.dead and w.proc.is_alive()
+                   for w in self.workers.values())
 
     def close(self):
         # Stop any in-flight prefill at its next chunk boundary so workers reach the
