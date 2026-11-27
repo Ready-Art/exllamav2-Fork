@@ -450,12 +450,16 @@ class TPContext:
                 sm_scale = scale,
                 q_data_type = torch.half,
                 kv_data_type = k_cache_dev.dtype,
-                # Graph-mode split-KV schedule is baked at capture and drifts as kv grows
-                # within the envelope window -> wrong attention -> long-ctx degeneration
-                # (GPU-verified 2026-11-26: EXL2_FI_SPLITKV=0 coherent @12k+2k, envelope 512;
-                # split-KV on loops). Single-pass decode is kv-independent (no baked split
-                # schedule). EXL2_FI_SPLITKV=1 re-enables split-KV for experiments.
-                disable_split_kv = os.environ.get("EXL2_FI_SPLITKV", "0") == "0",
+                # Split-KV (FlashDecoding) ON by default: at small q the single-pass fa2
+                # kernel launches only ~nq CTAs (~8 on 82 SMs) and streams KV at ~62 GB/s
+                # instead of near-peak -- the long-ctx gen-t/s collapse (2026-11-26 log:
+                # verify ~0.9 ms per 1k ctx tokens). Single-pass was a degeneration
+                # mitigation, but the user's A/B isolated that bug to INT8 KV, which
+                # bypasses FI wrappers entirely; the per-replay re-plan refreshes the
+                # split schedule (BUG 103 fixed-buffer contract), and split-KV fp16 was
+                # the verified-coherent path before the mitigation. EXL2_FI_SPLITKV=0
+                # restores single-pass.
+                disable_split_kv = os.environ.get("EXL2_FI_SPLITKV", "1") == "0",
             )
         finally:
             torch.cuda.set_stream(prev_stream)
@@ -585,9 +589,10 @@ class TPContext:
                 sm_scale = scale,
                 q_data_type = torch.half,
                 kv_data_type = k_cache_dev.dtype,
-                # Graph-mode split-KV schedule drifts with kv -> long-ctx degeneration;
-                # single-pass is kv-safe (same as fi_decode_plan / fi_decode_rows_plan).
-                disable_split_kv = os.environ.get("EXL2_FI_SPLITKV", "0") == "0",
+                # Split-KV ON by default -- see fi_decode_plan: single-pass starves the
+                # small-q verify kernel of CTAs (~62 GB/s KV streaming); the degeneration
+                # it mitigated was INT8-KV-specific (INT8 bypasses FI). =0 restores it.
+                disable_split_kv = os.environ.get("EXL2_FI_SPLITKV", "1") == "0",
             )
         finally:
             torch.cuda.set_stream(prev_stream)
@@ -681,9 +686,9 @@ class TPContext:
                 sm_scale = scale,
                 q_data_type = torch.half,
                 kv_data_type = k_cache_dev.dtype,
-                # Same as fi_decode_plan: graph-mode split-KV schedule drifts with kv ->
-                # degeneration; single-pass is kv-safe. EXL2_FI_SPLITKV=1 re-enables.
-                disable_split_kv = os.environ.get("EXL2_FI_SPLITKV", "0") == "0",
+                # Same as fi_decode_plan: split-KV ON by default (single-pass starves
+                # small-q attention of CTAs). EXL2_FI_SPLITKV=0 restores single-pass.
+                disable_split_kv = os.environ.get("EXL2_FI_SPLITKV", "1") == "0",
             )
         finally:
             torch.cuda.set_stream(prev_stream)
